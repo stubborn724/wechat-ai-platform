@@ -1,0 +1,47 @@
+"""插入初始数据：租户 + 管理员用户"""
+from app.database import MysqlSessionLocal
+from app.models.mysql_models import Tenant, User, Membership
+from app.services.auth_service import hash_password
+
+EMAIL = "admin@wechat.ai"
+PASSWORD = "admin123"
+DISPLAY_NAME = "管理员"
+
+def seed():
+    db = MysqlSessionLocal()
+    try:
+        # 检查是否已有数据
+        if db.query(User).filter(User.email == EMAIL).first():
+            print("管理员用户已存在，跳过")
+            return
+
+        # 创建默认租户
+        tenant = Tenant(name="默认团队", slug="default")
+        db.add(tenant)
+        db.flush()
+
+        # 创建管理员用户
+        user = User(
+            email=EMAIL,
+            password_hash=hash_password(PASSWORD),
+            display_name=DISPLAY_NAME,
+        )
+        db.add(user)
+        db.flush()
+
+        # 关联用户到租户
+        membership = Membership(tenant_id=tenant.id, user_id=user.id, role="admin")
+        db.add(membership)
+
+        db.commit()
+        print(f"初始化完成！")
+        print(f"  邮箱: {EMAIL}")
+        print(f"  密码: {PASSWORD}")
+    except Exception as e:
+        db.rollback()
+        print(f"失败: {e}")
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    seed()
