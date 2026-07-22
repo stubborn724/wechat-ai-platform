@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const client = axios.create({
   baseURL: '/api/v1',
-  timeout: 120000,
+  timeout: 600000, // 10 分钟（文章自动生成可能较慢）
 })
 
 client.interceptors.request.use((config) => {

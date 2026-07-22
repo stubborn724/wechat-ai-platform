@@ -18,6 +18,10 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(10)
 
+// Selection
+const selectedRows = ref<Article[]>([])
+const tableRef = ref()
+
 const statusOptions = [
   { value: '', label: '全部状态' },
   { value: 'COMPLETED', label: '已完成' },
@@ -47,6 +51,7 @@ const phaseLabels: Record<string, string> = {
   MERGE_COMPLETE: '合成完成',
   ALL_COMPLETE: '全部完成',
   COMPLETED: '已完成',
+  DRAFT_SAVED: '草稿已存',
   FAILED: '失败',
 }
 
@@ -114,6 +119,35 @@ async function handleDelete(row: Article) {
   }
 }
 
+async function handleBatchDelete() {
+  if (selectedRows.value.length === 0) {
+    ElMessage.warning('请先选择要删除的文章')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除选中的 ${selectedRows.value.length} 篇文章吗？此操作不可恢复。`,
+      '批量删除',
+      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
+    )
+    loading.value = true
+    for (const row of selectedRows.value) {
+      try {
+        await deleteArticle(row.id)
+      } catch {
+        // skip individual failures
+      }
+    }
+    ElMessage.success(`已删除 ${selectedRows.value.length} 篇文章`)
+    selectedRows.value = []
+    fetchArticles()
+  } catch {
+    // cancelled
+  } finally {
+    loading.value = false
+  }
+}
+
 function handleView(row: Article) {
   router.push(`/articles/${row.task_id}`)
 }
@@ -156,18 +190,29 @@ onMounted(() => {
         </el-select>
         <el-button type="primary" @click="handleSearch">搜索</el-button>
         <el-button type="success" @click="router.push('/articles')">新建文章</el-button>
+        <el-button
+          type="danger"
+          plain
+          :disabled="selectedRows.length === 0"
+          @click="handleBatchDelete"
+        >
+          批量删除{{ selectedRows.length > 0 ? ` (${selectedRows.length})` : '' }}
+        </el-button>
       </div>
     </el-card>
 
     <!-- Article Table -->
     <el-card shadow="never" class="table-card">
       <el-table
+        ref="tableRef"
         :data="articles"
         v-loading="loading"
         stripe
         style="width: 100%"
         empty-text="暂无文章数据"
+        @selection-change="(rows: any) => selectedRows = rows"
       >
+        <el-table-column type="selection" width="45" />
         <el-table-column prop="topic" label="文章主题" min-width="220" show-overflow-tooltip />
 
         <el-table-column label="风格" width="110">

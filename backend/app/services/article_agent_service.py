@@ -26,10 +26,8 @@ from app.constants.prompt import (
     AGENT3_CONTENT_PROMPT,
     AGENT4_IMAGE_REQUIREMENTS_PROMPT,
     AGENT5_IMAGE_EXECUTION_PROMPT,
-    PromptConstant,
+    get_style_prompt,
 )
-
-get_style_prompt = PromptConstant.get_style_prompt
 from app.schemas.article import ArticleState, ImageRequirement, ImageResult, TitleOption
 
 # ---------------------------------------------------------------------------
@@ -178,7 +176,7 @@ async def agent1_generate_title_options(state: ArticleState) -> ArticleState:
     if state.reference_articles:
         prompt += _build_reference_articles_section(state.reference_articles)
 
-    system_msg = "你是一个专业的微信公众号标题生成专家。"
+    system_msg = "你是一个专业的微信公众号标题生成专家。所有输出必须使用纯中文，禁止任何英文单词或中英混合。"
     if state.style_profile:
         system_msg += " 请严格按照提供的仿写风格指南来生成标题方案。"
 
@@ -269,7 +267,12 @@ async def agent3_generate_content(
     )
 
     # Inject knowledge base context if available
-    system_msg = "你是一个专业的微信公众号文章写手。"
+    system_msg = (
+        "你是一个专业的微信公众号文章写手。全文必须使用纯中文写作。\n"
+        "图片很重要！在文中适当位置插入图片标记：`[IMAGE:position=N,keywords=中文描述,type=T]`，"
+        "每篇文章必须包含4～8张配图标记。keywords写图片展示的内容即可。\n"
+        "正文中不得出现摄影术语（如俯拍、特写、暖光、45度等），不得虚构品牌价格联系方式。"
+    )
     if state.kb_context:
         prompt += (
             f"\n\n## 参考资料（请基于以下参考资料来撰写文章内容，确保信息准确）\n"
@@ -288,17 +291,17 @@ async def agent3_generate_content(
     # Inject reference articles for imitation (full content)
     if state.reference_articles:
         prompt += _build_reference_articles_section(state.reference_articles)
-        # Override system message: when imitating, follow reference format, not the standard prompt
+        # Override system message: when imitating, follow reference format
         system_msg = (
-            "你是一个专业的仿写专家。你正在仿写一篇公众号产品推广文章。\n"
-            "使用 `[IMAGE:position=N,keywords=中文描述,type=T]` 来标记每张图片的位置。"
-            "keywords 要写详细的中文描述，类似参考文章里的图片说明文字（如「45度俯拍暖光下的...」）。"
-            "keywords 必须用中文写，不要写英文。"
-            "最终输出应该是一篇结构清晰、段落自然的推广文章，和参考文章的格式保持一致。\n"
-            "【重要】标题必须用 **加粗** 包裹"
-            "【重要】禁止使用 > 引用块格式"
-            "【重要】禁止重复输出同一个标题或总结句"
-            "【重要】全文必须使用纯中文写作，禁止在中文中混入任何英文单词或英文句子。"
+            "你是一个专业的仿写专家。你正在仿写一篇公众号文章。\n"
+            "在文中适当位置插入图片标记：`[IMAGE:position=N,keywords=中文描述,type=T]`\n"
+            "图片很重要，每篇文章至少包含4张配图，请确保插入了足够数量的[IMAGE:]标记。\n"
+            "keywords 写图片展示的内容即可（如「客厅全景」「教师办公场景」「产品细节」），不要写拍摄角度或光线。\n"
+            "正文中不得出现任何摄影术语（俯拍、仰拍、特写、微距、暖光、逆光、45度等）。\n"
+            "【重要】标题必须用 **加粗** 包裹\n"
+            "【重要】禁止使用 > 引用块格式\n"
+            "【重要】禁止重复输出同一个标题或总结句\n"
+            "【重要】全文必须使用纯中文写作\n"
         )
 
     def _noop_handler(text: str) -> None:
@@ -457,7 +460,7 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
 
             url = images_by_position.get(pos, "")
             if url:
-                # Output: visible Chinese description + empty line + actual image
+                # Output image — description cleaned by post-processing if needed
                 return f"{alt}\n\n![{alt}]({url})"
             # No image available — remove placeholder entirely
             return ""
@@ -514,7 +517,7 @@ def _build_style_profile_section(profile: dict) -> str:
         "bold_statement": "观点式开头", "curiosity_gap": "悬念式开头",
     }
 
-    lines = ["\n\n## 仿写风格指南（请严格按照以下风格特征来撰写）"]
+    lines = ["\n\n## 仿写风格指南（只模仿以下风格特征，内容围绕用户主题重新创作）"]
 
     tone = profile.get("tone")
     if tone:
@@ -543,74 +546,71 @@ def _build_style_profile_section(profile: dict) -> str:
             m = {"emoji": "使用表情", "bullet_points": "使用要点列表",
                  "blockquotes": "使用引用块", "numbered_lists": "使用编号列表",
                  "bold_headers": "加粗标题", "images_in_text": "文中配图"}
-            fmt_cn.append(m.get(f.lower(), f))
-        lines.append(f"- 格式特征：{', '.join(fmt_cn)}")
+            mapped = m.get(f.lower(), f)
+            # Skip formatting items that are about image descriptions
+            if any(kw in mapped for kw in ['图片', '图像', '摄影', '拍摄']):
+                continue
+            fmt_cn.append(mapped)
+        if fmt_cn:
+            lines.append(f"- 格式特征：{', '.join(fmt_cn)}")
 
     signatures = profile.get("signature_elements")
     if signatures:
-        lines.append(f"- 独特标志：{', '.join(signatures)}")
+        # Filter out any signature elements related to image/photography descriptions
+        photography_keywords = ['图片', '图像', '摄影', '拍摄', '配图', '插图', '照片', '产品图', '场景图']
+        filtered = [s for s in signatures if not any(kw in s for kw in photography_keywords)]
+        if filtered:
+            lines.append(f"- 独特标志：{', '.join(filtered)}")
 
     return "\n".join(lines)
 
 
 def _build_reference_articles_section(articles: list) -> str:
-    """Build a reference articles section for prompt injection in imitation mode.
+    """Build a reference articles section for prompt injection.
 
-    Passes the full article content to the LLM so it can imitate the writing
-    style, structure, tone, and vocabulary.
+    Only passes short excerpts (style sample only) to avoid the LLM
+    reproducing product/image descriptions from the source articles.
     """
     if not articles:
         return ""
 
-    lines = ["\n\n## 参考文章（请严格按照以下文章的写作风格来仿写）"]
+    lines = ["\n\n## 参考文章风格摘要（仅展示句式结构和段落节奏，不要复制具体内容）"]
     for i, article_text in enumerate(articles, start=1):
-        # 8000 chars max per article — product articles are often long
-        max_chars = 8000
-        truncated = article_text[:max_chars]
-        if len(article_text) > max_chars:
-            truncated += "\n\n...（文章较长，已截取前8000字符）"
-        lines.append(f"\n### 参考文章 {i}\n{truncated}")
+        # Strip [IMAGE:] markers and common photography lines first
+        cleaned = re.sub(r'\[IMAGE:[^\]]*\]', '', article_text)
+        cleaned = re.sub(
+            r'^.*?(?:45度|俯拍|仰拍|微距|特写|暖光|逆光|打光|布光).*?(?:场景|效果|展示|组合|特写).*?\n',
+            '', cleaned, flags=re.MULTILINE,
+        )
+        cleaned = cleaned.strip()
+        # Only keep first 300 chars — enough for style, not enough for content
+        excerpt = cleaned[:300]
+        if len(cleaned) > 300:
+            excerpt += "\n\n...（风格摘要）"
+        if excerpt and len(excerpt) > 50:
+            lines.append(f"\n### 风格示例 {i}\n{excerpt}")
 
     lines.append("""
 
-## ⚠️ 输出格式硬性要求（优先级高于所有其他格式指令）
+## ⚠️ 输出格式规则
 
-你必须严格按照参考文章的格式来组织文章。参考文章的格式特征是：
+### 核心要求：
+1. **标题加粗**：所有小标题/段落总结语/独立成行的主题句，用 `**加粗**` 包裹
+2. **完整段落**：每一段必须是多句话连贯而成的完整段落
+3. **段落间距**：段与段之间空一行
+4. **图片标记（必须）**：每篇文章必须插入4～8张配图标记 `[IMAGE:position=N,keywords=图片内容描述,type=T]`
+   - keywords 只写图片内容（如「客厅全景」「教师办公」「产品细节」），不得包含任何摄影术语
+5. **禁止使用**：禁止使用 `>` 引用块、`---` 分隔线、`***`
 
-### 格式模板（请完全照此结构输出）：
-```
-**标题行（用加粗，一句话点明主题）**
+### 【绝对禁止】以下内容不得出现在正文中：
+- 拍摄角度、光线、构图等任何图片描述文字
+- 具体产品名、品牌名、价格、联系方式
+- 参考文章中的专属名词和特定产品描述
+- 摄影术语：俯拍、仰拍、特写、微距、暖光、逆光、45度、打光、布光、景深、背景虚化
 
-完整段落。就是像参考文章里那样，一个段落包含三四句话甚至更多，多句话连在一起形成一个完整的段落，不要断开。
-
-[IMAGE:position=1,keywords=45度俯拍暖光下的产品整体造型，突出独特设计,type=cover]
-
-**下一个标题行（加粗）**
-
-完整段落。每一段都必须是一个完整的段落，包含多句话，不要把它拆成单行或短句。
-
-[IMAGE:position=2,keywords=近景特写材质细节，呈现不同质感对比,type=section]
-
-**又一个标题行（加粗）**
-
-完整段落。
-```
-
-### 具体规则：
-1. **标题加粗**：所有小标题 / 段落总结语 / 独立成行的主题句，必须用 `**加粗**` 包裹
-   - ✅ 正确：`**三种触感，织就轻奢的温柔底色**`
-   - ❌ 错误：`三种触感，织就轻奢的温柔底色`（没加粗）
-2. **禁止重复**：同一行标题或总结语只能出现一次，禁止在段落末尾重复输出标题
-3. **禁止 > 引用**：全文禁止使用 `>` 引用块格式
-4. **完整段落**：每一段必须是多句话连贯而成的完整段落，绝对不要把一段话拆成多行
-5. **段落间距**：段与段之间空一行，不要多空
-6. **图片标记**：在每段需要配图的位置插入 `[IMAGE:position=N,keywords=详细中文图片描述,type=T]` 标记
-   - keywords 要写详细的中文描述，类似参考文章中的图片说明文字（如"45度俯拍暖光下的茶几整体造型..."）
-   - 不要写英文 keywords，全部用中文
-7. **禁止分隔线**：不要使用 `---` 或 `***` 作为段落分隔
-8. **纯中文**：全文使用纯中文写作，禁止混入任何英文单词
-
-### 如果你不确定怎么写，就多看看参考文章里段落的长度和结构——完全模仿它的节奏。
+### 重要：
+- 你的文章内容必须围绕用户给定的**主题**来写
+- 只模仿句子的**长短节奏**和**段落结构**，不复制具体写什么
 """)
 
     return "\n".join(lines)

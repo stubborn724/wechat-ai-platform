@@ -5,7 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import {
   Odometer, ChatDotSquare, Document, Edit, List, Picture,
   Connection, Collection, Calendar, Finished, Fold, Expand,
-  ArrowDown, Key, CopyDocument,
+  ArrowDown, Key, CopyDocument, Setting,
 } from '@element-plus/icons-vue'
 
 const auth = useAuthStore()
@@ -39,15 +39,16 @@ const menuItems = computed<MenuItem[]>(() => [
   { index: '2', route: '/accounts', label: '公众号', icon: 'ChatDotSquare', show: true },
   { index: '3', route: '/articles/list', label: '文章管理', icon: 'Document', show: true },
   { index: '4', route: '/articles', label: '创建文章', icon: 'Edit', show: true },
-  { index: '5', route: '/content', label: '内容任务', icon: 'List', show: true },
-  { index: '6', route: '/assets', label: '素材库', icon: 'Picture', show: true },
+  { index: '5', route: '/assets', label: '素材库', icon: 'Picture', show: true },
   { index: '7', route: '/feed-sources', label: '投喂源', icon: 'Connection', show: true },
   { index: '8', route: '/knowledge', label: '知识库', icon: 'Collection', show: true },
-  { index: '9', route: '/publish-plans', label: '发布计划', icon: 'Calendar', show: true },
+  { index: '9', route: '/scheduled-tasks', label: '定时任务', icon: 'Calendar', show: true },
   { index: '10', route: '/reviews', label: '审核台', icon: 'Finished', show: canReview.value },
   { index: '11', route: '/wechat-oauth', label: '扫码授权', icon: 'Key', show: true },
-  { index: '12', route: '/imitation/pools', label: '仿写池', icon: 'CopyDocument', show: true },
-  { index: '13', route: '/imitation/tasks', label: '仿写任务', icon: 'Calendar', show: true },
+  { index: '12', route: '/comments', label: '评论管理', icon: 'ChatDotSquare', show: true },
+  { index: '13', route: '/messages', label: '私信管理', icon: 'ChatDotSquare', show: true },
+  { index: '14', route: '/imitation/pools', label: '仿写池', icon: 'CopyDocument', show: true },
+  { index: '15', route: '/watermark', label: '水印设置', icon: 'Setting', show: true },
 ].filter(item => item.show))
 
 const activeRoute = computed(() => route.path)

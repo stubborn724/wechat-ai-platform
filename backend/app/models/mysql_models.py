@@ -113,6 +113,8 @@ class Article(MysqlBase):
     cover_image = Column(String(512), nullable=True)
     images = Column(JSON, nullable=True)
     footer_template = Column(Text, nullable=True)
+    msg_data_id = Column(String(128), nullable=True, comment="微信发布后返回的 msg_data_id，用于同步评论")
+    publish_id = Column(String(128), nullable=True, comment="微信发布任务 ID（publish_id），用于查询发布状态")
     status = Column(String(64), nullable=False, default="pending")
     phase = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
@@ -521,6 +523,75 @@ class ImitationTaskResult(MysqlBase):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
 
+# ============================================================
+# 阶段三：评论管理 & 私信
+# ============================================================
+
+
+class WeChatComment(MysqlBase):
+    """微信公众号文章评论 — 同步微信后台评论到本地"""
+    __tablename__ = "wechat_comments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_oauth_accounts.id"), nullable=True, comment="授权公众号 ID")
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=True, comment="所属文章")
+    # 微信侧数据
+    msg_id = Column(String(128), nullable=False, comment="文章 msg_id（群发返回的）")
+    comment_id = Column(String(128), nullable=False, index=True, comment="微信评论 ID（comment_id）")
+    user_comment_id = Column(String(128), nullable=True, comment="微信用户评论 ID（user_comment_id）")
+    openid = Column(String(128), nullable=True, comment="评论用户的 OpenID")
+    nickname = Column(String(255), nullable=True, comment="评论用户昵称")
+    content = Column(Text, nullable=False, comment="评论内容")
+    create_time = Column(DateTime, nullable=True, comment="评论时间")
+    # 回复
+    reply_content = Column(Text, nullable=True, comment="运营回复内容")
+    reply_create_time = Column(DateTime, nullable=True, comment="回复时间")
+    # 状态
+    is_favorited = Column(Boolean, default=False, nullable=False, comment="是否精选")
+    status = Column(String(32), nullable=False, default="pending", comment="pending/replied/ignored")
+    # 本地元信息
+    assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True, comment="分配给谁回复")
+    remark = Column(Text, nullable=True, comment="内部备注")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_wechat_comments_tenant", "tenant_id"),
+        Index("ix_wechat_comments_account", "account_id"),
+        Index("ix_wechat_comments_article", "article_id"),
+        Index("ix_wechat_comments_status", "status"),
+    )
+
+
+class WeChatMessage(MysqlBase):
+    """公众号主动私信记录"""
+    __tablename__ = "wechat_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_oauth_accounts.id"), nullable=True, comment="发送公众号")
+    openid = Column(String(128), nullable=False, index=True, comment="目标用户 OpenID")
+    msg_type = Column(String(32), nullable=False, comment="text/image/video/voice/miniprogrampage")
+    content = Column(Text, nullable=True, comment="文本内容（文本消息）")
+    media_id = Column(String(128), nullable=True, comment="素材 media_id（图片/视频消息）")
+    media_url = Column(String(512), nullable=True, comment="素材 URL")
+    # 小程序卡片专用
+    mini_title = Column(String(255), nullable=True, comment="小程序卡片标题")
+    mini_page_path = Column(String(512), nullable=True, comment="小程序页面路径")
+    mini_app_id = Column(String(128), nullable=True, comment="小程序 app_id")
+    # 状态
+    status = Column(String(32), nullable=False, default="sent", comment="sent/failed")
+    error_message = Column(Text, nullable=True, comment="发送失败原因")
+    sent_at = Column(DateTime, nullable=True, comment="发送时间")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_wechat_messages_tenant", "tenant_id"),
+        Index("ix_wechat_messages_account", "account_id"),
+    )
+
+
 class AuditLog(MysqlBase):
     __tablename__ = "audit_logs"
 
@@ -555,4 +626,85 @@ class Notification(MysqlBase):
 
     __table_args__ = (
         Index("ix_notifications_user_read", "user_id", "read_at"),
+    )
+
+
+class ScheduledTask(MysqlBase):
+    """统一的定时任务 — 取代 PublishPlan + ImitationTask"""
+    __tablename__ = "scheduled_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+
+    # 基本
+    name = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # 写作来源: free / feed / kb
+    writing_mode = Column(String(32), nullable=False, default="free")
+    topic = Column(Text, nullable=True)
+    style = Column(String(64), nullable=True)
+
+    # 投喂源配置（直接引用投喂源，替代仿写池）
+    feed_source_ids = Column(JSON, nullable=True)
+
+    # 知识库
+    knowledge_base_ids = Column(JSON, nullable=True)
+
+    # 日程: -1=每天, 0-6=周几
+    day_of_week = Column(Integer, default=-1)
+    publish_times = Column(JSON, nullable=False)
+
+    # 内容配置
+    article_slots = Column(JSON, nullable=True)
+    articles_per_day = Column(Integer, default=1)
+    public_count = Column(Integer, default=1)
+    private_count = Column(Integer, default=0)
+
+    # 发布配置
+    approval_mode = Column(String(32), default="auto")
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
+    footer_template = Column(Text, nullable=True)
+
+    # 统计
+    total_generated = Column(Integer, default=0)
+    last_run_at = Column(DateTime, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class TenantWatermarkConfig(MysqlBase):
+    """租户级水印配置"""
+    __tablename__ = "tenant_watermark_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, unique=True, index=True)
+
+    # 开关
+    enabled = Column(Boolean, default=False, nullable=False)
+
+    # 水印类型: logo / text
+    watermark_type = Column(String(32), default="logo", nullable=False)
+
+    # Logo 模式
+    logo_image_key = Column(String(512), nullable=True, comment="MinIO 中 Logo 图片的 storage_key")
+    logo_url = Column(String(512), nullable=True, comment="Logo 图片可访问 URL")
+    scale = Column(Integer, default=15, nullable=False, comment="Logo 缩放比例（百分比）")
+
+    # 文字模式
+    text_content = Column(String(255), nullable=True, comment="文字水印内容")
+    font_size = Column(Integer, default=36, nullable=False)
+
+    # 通用
+    position = Column(String(32), default="bottom-right", nullable=False,
+                       comment="top-left / top-right / bottom-left / bottom-right / center")
+    opacity = Column(Integer, default=80, nullable=False, comment="透明度 0-100")
+    color = Column(String(32), default="#FFFFFF", nullable=False, comment="文字颜色 HEX")
+    margin = Column(Integer, default=20, nullable=False, comment="边距 px")
+
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_tenant_watermark_tenant", "tenant_id"),
     )

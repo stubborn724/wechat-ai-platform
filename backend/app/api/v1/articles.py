@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import AsyncGenerator, List, Optional
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
 from app.config import settings
-from app.models.mysql_models import AgentLog, Article
+from app.models.mysql_models import AgentLog, Article, ContentVersion
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -37,6 +38,7 @@ class CreateArticleRequest(BaseModel):
     feed_article_ids: Optional[List[int]] = None  # 具体要仿写的文章ID列表
     selected_image_urls: Optional[List[str]] = None  # 本地素材预选图片URL
     footer_template: Optional[str] = None  # 文章底部固定内容
+    watermark_enabled: Optional[bool] = None  # 是否加水印，None 则使用租户全局配置
 
 
 class ConfirmTitleRequest(BaseModel):
@@ -78,6 +80,9 @@ class ArticleResponse(BaseModel):
     full_content: Optional[str] = None
     cover_image: Optional[str] = None
     images: Optional[list] = None
+    footer_template: Optional[str] = None
+    msg_data_id: Optional[str] = None
+    publish_id: Optional[str] = None
     status: str
     phase: Optional[str] = None
     error_message: Optional[str] = None
@@ -113,6 +118,46 @@ class AgentLogResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _strip_photography_text(text: str, pre_extracted_keywords: list | None = None) -> str:
+    """Remove lines containing photography/image description language from article body."""
+    if not text:
+        return text
+    # Use pre-extracted keywords, or extract from [IMAGE:] markers + markdown alt text
+    image_keywords = pre_extracted_keywords or re.findall(r'keywords=([^,\]]+)', text)
+    alt_texts = re.findall(r'!\[([^\]]+)\]\([^)]+\)', text)
+    image_keywords.extend(alt_texts)
+    text = re.sub(r'\[IMAGE:[^\]]*\]', '', text)
+    photo_kw = ['俯拍', '仰拍', '侧拍', '微距', '特写', '近景', '远景', '暖光',
+                '逆光', '侧光', '打光', '布光', '景深', '光圈', '快门', '45度']
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            cleaned.append(line)
+            continue
+        # Always preserve markdown image lines
+        if re.match(r'^!\[.*\]\(.*\)$', s):
+            cleaned.append(line)
+            continue
+        # Remove if line matches any extracted image keyword
+        if image_keywords:
+            skip = False
+            for kw in image_keywords:
+                if len(kw) >= 6 and kw in s:
+                    skip = True
+                    break
+            if skip:
+                continue
+        # Remove lines with 2+ photography terms
+        if sum(1 for kw in photo_kw if kw in s) >= 2:
+            continue
+        if re.search(r'(?:右下角|左下角|右上角|左上角).*(?:水印|logo|标志|文字)', s, re.IGNORECASE):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
 
 def _log_io(agent_name: str, prompt: str, response: str, duration_ms: int):
     """Print a coloured log block so the user can trace model I/O in the
@@ -230,7 +275,7 @@ def _sample_content(main_title: str, sub_title: str, outline: dict) -> str:
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/articles/create", status_code=status.HTTP_201_CREATED)
+@router.post("/articles/create", status_code=status.HTTP_201_CREATED, response_model=ArticleResponse)
 async def create_article(
     req: CreateArticleRequest,
     db: Session = Depends(get_mysql_db),
@@ -307,7 +352,12 @@ async def create_article(
                     for a in articles_to_imitate:
                         title = a.title or ""
                         body = a.body_markdown or ""
-                        ref_texts.append(f"## 参考文章：{title}\n\n{body}")
+                        # Clean: strip [IMAGE:], photography lines, then truncate to 300 chars
+                        body = re.sub(r'\[IMAGE:[^\]]*\]', '', body)
+                        body = re.sub(r'^.*?(?:45度|俯拍|仰拍|微距|特写|暖光|逆光|打光|布光).*?(?:场景|效果|展示|组合|特写).*?\n', '', body, flags=re.MULTILINE)
+                        body = body.strip()[:300]
+                        if body and len(body) > 50:
+                            ref_texts.append(f"## {title}\n\n{body}")
                     state.reference_articles = ref_texts
                     print(f"  📄 已加载 {len(ref_texts)} 篇参考文章用于仿写")
                     for a in articles_to_imitate:
@@ -399,6 +449,9 @@ async def create_article(
                     state = await agent5_generate_images(state)
                     print(f"     已获取 {len(state.images)} 张配图")
 
+                    # Extract image keywords BEFORE merge (post-processing needs them)
+                    image_keywords_auto = re.findall(r'keywords=([^,\]]+)', content)
+
                     # Merge images into content
                     state = merge_images_into_content(state)
                     content_rich = state.full_content or content
@@ -412,8 +465,24 @@ async def create_article(
                         from app.services.asset_archive_service import save_images_to_asset_library
                         image_urls = [img.url for img in state.images if img.url]
                         print(f"  ▶ [自动] 归档 {len(image_urls)} 张素材到素材库...")
-                        await save_images_to_asset_library(db, principal.tenant_id, image_urls)
-                        print(f"  ✅ 素材归档完成")
+                        archived = await save_images_to_asset_library(
+                            db, principal.tenant_id, image_urls,
+                            watermark_enabled=req.watermark_enabled,
+                        )
+                        # Build mapping: original URL -> watermarked MinIO URL
+                        from app.services.storage_service import storage_service as _ss
+                        url_map: dict[str, str] = {}
+                        for orig_url, asset_obj in zip(image_urls, archived):
+                            if asset_obj:
+                                url_map[orig_url] = _ss.get_url(asset_obj.storage_key)
+                        # Replace original URLs with watermarked versions
+                        if url_map:
+                            for img in state.images:
+                                if img.url and img.url in url_map:
+                                    img.url = url_map[img.url]
+                            if cover_image_url and cover_image_url in url_map:
+                                cover_image_url = url_map[cover_image_url]
+                        print(f"  ✅ 素材归档完成，已水印 {len(url_map)} 张")
 
                 except Exception as img_exc:
                     print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
@@ -432,6 +501,9 @@ async def create_article(
                 content_rich = _re.sub(r'\[IMAGE:(.*?)\]', _ph, content)
 
             # Footer is already appended by merge_images_into_content() via state.footer_template
+
+            # Post-processing: strip image descriptions using pre-extracted keywords
+            content_rich = _strip_photography_text(content_rich, image_keywords_auto)
 
             save_content(db, article.task_id, content, content_rich,
                          cover_image=cover_image_url,
@@ -605,21 +677,30 @@ async def confirm_outline(
                 state = await agent5_generate_images(state)
                 print(f"     已获取 {len(state.images)} 张配图")
 
-                # Merge images into content (also appends footer)
+                # ========== Archive images FIRST (watermark applied here) ==========
+                url_map: dict[str, str] = {}
+                if state.images:
+                    from app.services.asset_archive_service import save_images_to_asset_library
+                    from app.services.storage_service import storage_service as _ss
+                    image_urls = [img.url for img in state.images if img.url]
+                    archived = await save_images_to_asset_library(db, principal.tenant_id, image_urls)
+                    for orig_url, asset_obj in zip(image_urls, archived):
+                        if asset_obj:
+                            url_map[orig_url] = _ss.get_url(asset_obj.storage_key)
+                    if url_map:
+                        for img in state.images:
+                            if img.url and img.url in url_map:
+                                img.url = url_map[img.url]
+                        if cover_image_url and cover_image_url in url_map:
+                            cover_image_url = url_map[cover_image_url]
+
+                # Merge images into content (now uses watermarked URLs)
                 state = merge_images_into_content(state)
                 full_content = state.full_content or content
 
                 # Prepend AI cover if available
                 if cover_image_url:
                     full_content = f"![封面]({cover_image_url})\n\n{full_content}"
-
-                # Save to asset library
-                if state.images:
-                    from app.services.asset_archive_service import save_images_to_asset_library
-                    await save_images_to_asset_library(
-                        db, principal.tenant_id,
-                        [img.url for img in state.images if img.url],
-                    )
 
             except Exception as img_exc:
                 print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
@@ -645,6 +726,9 @@ async def confirm_outline(
             if cover_image_url:
                 full_content = f"![封面]({cover_image_url})\n\n{full_content}"
 
+        # Post-processing: strip photography text from final content
+        full_content = _strip_photography_text(full_content)
+
         save_content(db, task_id, content, full_content,
                      cover_image=cover_image_url,
                      footer_template=article.footer_template)
@@ -666,7 +750,11 @@ def publish_article_draft(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Save a completed article as a WeChat draft (草稿)."""
+    """Save a completed article as a WeChat draft (草稿).
+
+    这是「保存到草稿箱」，发布后返回 media_id。
+    如果需要正式发布（提交审核），请调用 /articles/{task_id}/submit-publish。
+    """
     article = db.query(Article).filter(Article.task_id == task_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
@@ -684,6 +772,220 @@ def publish_article_draft(
     except Exception as exc:
         logger.error("Save draft failed: %s", exc)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+
+@router.post("/articles/{task_id}/submit-publish")
+async def submit_publish(
+    task_id: str,
+    account_id: int = Query(..., description="OAuth account ID"),
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """正式发布草稿到微信公众号（自动轮询等待结果）。
+
+    流程:
+      1. 如果文章还没有保存为草稿，自动先保存草稿
+      2. 提交发布任务
+      3. 自动轮询发布状态（最多等 30 秒）
+      4. 发布成功后自动保存 msg_data_id → 可以直接同步评论
+    """
+    article = db.query(Article).filter(Article.task_id == task_id).first()
+    if not article:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
+
+    # Step 1: 如果有 content 但没有 media_id，先保存草稿
+    media_id = article.publish_id or ""  # 复用 publish_id 暂存 media_id（之前存过的话）
+    if not media_id and (article.full_content or article.content):
+        from app.services.wechat_publisher import save_article_as_draft
+        try:
+            draft_result = save_article_as_draft(db, article, account_id)
+            media_id = draft_result.get("media_id", "")
+            article.publish_id = media_id  # 临时存 publish_id 字段
+            db.commit()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Save draft failed: {exc}",
+            )
+
+    if not media_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Article has no content. Generate content first.",
+        )
+
+    # Step 2: 提交发布
+    from app.services.wechat_oauth_service import get_valid_token
+    token = await get_valid_token(db, account_id)
+
+    import httpx
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.weixin.qq.com/cgi-bin/draft/publish",
+            params={"access_token": token},
+            json={"media_id": media_id},
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+    if result.get("errcode", 0) != 0:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Publish failed: {result.get('errmsg', result)}",
+        )
+
+    publish_id = result.get("publish_id", "")
+    article.publish_id = str(publish_id) if publish_id else ""
+    article.status = "publishing"
+    article.phase = "PUBLISHING"
+    db.commit()
+
+    # Step 3: 自动轮询发布状态（最多等 30 秒，每 5 秒查一次）
+    import asyncio
+    msg_data_id = None
+    for attempt in range(6):
+        await asyncio.sleep(5)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.weixin.qq.com/cgi-bin/draft/get",
+                    params={"access_token": token},
+                    json={"publish_id": publish_id},
+                )
+                resp.raise_for_status()
+                status_result = resp.json()
+
+            if status_result.get("errcode", 0) != 0:
+                continue
+
+            pub_status = status_result.get("publish_status", -1)
+            if pub_status == 0:  # 发布成功
+                msg_data_id = (
+                    status_result.get("msg_data_id", "")
+                    or status_result.get("article_id", "")
+                )
+                article.msg_data_id = str(msg_data_id) if msg_data_id else ""
+                article.status = "published"
+                article.phase = "PUBLISHED"
+                db.commit()
+                break
+            elif pub_status in (1, 3):  # 发布失败
+                fail_detail = status_result.get("fail_detail", "")
+                article.status = "failed"
+                article.phase = "PUBLISH_FAILED"
+                article.error_message = f"Publish failed: {fail_detail}"
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Publish failed: {fail_detail}",
+                )
+            # pub_status == 2: 审核中，继续轮询
+        except HTTPException:
+            raise
+        except Exception:
+            continue
+
+    if msg_data_id:
+        return {
+            "success": True,
+            "publish_id": publish_id,
+            "msg_data_id": msg_data_id,
+            "task_id": task_id,
+            "message": "发布成功，msg_data_id 已自动保存，可直接同步评论",
+        }
+    else:
+        return {
+            "success": True,
+            "publish_id": publish_id,
+            "task_id": task_id,
+            "message": "发布任务已提交，审核中，稍后会自动获取 msg_data_id",
+            "auto_poll": True,
+        }
+
+
+@router.get("/articles/{task_id}/publish-status")
+async def query_publish_status(
+    task_id: str,
+    account_id: int = Query(..., description="OAuth account ID"),
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """查询公众号发布任务状态。
+
+    发布成功后，微信会返回 article_id 和 msg_data_id，
+    系统自动保存到 article 记录中，之后可用于同步评论。
+    """
+    article = db.query(Article).filter(Article.task_id == task_id).first()
+    if not article:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
+    if not article.publish_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No publish_id found, submit publish first")
+
+    from app.services.wechat_oauth_service import get_valid_token
+    token = await get_valid_token(db, account_id)
+
+    import httpx
+    url = f"https://api.weixin.qq.com/cgi-bin/draft/get?access_token={token}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, json={
+            "publish_id": article.publish_id,
+        })
+        resp.raise_for_status()
+        result = resp.json()
+
+    if result.get("errcode", 0) != 0:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"Query failed: {result.get('errmsg', result)}")
+
+    publish_status = result.get("publish_status", 0)
+    # publish_status: 0=成功, 1=失败, 2=审核中, 3=审核失败, 4=无权限
+    status_map = {
+        0: "published", 1: "failed", 2: "under_review",
+        3: "review_failed", 4: "no_permission",
+    }
+    new_status = status_map.get(publish_status, "unknown")
+
+    # 发布成功，提取 article_id 和 msg_data_id
+    if publish_status == 0:
+        article_id = result.get("article_id", "")
+        msg_data_id = result.get("msg_data_id", "") or result.get("article_id", "")
+        article.msg_data_id = str(msg_data_id) if msg_data_id else article.msg_data_id
+        # article_id 在微信新接口中就是 msg_data_id
+        if not article.msg_data_id and article_id:
+            article.msg_data_id = str(article_id)
+        article.status = "published"
+        article.phase = "PUBLISHED"
+    elif publish_status in (1, 3):
+        fail_detail = result.get("fail_detail", "")
+        article.error_message = f"发布失败(publish_id={article.publish_id}): {fail_detail}"
+        article.status = "failed"
+        article.phase = "PUBLISH_FAILED"
+
+    db.commit()
+
+    return {
+        "publish_id": article.publish_id,
+        "publish_status": new_status,
+        "article_id": result.get("article_id", ""),
+        "msg_data_id": article.msg_data_id or "",
+        "task_id": task_id,
+    }
+
+
+@router.post("/articles/{task_id}/set-msg-data-id")
+def set_article_msg_data_id(
+    task_id: str,
+    msg_data_id: str = Query(..., description="微信文章 msg_data_id"),
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """手动设置文章的 msg_data_id（用于在微信后台发布后，手动绑定评论）"""
+    article = db.query(Article).filter(Article.task_id == task_id).first()
+    if not article:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
+    article.msg_data_id = msg_data_id
+    db.commit()
+    return {"success": True, "task_id": task_id, "msg_data_id": msg_data_id}
 
 
 @router.post("/articles/{task_id}/ai-modify-outline")
@@ -737,6 +1039,10 @@ def delete_article(
     article = db.query(Article).filter(Article.id == article_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
+    # Nullify foreign keys before deleting
+    db.query(ContentVersion).filter(ContentVersion.article_id == article_id).update(
+        {ContentVersion.article_id: None}
+    )
     db.delete(article)
     db.commit()
 

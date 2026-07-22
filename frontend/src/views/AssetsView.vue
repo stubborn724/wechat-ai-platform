@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import type { Asset } from '@/api/types'
@@ -17,6 +17,31 @@ const selectedAsset = ref<Asset | null>(null)
 const showPreview = ref(false)
 const docContent = ref('')
 const docLoading = ref(false)
+
+// Watermark controls
+const applyingWatermark = ref(false)
+const removingWatermark = ref(false)
+const showWatermarkDialog = ref(false)
+const watermarkConfig = ref<any>(null)
+const watermarkLoading = ref(false)
+const wmPositionOptions = [
+  { value: 'top-left', label: '左上角' },
+  { value: 'top-right', label: '右上角' },
+  { value: 'bottom-left', label: '左下角' },
+  { value: 'bottom-right', label: '右下角' },
+  { value: 'center', label: '居中' },
+]
+const wmForm = ref({
+  type: 'logo' as 'logo' | 'text',
+  image_key: '',
+  content: '',
+  position: 'bottom-right',
+  opacity: 0.8,
+  scale: 0.15,
+  font_size: 36,
+  color: '#FFFFFF',
+  margin: 20,
+})
 
 const assetTypeNames: Record<string, string> = {
   image: '图片',
@@ -110,6 +135,85 @@ function previewAsset(asset: Asset) {
   docContent.value = ''
 }
 
+// ==================== Watermark ====================
+
+async function loadWatermarkConfig() {
+  watermarkLoading.value = true
+  try {
+    const res = await client.get('/watermark-config')
+    watermarkConfig.value = res.data
+    if (res.data.enabled) {
+      if (res.data.watermark_type === 'logo' && res.data.logo_image_key) {
+        wmForm.value.type = 'logo'
+        wmForm.value.image_key = res.data.logo_image_key
+        wmForm.value.scale = res.data.scale / 100
+      } else if (res.data.watermark_type === 'text') {
+        wmForm.value.type = 'text'
+        wmForm.value.content = res.data.text_content || ''
+        wmForm.value.font_size = res.data.font_size
+        wmForm.value.color = res.data.color
+      }
+      wmForm.value.position = res.data.position
+      wmForm.value.opacity = res.data.opacity / 100
+      wmForm.value.margin = res.data.margin
+    }
+  } catch {
+    // ignore
+  } finally {
+    watermarkLoading.value = false
+  }
+}
+
+async function handleApplyWatermark() {
+  if (!selectedAsset.value) return
+  applyingWatermark.value = true
+  try {
+    const res = await client.post(`/assets/${selectedAsset.value.id}/watermark`, wmForm.value)
+    Object.assign(selectedAsset.value, res.data)
+    // Refresh asset in list
+    const idx = assets.value.findIndex(a => a.id === selectedAsset.value!.id)
+    if (idx >= 0) assets.value[idx] = { ...res.data, preview_url: res.data.preview_url }
+    ElMessage.success('水印已应用')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '水印应用失败')
+  } finally {
+    applyingWatermark.value = false
+  }
+}
+
+async function handleRemoveWatermark() {
+  if (!selectedAsset.value) return
+  try {
+    await ElMessageBox.confirm('确定去除水印？将恢复到原始版本。', '确认', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      type: 'info',
+    })
+  } catch {
+    return
+  }
+  removingWatermark.value = true
+  try {
+    const res = await client.delete(`/assets/${selectedAsset.value.id}/watermark`)
+    Object.assign(selectedAsset.value, res.data)
+    // Refresh asset in list
+    const idx = assets.value.findIndex(a => a.id === selectedAsset.value!.id)
+    if (idx >= 0) assets.value[idx] = { ...res.data, preview_url: res.data.preview_url }
+    ElMessage.success('水印已去除')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '去除水印失败')
+  } finally {
+    removingWatermark.value = false
+  }
+}
+
+function openWatermarkDialog() {
+  showWatermarkDialog.value = true
+  loadWatermarkConfig()
+}
+
+const isImageAsset = computed(() => selectedAsset.value?.asset_type === 'image')
+
 onMounted(load)
 </script>
 
@@ -195,12 +299,109 @@ onMounted(load)
             {{ selectedAsset.created_at ? new Date(selectedAsset.created_at).toLocaleString('zh-CN') : '-' }}
           </el-descriptions-item>
         </el-descriptions>
+        <el-divider />
         <div class="preview-actions">
           <a v-if="selectedAsset.preview_url" :href="selectedAsset.preview_url" target="_blank">
             <el-button size="small">下载</el-button>
           </a>
+          <template v-if="isImageAsset">
+            <el-button
+              v-if="!selectedAsset.is_watermarked"
+              size="small"
+              type="warning"
+              plain
+              @click="openWatermarkDialog"
+            >
+              添加水印
+            </el-button>
+            <el-button
+              v-else
+              size="small"
+              type="danger"
+              plain
+              :loading="removingWatermark"
+              @click="handleRemoveWatermark"
+            >
+              {{ removingWatermark ? '去除中...' : '去除水印' }}
+            </el-button>
+            <span v-if="selectedAsset.is_watermarked" class="watermark-badge">已添加水印</span>
+          </template>
         </div>
       </div>
+    </el-dialog>
+
+    <!-- Watermark Config Dialog -->
+    <el-dialog v-model="showWatermarkDialog" title="添加水印" width="520px" top="5vh">
+      <div v-if="watermarkLoading" style="padding: 24px; text-align: center;">
+        <el-skeleton :rows="3" animated />
+      </div>
+      <template v-else>
+        <el-form label-position="top" size="small">
+          <el-form-item label="水印类型">
+            <el-radio-group v-model="wmForm.type">
+              <el-radio value="logo">Logo 图片</el-radio>
+              <el-radio value="text">文字</el-radio>
+            </el-radio-group>
+          </el-form-item>
+
+          <template v-if="wmForm.type === 'logo'">
+            <el-form-item label="Logo 图片 Key">
+              <el-input v-model="wmForm.image_key" placeholder="MinIO 中的 Logo 图片 key" />
+              <span class="form-hint">请先在「水印设置」中上传 Logo</span>
+            </el-form-item>
+            <el-form-item label="缩放比例">
+              <el-slider v-model="wmForm.scale" :min="0.05" :max="0.4" :step="0.01" show-input />
+            </el-form-item>
+          </template>
+
+          <template v-else>
+            <el-form-item label="水印文字">
+              <el-input v-model="wmForm.content" placeholder="输入水印文字" maxlength="100" />
+            </el-form-item>
+            <el-row :gutter="12">
+              <el-col :span="12">
+                <el-form-item label="字号">
+                  <el-input-number v-model="wmForm.font_size" :min="12" :max="120" :step="4" />
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="颜色">
+                  <el-color-picker v-model="wmForm.color" />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </template>
+
+          <el-row :gutter="12">
+            <el-col :span="8">
+              <el-form-item label="位置">
+                <el-select v-model="wmForm.position" style="width:100%">
+                  <el-option v-for="opt in wmPositionOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="透明度">
+                <el-slider v-model="wmForm.opacity" :min="0.1" :max="1" :step="0.05" show-input />
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="边距">
+                <el-input-number v-model="wmForm.margin" :min="0" :max="100" :step="5" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+        </el-form>
+        <p style="color: #909399; font-size: 12px; margin-top: 8px;">
+          此操作仅对当前素材生效。如需全局默认水印，请在「水印设置」中配置。
+        </p>
+      </template>
+      <template #footer>
+        <el-button @click="showWatermarkDialog = false">取消</el-button>
+        <el-button type="primary" :loading="applyingWatermark" :disabled="watermarkLoading" @click="handleApplyWatermark">
+          {{ applyingWatermark ? '应用中...' : '应用水印' }}
+        </el-button>
+      </template>
     </el-dialog>
 
     <!-- Upload Dialog -->
@@ -432,5 +633,21 @@ onMounted(load)
   margin-top: 4px;
   font-size: 12px;
   color: #909399;
+}
+
+.watermark-badge {
+  font-size: 11px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-left: 8px;
+}
+
+.form-hint {
+  display: block;
+  font-size: 11px;
+  color: #909399;
+  margin-top: 2px;
 }
 </style>

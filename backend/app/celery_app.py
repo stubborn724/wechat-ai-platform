@@ -23,9 +23,9 @@ celery_app.conf.update(
             "task": "app.tasks.feed_tasks.fetch_all_feeds",
             "schedule": 1800.0,
         },
-        # Check publish plans every 15 minutes
-        "check-publish-plans-every-15-minutes": {
-            "task": "app.tasks.publish_tasks.check_publish_plans",
+        # Check scheduled tasks every 15 minutes
+        "check-scheduled-tasks-every-15-minutes": {
+            "task": "app.tasks.scheduled_task_executor.check_scheduled_tasks",
             "schedule": 900.0,
         },
         # Poll queued content jobs every minute
@@ -37,11 +37,6 @@ celery_app.conf.update(
         "cleanup-old-assets-daily": {
             "task": "app.tasks.job_tasks.cleanup_old_assets",
             "schedule": 86400.0,
-        },
-        # Check imitation tasks every hour
-        "poll-imitation-tasks-every-hour": {
-            "task": "app.tasks.imitation_tasks.poll_due_imitation_tasks",
-            "schedule": 3600.0,
         },
     },
 )

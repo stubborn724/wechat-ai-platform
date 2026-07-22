@@ -37,10 +37,13 @@ def create_pool(db: Session, tenant_id: int, name: str, description: str = "") -
 
 
 def list_pools(db: Session, tenant_id: int) -> List[ImitationPool]:
-    """列出租户的所有仿写池"""
+    """列出租户的所有启用的仿写池"""
     return (
         db.query(ImitationPool)
-        .filter(ImitationPool.tenant_id == tenant_id)
+        .filter(
+            ImitationPool.tenant_id == tenant_id,
+            ImitationPool.is_active == True,
+        )
         .order_by(ImitationPool.id.desc())
         .all()
     )

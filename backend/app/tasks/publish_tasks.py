@@ -28,7 +28,7 @@ def check_publish_plans():
         plans = (
             db.query(PublishPlan)
             .filter(
-                PublishPlan.day_of_week == day_of_week,
+                PublishPlan.day_of_week.in_([day_of_week, -1]),
                 PublishPlan.is_active == True,
             )
             .all()

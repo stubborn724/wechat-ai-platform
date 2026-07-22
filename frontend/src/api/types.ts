@@ -10,12 +10,13 @@ export interface FeedSourceArticle { id: number; title: string; body_markdown?: 
 export interface FeedSourceArticlePage { total: number; page: number; page_size: number; items: FeedSourceArticle[] }
 export interface KnowledgeBase { id: number | string; name: string; slug?: string; kb_type?: string; description?: string; is_active?: boolean; created_at: string }
 export interface KbDocument { id: number | string; filename: string; file_type?: string; status: string; chunk_count?: number; error_message?: string; created_at: string }
-export interface PublishPlan { id: string; account_id: string; day_of_week: number | null; article_slots: ArticleSlot[]; publish_times: string[]; public_count: number; private_count: number; is_active: boolean; created_at?: string }
+export interface PublishPlan { id: number; account_id: number; day_of_week: number; article_slots: ArticleSlot[]; publish_times: string[]; public_count: number; private_count: number; is_active: boolean; created_at?: string }
 export interface ArticleSlot { content_type: string; sort_order: number; publish_domain: string; topic?: string }
 export interface TitleOption { main_title: string; sub_title: string }
 export interface LoginRequest { email: string; password: string }
 export interface LoginResponse { access_token: string; refresh_token: string; user: User }
 export interface PaginatedResponse<T> { total: number; page: number; page_size: number; items: T[] }
 export interface OAuthAccount { id: number; app_id: string; nick_name: string | null; head_img: string | null; alias: string | null; service_type_info: number | null; user_name: string | null; qrcode_url: string | null; func_info: any[] | null; token_expires_at: string | null; created_at: string }
+export interface ScheduledTask { id: number; name: string; is_active: boolean; writing_mode: string; topic: string | null; feed_source_ids: number[] | null; style: string | null; knowledge_base_ids: number[] | null; day_of_week: number; publish_times: string[]; article_slots: ArticleSlot[] | null; articles_per_day: number; public_count: number; private_count: number; approval_mode: string; account_id: number | null; footer_template: string | null; total_generated: number; last_run_at: string | null; created_at: string; updated_at: string }
 export interface ImitationPool { id: number; name: string; description: string | null; is_active: boolean; source_count: number; created_at: string }
 export interface ImitationTask { id: number; name: string; pool_id: number | null; strategy: string; articles_per_day: number; status: string; total_generated: number; created_at: string; updated_at: string }

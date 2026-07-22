@@ -7,8 +7,9 @@ from typing import List, Optional
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models.mysql_models import Asset, AssetUsage
+from app.models.mysql_models import Asset, AssetUsage, TenantWatermarkConfig
 from app.services.storage_service import generate_object_key, storage_service
+from app.services.watermark_service import watermark_service
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +42,18 @@ async def save_image_to_asset_library(
     image_url: str,
     keywords: str = "",
     usage_type: str = "generated_image",
+    watermark_enabled: Optional[bool] = None,
 ) -> Optional[Asset]:
     """Download an image URL and save it to the asset library.
 
-    Downloads the image, uploads to MinIO under ``assets/auto/``,
-    creates an Asset record, and returns it.
+    ``watermark_enabled`` overrides the tenant global config per-image.
+    ``None`` = fallback to tenant config; ``True``/``False`` = force on/off.
     """
     if not image_url:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(image_url)
             resp.raise_for_status()
 
@@ -76,6 +78,39 @@ async def save_image_to_asset_library(
             width, height = img.size
         except Exception:
             pass
+
+        # Apply watermark (per-request override or tenant global config)
+        wm_config = db.query(TenantWatermarkConfig).filter(
+            TenantWatermarkConfig.tenant_id == tenant_id,
+        ).first()
+        should_wm = watermark_enabled if watermark_enabled is not None else (wm_config.enabled if wm_config else False)
+        if should_wm and wm_config:
+            try:
+                wm_params = {
+                    "type": wm_config.watermark_type,
+                    "position": wm_config.position,
+                    "opacity": wm_config.opacity / 100.0,
+                    "margin": wm_config.margin,
+                }
+                if wm_config.watermark_type == "logo":
+                    if wm_config.logo_image_key:
+                        wm_params["image_key"] = wm_config.logo_image_key
+                        wm_params["scale"] = wm_config.scale / 100.0
+                        file_bytes = watermark_service.apply_image_watermark(
+                            file_bytes, wm_params, content_type,
+                        )
+                        logger.info("Applied logo watermark to archived image")
+                else:
+                    wm_params["content"] = wm_config.text_content or ""
+                    wm_params["font_size"] = wm_config.font_size
+                    wm_params["color"] = wm_config.color
+                    if wm_params["content"]:
+                        file_bytes = watermark_service.apply_image_watermark(
+                            file_bytes, wm_params, content_type,
+                        )
+                        logger.info("Applied text watermark to archived image")
+            except Exception as exc:
+                logger.warning("Failed to apply watermark on archive: %s", exc)
 
         # Upload to MinIO
         filename = f"auto_archive_{int(datetime.now().timestamp())}{ext}"
@@ -118,12 +153,13 @@ async def save_images_to_asset_library(
     tenant_id: int,
     image_urls: List[str],
     keywords: Optional[List[str]] = None,
+    watermark_enabled: Optional[bool] = None,
 ) -> List[Asset]:
     """Save multiple image URLs to the asset library."""
     assets = []
     for i, url in enumerate(image_urls):
         kw = keywords[i] if keywords and i < len(keywords) else ""
-        asset = await save_image_to_asset_library(db, tenant_id, url, kw)
+        asset = await save_image_to_asset_library(db, tenant_id, url, kw, watermark_enabled=watermark_enabled)
         if asset:
             assets.append(asset)
     return assets

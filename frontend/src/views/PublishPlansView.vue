@@ -14,7 +14,7 @@ const currentId = ref<string | null>(null)
 
 const form = reactive({
   account_id: '',
-  day_of_week: null as number | null,
+  day_of_week: -1,
   article_slots: [] as ArticleSlot[],
   publish_times: [] as string[],
   public_count: 1,
@@ -23,7 +23,7 @@ const form = reactive({
 
 const dayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
 const dayOptions = [
-  { value: null, label: '每天' },
+  { value: -1, label: '每天' },
   ...dayLabels.map((label, i) => ({ value: i, label })),
 ]
 
@@ -56,7 +56,7 @@ async function load() {
 
 function resetForm() {
   form.account_id = ''
-  form.day_of_week = null
+  form.day_of_week = -1
   form.article_slots = []
   form.publish_times = []
   form.public_count = 1
@@ -73,7 +73,7 @@ function openCreate() {
 async function openEdit(plan: PublishPlan) {
   editing.value = true
   currentId.value = plan.id
-  form.account_id = plan.account_id
+  form.account_id = plan.account_id.toString()
   form.day_of_week = plan.day_of_week
   form.article_slots = [...plan.article_slots]
   form.publish_times = [...plan.publish_times]
@@ -107,7 +107,7 @@ async function save() {
   saving.value = true
   try {
     const payload = {
-      account_id: form.account_id,
+      account_id: parseInt(form.account_id, 10),
       day_of_week: form.day_of_week,
       article_slots: form.article_slots,
       publish_times: form.publish_times,
@@ -116,7 +116,7 @@ async function save() {
     }
 
     if (editing.value && currentId.value) {
-      await client.patch(`/publish-plans/${currentId.value}`, payload)
+      await client.put(`/publish-plans/${currentId.value}`, payload)
       ElMessage.success('计划已更新')
     } else {
       await client.post('/publish-plans', payload)
@@ -143,12 +143,12 @@ async function confirmDelete(plan: PublishPlan) {
 }
 
 function getDayLabel(d: number | null): string {
-  if (d === null) return '每天'
+  if (d === -1 || d === null) return '每天'
   return dayLabels[d] || '未知'
 }
 
-function getAccountName(accountId: string): string {
-  return accounts.value.find(a => a.id.toString() === accountId)?.name || accountId.slice(0, 8)
+function getAccountName(accountId: number | string): string {
+  return accounts.value.find(a => a.id.toString() === accountId.toString())?.name || String(accountId).slice(0, 8)
 }
 
 const contentTypeLabels: Record<string, string> = {
@@ -229,6 +229,7 @@ onMounted(load)
       v-model="showForm"
       :title="editing ? '编辑发布计划' : '新建发布计划'"
       width="560px"
+      destroy-on-close
     >
       <el-form label-position="top">
         <el-form-item label="公众号" required>

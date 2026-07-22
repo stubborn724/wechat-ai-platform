@@ -18,7 +18,7 @@ router = APIRouter()
 
 class PublishPlanCreate(BaseModel):
     account_id: int
-    day_of_week: int  # 0=Monday, 6=Sunday
+    day_of_week: int = -1  # 0=Monday, 6=Sunday, -1=every day
     article_slots: Optional[list] = None
     publish_times: Optional[list] = None
     public_count: int = 0
@@ -80,14 +80,14 @@ def create_publish_plan(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Create a new publish plan."""
-    if req.day_of_week < 0 or req.day_of_week > 6:
+    if req.day_of_week not in range(-1, 7):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="day_of_week must be between 0 (Monday) and 6 (Sunday)",
+            detail="day_of_week must be between -1 (every day) and 6 (Sunday)",
         )
 
     plan = PublishPlan(
-        tenant_id=1,  # TODO: resolve from principal
+        tenant_id=principal.tenant_id,
         account_id=req.account_id,
         day_of_week=req.day_of_week,
         article_slots=req.article_slots,

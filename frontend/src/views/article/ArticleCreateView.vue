@@ -90,6 +90,41 @@ const footerQrUrl = ref('')
 const uploadingQr = ref(false)
 const qrFileInput = ref<HTMLInputElement | null>(null)
 
+// Scheduling option
+const enableSchedule = ref(false)
+const enableWatermark = ref(true)
+const watermarkConfigLoaded = ref(false)
+
+async function loadWatermarkConfig() {
+  try {
+    const res = await client.get('/watermark-config')
+    enableWatermark.value = res.data.enabled
+    watermarkConfigLoaded.value = true
+  } catch {
+    watermarkConfigLoaded.value = true
+  }
+}
+const scheduleForm = reactive({
+  day_of_week: -1,
+  publish_times: ['08:00'] as string[],
+  articles_per_day: 1,
+  approval_mode: 'auto',
+})
+
+const dayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+const dayOptions = [
+  { value: -1, label: '每天' },
+  ...dayLabels.map((label, i) => ({ value: i, label })),
+]
+const newScheduleTime = ref('')
+
+function addScheduleTime() {
+  if (newScheduleTime.value && !scheduleForm.publish_times.includes(newScheduleTime.value)) {
+    scheduleForm.publish_times.push(newScheduleTime.value)
+    newScheduleTime.value = ''
+  }
+}
+
 async function uploadFooterQr(event: Event) {
   const input = event.target as HTMLInputElement
   if (!input.files?.length) return
@@ -269,10 +304,36 @@ async function handleCreate() {
       selected_image_urls: imageSelectionMode.value === 'manual' && selectedImageUrls.value.length > 0
         ? selectedImageUrls.value : undefined,
       footer_template: footerTemplate.value || undefined,
+      watermark_enabled: enableWatermark.value || undefined,
     })
 
     currentTaskId.value = article.task_id
     currentArticle.value = article
+    console.log('[DEBUG] createArticle response:', JSON.stringify(article).slice(0, 500))
+
+    // If scheduling is enabled, create a scheduled task
+    if (enableSchedule.value) {
+      try {
+        const schedulePayload: Record<string, any> = {
+          name: `定时: ${topic.value.slice(0, 40)}`,
+          writing_mode: selectedFeedSourceId.value ? 'feed' : 'free',
+          topic: topic.value,
+          style: style.value || null,
+          feed_source_ids: selectedFeedSourceId.value ? [selectedFeedSourceId.value] : null,
+          knowledge_base_ids: selectedKbIds.value.length > 0 ? selectedKbIds.value : null,
+          day_of_week: scheduleForm.day_of_week,
+          publish_times: scheduleForm.publish_times,
+          articles_per_day: scheduleForm.articles_per_day,
+          approval_mode: scheduleForm.approval_mode,
+          account_id: selectedAccountId.value,
+          footer_template: footerTemplate.value || null,
+        }
+        await client.post('/scheduled-tasks', schedulePayload)
+        ElMessage.success('定时任务已创建！')
+      } catch (scheduleErr: any) {
+        ElMessage.warning('文章创建成功，但定时任务创建失败')
+      }
+    }
 
     if (mode.value === 'auto') {
       // 全自动模式：后端已同步完成所有流程（含自动保存草稿）
@@ -287,7 +348,11 @@ async function handleCreate() {
       connectSSE(article.task_id)
     }
   } catch (err: any) {
-    ElMessage.error(err?.response?.data?.message || '创建失败')
+    console.error('[DEBUG] handleCreate error:', err)
+    console.error('[DEBUG] response:', err?.response?.data)
+    console.error('[DEBUG] status:', err?.response?.status)
+    const errMsg = err?.response?.data?.message || err?.response?.data?.detail || err?.message || '创建失败'
+    ElMessage.error(errMsg)
     currentPhase.value = 'FAILED'
   } finally {
     loading.value = false
@@ -535,6 +600,7 @@ onMounted(() => {
   loadAccounts()
   loadKnowledgeBases()
   loadFeedSources()
+  loadWatermarkConfig()
 })
 
 onUnmounted(() => {
@@ -711,6 +777,71 @@ onUnmounted(() => {
               </div>
             </div>
           </el-form-item>
+
+          <!-- Watermark Toggle -->
+          <el-divider />
+          <el-form-item label="水印">
+            <div class="watermark-toggle-row">
+              <el-switch v-model="enableWatermark" active-text="添加水印" inactive-text="无水印" />
+              <span v-if="watermarkConfigLoaded" class="form-hint">
+                在「水印设置」中配置样式
+              </span>
+            </div>
+          </el-form-item>
+
+          <!-- Scheduling Section -->
+          <el-divider />
+          <el-form-item>
+            <el-checkbox v-model="enableSchedule" label="同时创建定时任务" border />
+            <span class="form-hint" style="margin-left: 8px;">开启后，除了生成文章，还会按设定的时间周期自动生成</span>
+          </el-form-item>
+
+          <template v-if="enableSchedule">
+            <el-row :gutter="16">
+              <el-col :span="8">
+                <el-form-item label="执行频率">
+                  <el-select v-model="scheduleForm.day_of_week" style="width:100%">
+                    <el-option v-for="d in dayOptions" :key="d.value" :value="d.value" :label="d.label" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="每次篇数">
+                  <el-input-number v-model="scheduleForm.articles_per_day" :min="1" :max="10" style="width:100%" />
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="发布方式">
+                  <el-radio-group v-model="scheduleForm.approval_mode" size="small">
+                    <el-radio value="auto" border>自动</el-radio>
+                    <el-radio value="manual" border>人工审核</el-radio>
+                  </el-radio-group>
+                </el-form-item>
+              </el-col>
+            </el-row>
+
+            <el-form-item label="发布时间">
+              <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                <el-tag
+                  v-for="(t, i) in scheduleForm.publish_times"
+                  :key="i"
+                  closable
+                  @close="scheduleForm.publish_times.splice(i, 1)"
+                  style="margin-right: 4px;"
+                >
+                  {{ t }}
+                </el-tag>
+                <el-time-picker
+                  v-model="newScheduleTime"
+                  format="HH:mm"
+                  value-format="HH:mm"
+                  style="width: 120px"
+                  placeholder="添加时间"
+                />
+                <el-button size="small" @click="addScheduleTime" :disabled="!newScheduleTime">添加</el-button>
+              </div>
+            </el-form-item>
+          </template>
 
           <el-form-item>
             <el-button
@@ -1288,6 +1419,12 @@ onUnmounted(() => {
 
 .publish-card {
   margin-top: 16px;
+}
+
+.watermark-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .publish-row {

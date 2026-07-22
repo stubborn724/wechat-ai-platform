@@ -127,6 +127,10 @@ def save_content(
 ) -> Optional[Article]:
     """Persist the generated content, raw content, images metadata and cover
     image URL in a single call."""
+    # Final safety net: strip any photography/image description text
+    import re as _re
+    content = _strip_photography_lines(content)
+    full_content = _strip_photography_lines(full_content)
     return update_article_phase(
         db,
         task_id,
@@ -137,3 +141,74 @@ def save_content(
         cover_image=cover_image or "",
         footer_template=footer_template or "",
     )
+
+
+def _strip_photography_lines(text: str) -> str:
+    """Final safety net: remove lines containing photography/image description language.
+
+    Strategy:
+    1. Extract all IMAGE keywords (AI's own image descriptions) → remove matching body text
+    2. Remove lines with 2+ photography terms
+    3. Remove [IMAGE:] markers
+    """
+    if not text:
+        return text
+    import re as _re
+
+    # Step 1: Extract all image keywords from [IMAGE:keywords=XXX] markers AND markdown alt text
+    image_keywords = _re.findall(r'keywords=([^,\]]+)', text)
+    alt_texts = _re.findall(r'!\[([^\]]+)\]\([^)]+\)', text)
+    image_keywords.extend(alt_texts)
+    # Strip [IMAGE:] markers first
+    text = _re.sub(r'\[IMAGE:[^\]]*\]', '', text)
+
+    lines = text.split("\n")
+    photo_keywords = [
+        '俯拍', '仰拍', '侧拍', '微距', '特写', '近景', '远景', '中景',
+        '暖光', '逆光', '侧光', '顶光', '底光', '打光', '布光',
+        '景深', '光圈', '快门', '45度',
+    ]
+
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            cleaned.append(line)
+            continue
+
+        # ALWAYS preserve markdown image lines
+        if _re.match(r'^!\[.*\]\(.*\)$', s):
+            cleaned.append(line)
+            continue
+
+        # Step 2: Remove if line matches any image keyword phrase (AI wrote it as description)
+        if image_keywords:
+            is_image_desc = False
+            for kw in image_keywords:
+                # If the line contains a significant portion of the keyword phrase
+                if len(kw) >= 6 and kw in s:
+                    is_image_desc = True
+                    break
+                # Partial match: if >60% of keyword chars appear in the line in order
+                if len(kw) >= 10:
+                    common = sum(1 for c in kw if c in s)
+                    if common / len(kw) > 0.6:
+                        is_image_desc = True
+                        break
+            if is_image_desc:
+                continue
+
+        # Step 3: Skip if line starts with degree number (e.g. "45度俯拍...")
+        if _re.match(r'^\d+度', s):
+            continue
+        # Step 4: Skip if line has 2+ photography keywords
+        count = sum(1 for kw in photo_keywords if kw in s)
+        if count >= 2:
+            continue
+        # Step 5: Skip watermark/corner marks
+        if _re.search(r'(?:右下角|左下角|右上角|左上角).*(?:水印|文字|标志|logo)', s, _re.IGNORECASE):
+            continue
+
+        cleaned.append(line)
+
+    return "\n".join(cleaned)

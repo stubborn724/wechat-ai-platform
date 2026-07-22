@@ -211,7 +211,7 @@ onMounted(load)
     </el-dialog>
 
     <!-- Add Source Dialog -->
-    <el-dialog v-model="showAddSource" title="添加仿写来源" width="500px">
+    <el-dialog v-model="showAddSource" title="添加仿写来源" width="500px" destroy-on-close>
       <el-form label-position="top">
         <el-form-item label="从投喂源选择（优先）">
           <el-select v-model="addSourceForm.feed_source_id" style="width: 100%" clearable placeholder="选择已有投喂源">
