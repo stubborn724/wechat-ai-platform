@@ -101,7 +101,8 @@ class DashScopeImageGenService(ImageSearchService):
         prompt = kwargs.get("prompt") or keywords
         if not prompt:
             return self.get_fallback_image(keywords)
-        url = await self.wanxiang.generate_image(prompt)
+        # 默认不生成文字，除非 prompt 中明确要求了
+        url = await self.wanxiang.generate_image(prompt, no_text=True)
         if url:
             return url
         # Fallback to Pexels if Wanxiang fails

@@ -6,15 +6,38 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 from sqlalchemy.orm import Session
 
 from app.models.mysql_models import Article, AccountCredential, WeChatAccount
 
 logger = logging.getLogger(__name__)
+
+
+class _IPv4Adapter(HTTPAdapter):
+    """强制使用 IPv4 的 HTTP 适配器，解决 IPv6 导致微信 IP 白名单不匹配的问题"""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['source_address'] = ('0.0.0.0', 0)  # 强制 IPv4
+        return super().init_poolmanager(*args, **kwargs)
+
+    def send(self, *args, **kwargs):
+        # 保存原始 getaddrinfo
+        original_getaddrinfo = socket.getaddrinfo
+
+        def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+        socket.getaddrinfo = _ipv4_getaddrinfo
+        try:
+            return super().send(*args, **kwargs)
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
 
 
 class WechatPublisher:
@@ -25,10 +48,14 @@ class WechatPublisher:
         self.access_token: Optional[str] = None
         self.access_token_expire_time: float = 0
         self.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        # 创建使用 IPv4 的 session
+        self._session = requests.Session()
+        self._session.mount('https://api.weixin.qq.com', _IPv4Adapter())
+        self._session.mount('https://mp.weixin.qq.com', _IPv4Adapter())
         logger.info("WeChatPublisher 初始化: app_id=%s...", app_id[:6] if app_id else "")
 
     def _make_request(self, method, url, **kwargs):
-        """统一请求方法，自动添加代理和重试逻辑（与原项目一致）"""
+        """统一请求方法，自动使用 IPv4 session，添加代理和重试逻辑"""
         if self.proxies:
             kwargs['proxies'] = self.proxies
         if 'timeout' not in kwargs:
@@ -39,9 +66,9 @@ class WechatPublisher:
         for attempt in range(max_retries):
             try:
                 if method.upper() == 'GET':
-                    response = requests.get(url, **kwargs)
+                    response = self._session.get(url, **kwargs)
                 elif method.upper() == 'POST':
-                    response = requests.post(url, **kwargs)
+                    response = self._session.post(url, **kwargs)
                 else:
                     raise ValueError(f"不支持的HTTP方法: {method}")
                 response.raise_for_status()
@@ -407,9 +434,57 @@ class WechatPublisher:
         logger.info("✅ 保存草稿成功: %s", result)
         return result
 
+    # -----------------------------------------------------------------------
+    # 直接发布（保存草稿 → 立即发布）
+    # -----------------------------------------------------------------------
 
-def save_article_as_draft(db: Session, article: Article, account_id: int) -> dict:
-    """从数据库读取凭证并保存草稿"""
+    def publish_directly(self, title, content_markdown, author="", summary="",
+                         cover_image_url=None) -> dict:
+        """保存草稿后立即提交发布
+
+        Returns:
+            dict with publish_id from WeChat API
+        """
+        # Step 1: 先保存草稿，拿到 media_id
+        draft_result = self.save_draft(
+            title=title,
+            content_markdown=content_markdown,
+            author=author,
+            summary=summary,
+            cover_image_url=cover_image_url,
+        )
+        media_id = draft_result.get("media_id")
+        if not media_id:
+            raise Exception(f"保存草稿成功但未获取到 media_id: {draft_result}")
+
+        # Step 2: 提交发布
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"https://api.weixin.qq.com/cgi-bin/freepublish/submit?access_token={self.access_token}"
+        body = {"media_id": media_id}
+        headers = {"Content-Type": "application/json"}
+        response = self._make_request("POST", url, data=json.dumps(body), headers=headers)
+        result = response.json()
+
+        if "errcode" in result and result["errcode"] != 0:
+            errcode = result["errcode"]
+            logger.error("直接发布失败(errcode=%d): %s", errcode, result)
+            # 即使发布失败，草稿已保存到草稿箱，返回 partial 状态
+            return {
+                "media_id": media_id,
+                "publish_id": None,
+                "draft_saved": True,
+                "publish_error": str(result),
+            }
+
+        publish_id = result.get("publish_id")
+        logger.info("✅ 直接发布成功! publish_id=%s, media_id=%s", publish_id, media_id)
+        return {"media_id": media_id, "publish_id": publish_id, "draft_saved": True}
+
+
+def _get_publisher_for_account(db: Session, account_id: int) -> WechatPublisher:
+    """从数据库读取凭证，构造 WechatPublisher 实例"""
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id, WeChatAccount.deleted_at.is_(None)
     ).first()
@@ -422,18 +497,46 @@ def save_article_as_draft(db: Session, article: Article, account_id: int) -> dic
     if not credential:
         raise ValueError(f"Credential for account {account_id} not found")
 
-    app_secret = credential.encrypted_secret
-    logger.info("使用公众号: %s (app_id=%s... secret_len=%d)",
-                account.name, account.app_id[:6] if account.app_id else "", len(app_secret) if app_secret else 0)
+    logger.info("使用公众号: %s (app_id=%s...)", account.name, account.app_id[:6] if account.app_id else "")
+    return WechatPublisher(app_id=account.app_id, app_secret=credential.encrypted_secret)
 
-    publisher = WechatPublisher(app_id=account.app_id, app_secret=app_secret)
+
+def publish_article(db: Session, article: Article, account_id: int,
+                    mode: str = "draft") -> dict:
+    """发布文章到微信公众号
+
+    Args:
+        db: 数据库 Session
+        article: 文章对象
+        account_id: 公众号 ID
+        mode: 发布模式 — "draft" 保存草稿箱, "direct" 直接发布
+
+    Returns:
+        包含发布结果的 dict
+    """
+    publisher = _get_publisher_for_account(db, account_id)
     content = article.full_content or article.content or ""
     summary = article.sub_title or article.topic or ""
+    title = article.main_title or article.topic or "无标题"
 
-    return publisher.save_draft(
-        title=article.main_title or article.topic or "无标题",
-        content_markdown=content,
-        author="",
-        summary=summary,
-        cover_image_url=article.cover_image,
-    )
+    if mode == "direct":
+        return publisher.publish_directly(
+            title=title,
+            content_markdown=content,
+            author="",
+            summary=summary,
+            cover_image_url=article.cover_image,
+        )
+    else:
+        return publisher.save_draft(
+            title=title,
+            content_markdown=content,
+            author="",
+            summary=summary,
+            cover_image_url=article.cover_image,
+        )
+
+
+def save_article_as_draft(db: Session, article: Article, account_id: int) -> dict:
+    """保留的兼容函数 — 等价于 publish_article(..., mode='draft')"""
+    return publish_article(db, article, account_id, mode="draft")

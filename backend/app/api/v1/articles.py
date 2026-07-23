@@ -32,7 +32,8 @@ class CreateArticleRequest(BaseModel):
     user_description: Optional[str] = None
     mode: str = "manual"  # "manual" or "auto"
     article_count: int = 1
-    account_id: Optional[int] = None  # auto 模式下自动保存草稿
+    account_ids: Optional[List[int]] = None  # 要发布到的公众号列表，可多选
+    publish_mode: str = "draft"  # 发布模式: "draft" 存草稿箱, "direct" 直接发布
     knowledge_base_ids: Optional[List[int]] = None  # 知识库ID列表，用于注入参考内容
     source_feed_id: Optional[int] = None  # Feed源ID，用于仿写模式
     feed_article_ids: Optional[List[int]] = None  # 具体要仿写的文章ID列表
@@ -59,6 +60,7 @@ class OutlineResultSchema(BaseModel):
 
 class ConfirmOutlineRequest(BaseModel):
     outline: OutlineResultSchema
+    watermark_enabled: Optional[bool] = None  # None = use tenant global config
 
 
 class AiModifyOutlineRequest(BaseModel):
@@ -137,8 +139,8 @@ def _strip_photography_text(text: str, pre_extracted_keywords: list | None = Non
         if not s:
             cleaned.append(line)
             continue
-        # Always preserve markdown image lines
-        if re.match(r'^!\[.*\]\(.*\)$', s):
+        # Always preserve markdown image lines AND HTML img tags
+        if re.match(r'^!\[.*\]\(.*\)$', s) or re.match(r'^<img\s+[^>]+/?>$', s, re.IGNORECASE):
             cleaned.append(line)
             continue
         # Remove if line matches any extracted image keyword
@@ -430,7 +432,7 @@ async def create_article(
                     print("  ▶ [自动] 生成AI封面图...")
                     try:
                         from app.services.wanxiang_service import WanxiangImageService
-                        cover_prompt = f"公众号文章封面图：{main_title}。扁平化设计，简洁大气，适合社交媒体传播。"
+                        cover_prompt = f"公众号文章封面图：{main_title}。扁平化设计，简洁大气，适合社交媒体传播。不要包含任何文字或标题。"
                         ws = WanxiangImageService()
                         cover_url = await ws.generate_image(cover_prompt, size="1024*1024")
                         if cover_url:
@@ -452,18 +454,12 @@ async def create_article(
                     # Extract image keywords BEFORE merge (post-processing needs them)
                     image_keywords_auto = re.findall(r'keywords=([^,\]]+)', content)
 
-                    # Merge images into content
-                    state = merge_images_into_content(state)
-                    content_rich = state.full_content or content
-
-                    # If we have an AI cover, prepend it to the content
-                    if cover_image_url:
-                        content_rich = f"![封面]({cover_image_url})\n\n{content_rich}"
-
-                    # Save images to asset library
+                    # Save images to asset library (include cover image)
                     if state.images:
                         from app.services.asset_archive_service import save_images_to_asset_library
                         image_urls = [img.url for img in state.images if img.url]
+                        if cover_image_url and cover_image_url not in image_urls:
+                            image_urls.append(cover_image_url)
                         print(f"  ▶ [自动] 归档 {len(image_urls)} 张素材到素材库...")
                         archived = await save_images_to_asset_library(
                             db, principal.tenant_id, image_urls,
@@ -483,6 +479,13 @@ async def create_article(
                             if cover_image_url and cover_image_url in url_map:
                                 cover_image_url = url_map[cover_image_url]
                         print(f"  ✅ 素材归档完成，已水印 {len(url_map)} 张")
+
+                    # Merge images into content AFTER URLs are finalized
+                    state = merge_images_into_content(state)
+                    content_rich = state.full_content or content
+
+                    # 封面图不嵌入正文（已存为 article.cover_image，前端自行展示）
+                    # 不要在这里往 content_rich 前面加 <img>，避免重复
 
                 except Exception as img_exc:
                     print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
@@ -515,18 +518,25 @@ async def create_article(
             db.commit()
             print(f"  ✅ [自动] 全流程完成！")
 
-            # 自动保存到微信公众号草稿
-            if req.account_id:
-                from app.services.wechat_publisher import save_article_as_draft
-                try:
-                    draft_result = save_article_as_draft(db, article, req.account_id)
-                    media_id = draft_result.get("media_id")
-                    print(f"  ✅ [自动] 已保存到微信草稿箱! media_id={media_id}")
-                    article.status = "published"
-                    article.phase = "PUBLISHED"
+            # 自动保存到微信公众号（草稿箱或直接发布）
+            if req.account_ids:
+                from app.services.wechat_publisher import publish_article
+                success_count = 0
+                for aid in req.account_ids:
+                    try:
+                        result = publish_article(db, article, aid, mode=req.publish_mode)
+                        media_id = result.get("media_id")
+                        publish_id = result.get("publish_id")
+                        mode_label = "直接发布" if req.publish_mode == "direct" else "存草稿"
+                        detail = f"publish_id={publish_id}" if publish_id else f"media_id={media_id}"
+                        print(f"  ✅ [自动] {mode_label}到公众号 #{aid} 成功! {detail}")
+                        success_count += 1
+                    except Exception as draft_err:
+                        print(f"  ⚠️ [自动] 发布到公众号 #{aid} 失败: {draft_err}")
+                if success_count > 0:
+                    article.status = "published" if req.publish_mode == "direct" else "draft_saved"
+                    article.phase = "PUBLISHED" if req.publish_mode == "direct" else "DRAFT_SAVED"
                     db.commit()
-                except Exception as draft_err:
-                    print(f"  ⚠️ [自动] 保存微信草稿失败: {draft_err}")
 
         # ========== MANUAL MODE: 生成标题供用户选择 ==========
         else:
@@ -649,7 +659,7 @@ async def confirm_outline(
         if settings.dashscope_api_key:
             try:
                 from app.services.wanxiang_service import WanxiangImageService
-                cover_prompt = f"公众号文章封面图：{article.main_title or article.topic}。扁平化设计，简洁大气。"
+                cover_prompt = f"公众号文章封面图：{article.main_title or article.topic}。扁平化设计，简洁大气，适合社交媒体传播。不要包含任何文字或标题。"
                 ws = WanxiangImageService()
                 cover_url = await ws.generate_image(cover_prompt, size="1024*1024")
                 if cover_url:
@@ -682,8 +692,14 @@ async def confirm_outline(
                 if state.images:
                     from app.services.asset_archive_service import save_images_to_asset_library
                     from app.services.storage_service import storage_service as _ss
+                    # Include cover image in the archive list so it also gets watermarked
                     image_urls = [img.url for img in state.images if img.url]
-                    archived = await save_images_to_asset_library(db, principal.tenant_id, image_urls)
+                    if cover_image_url and cover_image_url not in image_urls:
+                        image_urls.append(cover_image_url)
+                    archived = await save_images_to_asset_library(
+                        db, principal.tenant_id, image_urls,
+                        watermark_enabled=req.watermark_enabled,
+                    )
                     for orig_url, asset_obj in zip(image_urls, archived):
                         if asset_obj:
                             url_map[orig_url] = _ss.get_url(asset_obj.storage_key)
@@ -698,9 +714,7 @@ async def confirm_outline(
                 state = merge_images_into_content(state)
                 full_content = state.full_content or content
 
-                # Prepend AI cover if available
-                if cover_image_url:
-                    full_content = f"![封面]({cover_image_url})\n\n{full_content}"
+                # 封面图不嵌入正文（已存为 article.cover_image，前端自行展示）
 
             except Exception as img_exc:
                 print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
@@ -713,7 +727,11 @@ async def confirm_outline(
                 footer = article.footer_template or ""
                 full_content = f"{content_rich}\n\n---\n\n{footer.strip()}" if footer else content_rich
                 if cover_image_url:
-                    full_content = f"![封面]({cover_image_url})\n\n{full_content}"
+                    full_content = (
+                        f'<img src="{cover_image_url}" alt="封面" '
+                        f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />\n\n'
+                        f'{full_content}'
+                    )
         else:
             import re
             def _ph(m):
@@ -724,7 +742,11 @@ async def confirm_outline(
             footer = article.footer_template or ""
             full_content = f"{content_rich}\n\n---\n\n{footer.strip()}" if footer else content_rich
             if cover_image_url:
-                full_content = f"![封面]({cover_image_url})\n\n{full_content}"
+                full_content = (
+                    f'<img src="{cover_image_url}" alt="封面" '
+                    f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />\n\n'
+                    f'{full_content}'
+                )
 
         # Post-processing: strip photography text from final content
         full_content = _strip_photography_text(full_content)
@@ -747,160 +769,44 @@ async def confirm_outline(
 def publish_article_draft(
     task_id: str,
     account_id: int = Query(..., description="WeChat account ID"),
+    mode: str = Query("draft", description='发布模式: "draft" 存草稿箱, "direct" 直接发布'),
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Save a completed article as a WeChat draft (草稿).
-
-    这是「保存到草稿箱」，发布后返回 media_id。
-    如果需要正式发布（提交审核），请调用 /articles/{task_id}/submit-publish。
-    """
+    """发布文章到微信公众号（存草稿箱或直接发布）"""
     article = db.query(Article).filter(Article.task_id == task_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
     if not (article.full_content or article.content):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Article has no content")
 
-    from app.services.wechat_publisher import save_article_as_draft
+    from app.services.wechat_publisher import publish_article
 
     try:
-        result = save_article_as_draft(db, article, account_id)
-        article.status = "published"
-        article.phase = "PUBLISHED"
+        result = publish_article(db, article, account_id, mode=mode)
+        if mode == "direct":
+            article.status = "publishing"
+            article.phase = "PUBLISHING"
+            article.publish_id = result.get("publish_id") or result.get("media_id", "")
+        else:
+            article.status = "draft_saved"
+            article.phase = "DRAFT_SAVED"
         db.commit()
-        return {"success": True, "media_id": result.get("media_id"), "task_id": task_id}
+        return {
+            "success": True,
+            "media_id": result.get("media_id"),
+            "publish_id": result.get("publish_id"),
+            "task_id": task_id,
+            "mode": mode,
+        }
     except Exception as exc:
-        logger.error("Save draft failed: %s", exc)
+        logger.error("Publish article failed: %s", exc)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
 
 
-@router.post("/articles/{task_id}/submit-publish")
-async def submit_publish(
-    task_id: str,
-    account_id: int = Query(..., description="OAuth account ID"),
-    db: Session = Depends(get_mysql_db),
-    principal: CurrentPrincipal = Depends(require_auth),
-):
-    """正式发布草稿到微信公众号（自动轮询等待结果）。
-
-    流程:
-      1. 如果文章还没有保存为草稿，自动先保存草稿
-      2. 提交发布任务
-      3. 自动轮询发布状态（最多等 30 秒）
-      4. 发布成功后自动保存 msg_data_id → 可以直接同步评论
-    """
-    article = db.query(Article).filter(Article.task_id == task_id).first()
-    if not article:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
-
-    # Step 1: 如果有 content 但没有 media_id，先保存草稿
-    media_id = article.publish_id or ""  # 复用 publish_id 暂存 media_id（之前存过的话）
-    if not media_id and (article.full_content or article.content):
-        from app.services.wechat_publisher import save_article_as_draft
-        try:
-            draft_result = save_article_as_draft(db, article, account_id)
-            media_id = draft_result.get("media_id", "")
-            article.publish_id = media_id  # 临时存 publish_id 字段
-            db.commit()
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Save draft failed: {exc}",
-            )
-
-    if not media_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Article has no content. Generate content first.",
-        )
-
-    # Step 2: 提交发布
-    from app.services.wechat_oauth_service import get_valid_token
-    token = await get_valid_token(db, account_id)
-
-    import httpx
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            "https://api.weixin.qq.com/cgi-bin/draft/publish",
-            params={"access_token": token},
-            json={"media_id": media_id},
-        )
-        resp.raise_for_status()
-        result = resp.json()
-
-    if result.get("errcode", 0) != 0:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Publish failed: {result.get('errmsg', result)}",
-        )
-
-    publish_id = result.get("publish_id", "")
-    article.publish_id = str(publish_id) if publish_id else ""
-    article.status = "publishing"
-    article.phase = "PUBLISHING"
-    db.commit()
-
-    # Step 3: 自动轮询发布状态（最多等 30 秒，每 5 秒查一次）
-    import asyncio
-    msg_data_id = None
-    for attempt in range(6):
-        await asyncio.sleep(5)
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    "https://api.weixin.qq.com/cgi-bin/draft/get",
-                    params={"access_token": token},
-                    json={"publish_id": publish_id},
-                )
-                resp.raise_for_status()
-                status_result = resp.json()
-
-            if status_result.get("errcode", 0) != 0:
-                continue
-
-            pub_status = status_result.get("publish_status", -1)
-            if pub_status == 0:  # 发布成功
-                msg_data_id = (
-                    status_result.get("msg_data_id", "")
-                    or status_result.get("article_id", "")
-                )
-                article.msg_data_id = str(msg_data_id) if msg_data_id else ""
-                article.status = "published"
-                article.phase = "PUBLISHED"
-                db.commit()
-                break
-            elif pub_status in (1, 3):  # 发布失败
-                fail_detail = status_result.get("fail_detail", "")
-                article.status = "failed"
-                article.phase = "PUBLISH_FAILED"
-                article.error_message = f"Publish failed: {fail_detail}"
-                db.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Publish failed: {fail_detail}",
-                )
-            # pub_status == 2: 审核中，继续轮询
-        except HTTPException:
-            raise
-        except Exception:
-            continue
-
-    if msg_data_id:
-        return {
-            "success": True,
-            "publish_id": publish_id,
-            "msg_data_id": msg_data_id,
-            "task_id": task_id,
-            "message": "发布成功，msg_data_id 已自动保存，可直接同步评论",
-        }
-    else:
-        return {
-            "success": True,
-            "publish_id": publish_id,
-            "task_id": task_id,
-            "message": "发布任务已提交，审核中，稍后会自动获取 msg_data_id",
-            "auto_poll": True,
-        }
+# ===========================================================
+# 文章定时发布 — 已迁移到 scheduled_tasks 流程
+# ===========================================================
 
 
 @router.get("/articles/{task_id}/publish-status")
@@ -910,66 +816,14 @@ async def query_publish_status(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """查询公众号发布任务状态。
+    """查询公众号发布任务状态（当前版本的发布改用 publish-draft?mode=direct）
 
-    发布成功后，微信会返回 article_id 和 msg_data_id，
-    系统自动保存到 article 记录中，之后可用于同步评论。
+    保留此端点仅用于兼容旧数据，新数据直接通过 publish-draft 完成。
     """
-    article = db.query(Article).filter(Article.task_id == task_id).first()
-    if not article:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
-    if not article.publish_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No publish_id found, submit publish first")
-
-    from app.services.wechat_oauth_service import get_valid_token
-    token = await get_valid_token(db, account_id)
-
-    import httpx
-    url = f"https://api.weixin.qq.com/cgi-bin/draft/get?access_token={token}"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(url, json={
-            "publish_id": article.publish_id,
-        })
-        resp.raise_for_status()
-        result = resp.json()
-
-    if result.get("errcode", 0) != 0:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail=f"Query failed: {result.get('errmsg', result)}")
-
-    publish_status = result.get("publish_status", 0)
-    # publish_status: 0=成功, 1=失败, 2=审核中, 3=审核失败, 4=无权限
-    status_map = {
-        0: "published", 1: "failed", 2: "under_review",
-        3: "review_failed", 4: "no_permission",
-    }
-    new_status = status_map.get(publish_status, "unknown")
-
-    # 发布成功，提取 article_id 和 msg_data_id
-    if publish_status == 0:
-        article_id = result.get("article_id", "")
-        msg_data_id = result.get("msg_data_id", "") or result.get("article_id", "")
-        article.msg_data_id = str(msg_data_id) if msg_data_id else article.msg_data_id
-        # article_id 在微信新接口中就是 msg_data_id
-        if not article.msg_data_id and article_id:
-            article.msg_data_id = str(article_id)
-        article.status = "published"
-        article.phase = "PUBLISHED"
-    elif publish_status in (1, 3):
-        fail_detail = result.get("fail_detail", "")
-        article.error_message = f"发布失败(publish_id={article.publish_id}): {fail_detail}"
-        article.status = "failed"
-        article.phase = "PUBLISH_FAILED"
-
-    db.commit()
-
-    return {
-        "publish_id": article.publish_id,
-        "publish_status": new_status,
-        "article_id": result.get("article_id", ""),
-        "msg_data_id": article.msg_data_id or "",
-        "task_id": task_id,
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="此接口已废弃，请使用 POST /articles/{task_id}/publish-draft?mode=direct",
+    )
 
 
 @router.post("/articles/{task_id}/set-msg-data-id")

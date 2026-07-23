@@ -68,10 +68,13 @@ def merge_content_node(state: ArticleGenState) -> dict:
                 img = lookup.get(pos)
                 if img is None:
                     logger.debug("No image found for position %d; removing placeholder", pos)
-                    return ""  # Remove placeholder entirely rather than leaving it
+                    return ""
                 alt_text = img.keywords or f"Image {pos}"
-                # Output: visible Chinese description + empty line + actual image
-                return f"{alt_text}\n\n![{alt_text}]({img.url})"
+                return (
+                    f'{alt_text}\n\n'
+                    f'<img src="{img.url}" alt="{alt_text}" '
+                    f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />'
+                )
 
             merged = _PLACEHOLDER_RE.sub(_replace_match, content)
         else:
@@ -79,10 +82,13 @@ def merge_content_node(state: ArticleGenState) -> dict:
                 "No placeholders found; appending %d images to end of content",
                 len(images),
             )
-            merged = content + "\n\n---\n\n"
+            merged = content + "\n\n"
             for img in images:
                 alt = img.keywords or f"Image {img.position}"
-                merged += f"![{alt}]({img.url})\n\n"
+                merged += (
+                    f'<img src="{img.url}" alt="{alt}" '
+                    f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />\n\n'
+                )
 
     # Post-processing: remove any remaining [IMAGE:] placeholders
     merged = re.sub(r'\[IMAGE:[^\]]*\]', '', merged)
@@ -93,10 +99,33 @@ def merge_content_node(state: ArticleGenState) -> dict:
     # Post-processing: normalize 3+ spaces at line starts
     merged = re.sub(r'^ {3,}', '', merged, flags=re.MULTILINE)
 
-    # Append footer template if configured
+    # Post-processing: 去掉正文开头的标题（已由前端独立展示）
+    selected_title = state.get("selected_title")
+    main_title = None
+    if selected_title:
+        if isinstance(selected_title, dict):
+            main_title = selected_title.get("main_title", "")
+        else:
+            main_title = getattr(selected_title, "main_title", "")
+    if main_title:
+        lines = merged.split("\n")
+        while lines:
+            stripped = lines[0].strip()
+            if stripped.startswith("# ") or stripped.startswith("## "):
+                title_text = stripped.lstrip("#").strip()
+                if title_text == main_title:
+                    lines.pop(0)
+                    continue
+            elif not stripped:
+                lines.pop(0)
+                continue
+            break
+        merged = "\n".join(lines)
+
+    # Append footer template if configured（不加横线）
     footer_template = state.get("footer_template", "")
     if footer_template:
-        merged = f"{merged}\n\n---\n\n{footer_template.strip()}"
+        merged = f"{merged}\n\n{footer_template.strip()}"
 
     logger.info("Merged content length: %d characters", len(merged))
     return {"full_content": merged}

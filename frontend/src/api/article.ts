@@ -9,7 +9,8 @@ export interface CreateArticleRequest {
   user_description?: string
   mode?: string
   article_count?: number
-  account_id?: number
+  account_ids?: number[]
+  publish_mode?: string
   knowledge_base_ids?: number[]
   source_feed_id?: number
   feed_article_ids?: number[]
@@ -24,6 +25,7 @@ export interface ConfirmTitleRequest {
 
 export interface ConfirmOutlineRequest {
   outline: any
+  watermark_enabled?: boolean
 }
 
 export interface AiModifyOutlineRequest {
@@ -72,9 +74,9 @@ export async function getExecutionLogs(taskId: string) {
   return res.data.data || res.data
 }
 
-export async function publishDraft(taskId: string, accountId: number) {
+export async function publishDraft(taskId: string, accountId: number, mode: string = 'draft') {
   const res = await client.post(`/articles/${taskId}/publish-draft`, null, {
-    params: { account_id: accountId },
+    params: { account_id: accountId, mode },
   })
   return res.data
 }

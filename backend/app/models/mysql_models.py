@@ -397,43 +397,6 @@ class AssetUsage(MysqlBase):
 
 
 # ============================================================
-# 阶段一：微信开放平台扫码授权
-# ============================================================
-
-
-class WeChatOAuthAccount(MysqlBase):
-    """通过微信开放平台扫码授权的公众号"""
-    __tablename__ = "wechat_oauth_accounts"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    # 授权信息
-    app_id = Column(String(128), nullable=False, comment="授权公众号的 AppID")
-    nick_name = Column(String(255), nullable=True, comment="公众号昵称")
-    head_img = Column(String(512), nullable=True, comment="公众号头像 URL")
-    service_type_info = Column(Integer, nullable=True, comment="公众号类型")
-    verify_type_info = Column(Integer, nullable=True, comment="认证类型")
-    user_name = Column(String(128), nullable=True, comment="原始 ID")
-    alias = Column(String(255), nullable=True, comment="微信号")
-    qrcode_url = Column(String(512), nullable=True, comment="二维码 URL")
-    business_info = Column(JSON, nullable=True)
-    # Token
-    authorizer_access_token = Column(Text, nullable=True)
-    authorizer_refresh_token = Column(Text, nullable=True)
-    token_expires_at = Column(DateTime, nullable=True)
-    func_info = Column(JSON, nullable=True, comment="授权给第三方平台的权限集")
-    # 状态
-    is_active = Column(Boolean, default=True, nullable=False)
-    authorization_app_id = Column(String(128), nullable=True, comment="第三方平台 app_id")
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("tenant_id", "app_id", name="uq_oauth_account_tenant_app"),
-    )
-
-
-# ============================================================
 # 阶段二：多源仿写
 # ============================================================
 
@@ -664,6 +627,9 @@ class ScheduledTask(MysqlBase):
     # 发布配置
     approval_mode = Column(String(32), default="auto")
     account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
+    account_ids = Column(JSON, nullable=True, comment="多选公众号 ID 列表，优先级高于 account_id")
+    publish_mode = Column(String(32), default="draft", comment="draft=存草稿箱, direct=直接发布")
+    image_source = Column(String(64), default="pexels", comment="图片来源: pexels/local/DASHSCOPE")
     footer_template = Column(Text, nullable=True)
 
     # 统计
@@ -708,3 +674,23 @@ class TenantWatermarkConfig(MysqlBase):
     __table_args__ = (
         Index("ix_tenant_watermark_tenant", "tenant_id"),
     )
+
+
+class WeChatCommentAutoConfig(MysqlBase):
+    """评论自动回复 & 自动私信配置 — 按公众号独立设置"""
+    __tablename__ = "wechat_comment_auto_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False, unique=True, index=True)
+
+    # 自动回复
+    auto_reply_enabled = Column(Boolean, default=False, nullable=False, comment="是否开启自动回复")
+    auto_reply_content = Column(Text, nullable=True, comment="自动回复内容")
+
+    # 自动私信
+    auto_msg_enabled = Column(Boolean, default=False, nullable=False, comment="是否开启自动私信")
+    auto_msg_content = Column(Text, nullable=True, comment="自动私信内容")
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

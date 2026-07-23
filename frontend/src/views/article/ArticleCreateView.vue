@@ -66,9 +66,9 @@ const imageProgress = ref<{ total: number; completed: number; items: any[] }>({
   items: [],
 })
 
-// WeChat draft
+// WeChat drafts — 支持多选公众号
 const accounts = ref<Account[]>([])
-const selectedAccountId = ref<number | null>(null)
+const selectedAccountIds = ref<number[]>([])
 const savingDraft = ref(false)
 
 // Knowledge base selector
@@ -89,6 +89,9 @@ const footerTemplate = ref('')
 const footerQrUrl = ref('')
 const uploadingQr = ref(false)
 const qrFileInput = ref<HTMLInputElement | null>(null)
+
+// Publish mode: "draft" = 存草稿箱, "direct" = 直接发布
+const publishMode = ref('draft')
 
 // Scheduling option
 const enableSchedule = ref(false)
@@ -230,7 +233,13 @@ function handleImageSourceChange() {
     imageSelectionMode.value = 'auto'
     selectedImageUrls.value = []
     loadLocalAssets()
+  } else if (imageSource.value === 'ai') {
+    // AI 生图模式：只启用 DASHSCOPE
+    enabledImageMethods.value = ['DASHSCOPE']
+    imageSelectionMode.value = 'auto'
+    selectedImageUrls.value = []
   } else {
+    enabledImageMethods.value = ['PEXELS', 'DASHSCOPE']
     imageSelectionMode.value = 'auto'
     selectedImageUrls.value = []
   }
@@ -240,25 +249,29 @@ async function loadAccounts() {
   try {
     const res = await client.get<{ items: Account[] }>('/accounts')
     accounts.value = (res.data.items || []).filter(a => a.status === 'active')
-    if (accounts.value.length > 0) {
-      selectedAccountId.value = accounts.value[0].id
-    }
+    // 默认不勾选，让用户手动选择
   } catch {
     // ignore
   }
 }
 
 async function handlePublishDraft() {
-  if (!currentTaskId.value || !selectedAccountId.value) return
+  if (!currentTaskId.value || selectedAccountIds.value.length === 0) return
   savingDraft.value = true
-  try {
-    const result = await publishDraft(currentTaskId.value, selectedAccountId.value)
-    ElMessage.success('✅ 已保存到微信草稿箱')
-  } catch (err: any) {
-    ElMessage.error(err?.response?.data?.detail || '保存到微信失败')
-  } finally {
-    savingDraft.value = false
+  let successCount = 0
+  const modeLabel = publishMode.value === 'direct' ? '直接发布' : '存草稿箱'
+  for (const aid of selectedAccountIds.value) {
+    try {
+      await publishDraft(currentTaskId.value, aid, publishMode.value)
+      successCount++
+    } catch (err: any) {
+      ElMessage.error(`${modeLabel}到公众号 #${aid} 失败: ${err?.response?.data?.detail || '未知错误'}`)
+    }
   }
+  if (successCount > 0) {
+    ElMessage.success(`✅ 已${modeLabel}到 ${successCount} 个公众号`)
+  }
+  savingDraft.value = false
 }
 
 // SSE
@@ -278,9 +291,8 @@ const styleOptions = [
 ]
 
 const imageMethodOptions = [
-  { value: 'PEXELS', label: 'Pexels 图片' },
+  { value: 'PEXELS', label: 'Pexels 图库' },
   { value: 'DASHSCOPE', label: 'AI 生图（通义万相）' },
-  { value: 'ICONIFY', label: '图标库' },
 ]
 
 // ==================== Methods ====================
@@ -292,12 +304,13 @@ async function handleCreate() {
     const article = await createArticle({
       topic: topic.value,
       style: style.value,
-      image_source: imageSource.value,
+      image_source: imageSource.value === 'ai' ? 'DASHSCOPE' : imageSource.value,
       enabled_image_methods: enabledImageMethods.value,
       user_description: userDescription.value || undefined,
       mode: mode.value,
       article_count: articleCount.value,
-      account_id: mode.value === 'auto' ? (selectedAccountId.value ?? undefined) : undefined,
+      account_ids: selectedAccountIds.value.length > 0 ? selectedAccountIds.value : undefined,
+      publish_mode: publishMode.value,
       knowledge_base_ids: selectedKbIds.value.length > 0 ? selectedKbIds.value : undefined,
       source_feed_id: selectedFeedSourceId.value ?? undefined,
       feed_article_ids: selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined,
@@ -325,7 +338,8 @@ async function handleCreate() {
           publish_times: scheduleForm.publish_times,
           articles_per_day: scheduleForm.articles_per_day,
           approval_mode: scheduleForm.approval_mode,
-          account_id: selectedAccountId.value,
+          account_ids: selectedAccountIds.value.length > 0 ? selectedAccountIds.value : null,
+          publish_mode: publishMode.value,
           footer_template: footerTemplate.value || null,
         }
         await client.post('/scheduled-tasks', schedulePayload)
@@ -528,6 +542,7 @@ async function handleConfirmOutline() {
   try {
     await confirmOutline(currentTaskId.value, {
       outline: outline.value,
+      watermark_enabled: enableWatermark.value,
     })
     currentPhase.value = 'CONTENT_GENERATING'
     streamedContent.value = ''
@@ -652,8 +667,9 @@ onUnmounted(() => {
             <el-col :span="8">
               <el-form-item label="图片来源">
                 <el-radio-group v-model="imageSource" @change="handleImageSourceChange">
-                  <el-radio value="pexels">Pexels 素材</el-radio>
+                  <el-radio value="pexels">Pexels 图库</el-radio>
                   <el-radio value="local">本地素材</el-radio>
+                  <el-radio value="ai">AI 生图（通义万相）</el-radio>
                 </el-radio-group>
               </el-form-item>
               <!-- Local asset selection mode -->
@@ -777,6 +793,40 @@ onUnmounted(() => {
               </div>
             </div>
           </el-form-item>
+
+          <!-- Target Accounts (多选) + 发布模式 -->
+          <el-row :gutter="16">
+            <el-col :span="16">
+              <el-form-item label="发布到公众号（可选，可多选）">
+                <el-select
+                  v-model="selectedAccountIds"
+                  multiple
+                  collapse-tags
+                  collapse-tags-tooltip
+                  placeholder="选择要发布的公众号（不选则仅生成内容）"
+                  style="width: 100%"
+                >
+                  <el-option
+                    v-for="acct in accounts"
+                    :key="acct.id"
+                    :value="acct.id"
+                    :label="acct.name"
+                  />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="发布方式">
+                <el-radio-group v-model="publishMode" :disabled="selectedAccountIds.length === 0">
+                  <el-radio value="draft">存草稿箱</el-radio>
+                  <el-radio value="direct">直接发布</el-radio>
+                </el-radio-group>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <span v-if="selectedAccountIds.length > 0" class="form-hint" style="display:block;margin-top:-12px;margin-bottom:18px">
+            {{ publishMode === 'direct' ? '⚠️ 直接发布将立即推送给订阅用户，请确认内容无误' : '保存到微信草稿箱，可手动检查后再发布' }}
+          </span>
 
           <!-- Watermark Toggle -->
           <el-divider />
@@ -1048,13 +1098,20 @@ onUnmounted(() => {
         </el-table>
       </el-card>
 
-      <!-- Publish to WeChat -->
+      <!-- Publish to WeChat (支持多选) -->
       <el-card v-if="accounts.length > 0" class="publish-card">
         <template #header>
           <span>发布到微信公众号</span>
         </template>
         <div class="publish-row">
-          <el-select v-model="selectedAccountId" style="width: 240px">
+          <el-select
+            v-model="selectedAccountIds"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            placeholder="选择要发布到的公众号（可多选）"
+            style="width: 320px"
+          >
             <el-option
               v-for="acct in accounts"
               :key="acct.id"
@@ -1062,15 +1119,25 @@ onUnmounted(() => {
               :label="acct.name"
             />
           </el-select>
+          <el-radio-group v-model="publishMode" size="small" style="margin-right: 12px">
+            <el-radio value="draft">存草稿箱</el-radio>
+            <el-radio value="direct">直接发布</el-radio>
+          </el-radio-group>
           <el-button
             type="success"
             :loading="savingDraft"
-            :disabled="!selectedAccountId"
+            :disabled="selectedAccountIds.length === 0"
             @click="handlePublishDraft"
           >
-            {{ savingDraft ? '保存中...' : '保存到微信草稿箱' }}
+            {{ savingDraft ? '处理中...' : publishMode === 'direct' ? '立即发布' : '保存到草稿箱' }}
           </el-button>
         </div>
+        <span v-if="selectedAccountIds.length > 1" class="form-hint" style="display:block;margin-top:8px">
+          将依次{{ publishMode === 'direct' ? '发布' : '保存' }}到每个选中公众号
+        </span>
+        <span v-if="publishMode === 'direct'" class="form-hint" style="display:block;margin-top:4px;color:#e6a23c">
+          ⚠️ 直接发布将立即推送给订阅用户，请确认内容无误
+        </span>
       </el-card>
 
       <div class="action-bar">

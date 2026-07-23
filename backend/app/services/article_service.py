@@ -176,8 +176,8 @@ def _strip_photography_lines(text: str) -> str:
             cleaned.append(line)
             continue
 
-        # ALWAYS preserve markdown image lines
-        if _re.match(r'^!\[.*\]\(.*\)$', s):
+        # ALWAYS preserve markdown image lines AND HTML img tags
+        if _re.match(r'^!\[.*\]\(.*\)$', s) or _re.match(r'^<img\s+[^>]+/?>$', s, _re.IGNORECASE):
             cleaned.append(line)
             continue
 

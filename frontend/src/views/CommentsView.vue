@@ -3,7 +3,7 @@
     <div class="page-header">
       <h2>评论管理</h2>
       <div class="header-actions">
-        <el-select v-model="filterAccountId" placeholder="选择公众号" clearable style="width:240px">
+        <el-select v-model="filterAccountId" placeholder="选择公众号" clearable style="width:240px" @change="onAccountChange">
           <el-option v-for="a in accounts" :key="a.id" :label="a.label" :value="a.id">
             <span>{{ a.label }}</span>
             <el-tag v-if="a.account_type === 'oauth'" size="small" type="success" style="margin-left:8px">授权</el-tag>
@@ -20,6 +20,60 @@
         </el-button>
       </div>
     </div>
+
+    <!-- 自动回复 & 自动私信 配置卡 -->
+    <el-card class="auto-config-card" v-if="filterAccountId">
+      <template #header>
+        <div class="config-header">
+          <span>⚙️ 自动回复 & 自动私信设置</span>
+          <el-button type="primary" size="small" :loading="savingConfig" @click="saveAutoConfig">
+            保存配置
+          </el-button>
+        </div>
+      </template>
+      <el-form :model="autoConfig" label-width="100px" label-position="top">
+        <el-row :gutter="24">
+          <!-- 自动回复 -->
+          <el-col :span="12">
+            <el-form-item>
+              <template #label>
+                <span>
+                  自动回复评论
+                  <el-switch v-model="autoConfig.auto_reply_enabled" size="small" style="margin-left:8px" />
+                </span>
+              </template>
+              <el-input
+                v-model="autoConfig.auto_reply_content"
+                type="textarea"
+                :rows="3"
+                :disabled="!autoConfig.auto_reply_enabled"
+                placeholder="输入自动回复的内容，有新评论时自动回复"
+              />
+            </el-form-item>
+          </el-col>
+
+          <!-- 自动私信 -->
+          <el-col :span="12">
+            <el-form-item>
+              <template #label>
+                <span>
+                  自动发送私信
+                  <el-switch v-model="autoConfig.auto_msg_enabled" size="small" style="margin-left:8px" />
+                </span>
+              </template>
+              <el-input
+                v-model="autoConfig.auto_msg_content"
+                type="textarea"
+                :rows="3"
+                :disabled="!autoConfig.auto_msg_enabled"
+                placeholder="输入自动私信的内容，有新评论时自动给该用户发私信（不重复发送）"
+              />
+              <div class="config-tip">已发送过私信的用户不会重复发送</div>
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+    </el-card>
 
     <!-- 已发布文章列表（用于同步评论） -->
     <el-card class="articles-card" v-if="publishedArticles.length > 0">
@@ -108,7 +162,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listComments, replyComment, toggleFavorite } from '@/api/wechat'
 import type { Comment } from '@/api/wechat'
@@ -133,6 +187,15 @@ const replyDialogVisible = ref(false)
 const replyTarget = ref<Comment | null>(null)
 const replyContent = ref('')
 
+// 自动配置
+const autoConfig = ref({
+  auto_reply_enabled: false,
+  auto_reply_content: '',
+  auto_msg_enabled: false,
+  auto_msg_content: '',
+})
+const savingConfig = ref(false)
+
 function formatTime(t?: string) {
   if (!t) return ''
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
@@ -140,22 +203,11 @@ function formatTime(t?: string) {
 
 async function fetchAccounts() {
   try {
-    // 同时拉取 OAuth 授权账号 和 普通凭据账号
-    const [oauthRes, regularRes] = await Promise.all([
-      client.get('/wechat-oauth/accounts'),
-      client.get('/accounts'),
-    ])
-    const oauthList: any[] = oauthRes.data || []
-    const regularList: any[] = regularRes.data?.items || regularRes.data || []
-    // 合并去重（同名合并）
-    const merged = new Map()
-    for (const a of oauthList) {
-      merged.set(a.id, { ...a, account_type: 'oauth', label: a.nick_name || a.alias || a.app_id })
-    }
-    for (const a of regularList) {
-      merged.set('reg_' + a.id, { ...a, id: a.id, account_type: 'regular', label: a.name || a.app_id })
-    }
-    accounts.value = Array.from(merged.values())
+    const res = await client.get('/accounts')
+    const items: any[] = res.data?.items || res.data || []
+    accounts.value = items
+      .filter((a: any) => a.id != null)
+      .map((a: any) => ({ ...a, label: a.name || a.app_id }))
   } catch { /* ignore */ }
 }
 
@@ -188,6 +240,41 @@ async function fetchComments() {
   }
 }
 
+// 切换公众号时加载对应的自动配置
+async function onAccountChange() {
+  if (!filterAccountId.value) return
+  try {
+    const res = await client.get(`/comments/auto-config/${filterAccountId.value}`)
+    autoConfig.value = {
+      auto_reply_enabled: res.data.auto_reply_enabled,
+      auto_reply_content: res.data.auto_reply_content || '',
+      auto_msg_enabled: res.data.auto_msg_enabled,
+      auto_msg_content: res.data.auto_msg_content || '',
+    }
+  } catch {
+    // 404 = 尚未配置，使用默认值
+    autoConfig.value = {
+      auto_reply_enabled: false,
+      auto_reply_content: '',
+      auto_msg_enabled: false,
+      auto_msg_content: '',
+    }
+  }
+}
+
+async function saveAutoConfig() {
+  if (!filterAccountId.value) return
+  savingConfig.value = true
+  try {
+    await client.put(`/comments/auto-config/${filterAccountId.value}`, autoConfig.value)
+    ElMessage.success('配置已保存')
+  } catch (e: any) {
+    ElMessage.error('保存失败：' + (e.response?.data?.detail || e.message || ''))
+  } finally {
+    savingConfig.value = false
+  }
+}
+
 async function handleSyncArticle(article: any) {
   if (!filterAccountId.value) {
     ElMessage.warning('请先选择公众号')
@@ -201,11 +288,15 @@ async function handleSyncArticle(article: any) {
         account_id: filterAccountId.value,
       }
     })
-    ElMessage.success(`同步完成：新增 ${res.data.new} 条，共 ${res.data.total} 条`)
+    const d = res.data
+    const parts = [`同步完成：新增 ${d.new} 条，共 ${d.total} 条`]
+    if (d.auto_replied > 0) parts.push(`已自动回复 ${d.auto_replied} 条`)
+    if (d.auto_messaged > 0) parts.push(`已自动私信 ${d.auto_messaged} 人`)
+    if (d.auto_skipped_msg > 0) parts.push(`跳过 ${d.auto_skipped_msg} 人（已发过）`)
+    ElMessage.success(parts.join('，'))
     fetchComments()
   } catch (e: any) {
     const detail = e.response?.data?.detail || e.message || ''
-    // WeChat API 错误码提示
     if (detail.includes('no msg_data_id')) {
       ElMessageBox.prompt('该文章还没有 msg_data_id，请在微信后台发布后输入文章 ID', '设置 msg_data_id', {
         confirmButtonText: '确定',
@@ -264,6 +355,7 @@ async function handleDebugApi(article: any) {
     ElMessage.error('诊断失败：' + (e.response?.data?.detail || e.message || ''))
   }
 }
+
 async function handleSyncAll() {
   if (!filterAccountId.value) {
     ElMessage.warning('请先选择公众号')
@@ -271,16 +363,28 @@ async function handleSyncAll() {
   }
   syncingAll.value = true
   let totalNew = 0
+  let totalReplied = 0
+  let totalMsgd = 0
+  let totalSkipped = 0
   for (const article of publishedArticles.value) {
     if (!article.msg_data_id) continue
     try {
       const res = await client.post('/comments/sync-by-article', null, {
         params: { article_id: article.id, account_id: filterAccountId.value }
       })
-      totalNew += res.data.new || 0
+      const d = res.data
+      totalNew += d.new || 0
+      totalReplied += d.auto_replied || 0
+      totalMsgd += d.auto_messaged || 0
+      totalSkipped += d.auto_skipped_msg || 0
     } catch { /* skip failed */ }
   }
-  ElMessage.success(`全量同步完成，共新增 ${totalNew} 条评论`)
+  ElMessage.success(
+    `全量同步完成，新增 ${totalNew} 条` +
+    (totalReplied ? `，自动回复 ${totalReplied} 条` : '') +
+    (totalMsgd ? `，自动私信 ${totalMsgd} 人` : '') +
+    (totalSkipped ? `，跳过 ${totalSkipped} 人` : '')
+  )
   syncingAll.value = false
   fetchComments()
 }
@@ -378,6 +482,9 @@ onMounted(() => {
 .comments-view { padding: 20px; }
 .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
 .header-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.auto-config-card { margin-bottom: 16px; }
+.config-header { display: flex; justify-content: space-between; align-items: center; }
+.config-tip { font-size: 12px; color: #909399; margin-top: 4px; }
 .articles-card { margin-bottom: 16px; }
 .pagination-wrap { margin-top: 20px; display: flex; justify-content: center; }
 .reply-context { background: #f5f7fa; padding: 12px; border-radius: 6px; margin-bottom: 12px; }

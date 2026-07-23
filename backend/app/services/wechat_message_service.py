@@ -92,9 +92,37 @@ class WeChatMessageService:
 
 
 async def _get_service(db: Session, account_id: int) -> WeChatMessageService:
-    from app.services.wechat_oauth_service import get_valid_token
+    from app.models.mysql_models import AccountCredential, WeChatAccount
+    import httpx
 
-    token = await get_valid_token(db, account_id)
+    # 用 AppID + AppSecret 获取 access_token
+    account = db.query(WeChatAccount).filter(
+        WeChatAccount.id == account_id,
+        WeChatAccount.deleted_at.is_(None),
+    ).first()
+    if not account:
+        raise ValueError(f"Account {account_id} not found")
+    cred = db.query(AccountCredential).filter(
+        AccountCredential.account_id == account_id,
+    ).first()
+    if not cred:
+        raise ValueError(f"Credential for account {account_id} not found")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            "https://api.weixin.qq.com/cgi-bin/token",
+            params={
+                "grant_type": "client_credential",
+                "appid": account.app_id,
+                "secret": cred.encrypted_secret,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    token = data.get("access_token", "")
+    if not token:
+        raise ValueError(f"Failed to get access_token: {data}")
     return WeChatMessageService(token)
 
 

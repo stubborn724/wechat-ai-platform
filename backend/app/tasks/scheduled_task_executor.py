@@ -79,6 +79,9 @@ def check_scheduled_tasks():
 
 def _create_job_for_task(db, task: ScheduledTask):
     """Create a ContentJob from a scheduled task and enqueue it for processing."""
+    # 合并 account_ids（如果有多个公众号）
+    account_ids = task.account_ids or ([task.account_id] if task.account_id else [])
+
     config = {
         "writing_mode": task.writing_mode,
         "feed_source_ids": task.feed_source_ids,
@@ -89,14 +92,17 @@ def _create_job_for_task(db, task: ScheduledTask):
         "public_count": task.public_count,
         "private_count": task.private_count,
         "scheduled_task_id": task.id,
+        "account_ids": account_ids,
+        "publish_mode": task.publish_mode or "draft",
+        "image_source": task.image_source or "pexels",
     }
 
     topic = task.topic or task.name
 
     job = ContentJob(
         tenant_id=task.tenant_id,
-        account_id=task.account_id,
-        status="queued",  # Directly queued so poll_queued_jobs picks it up
+        account_id=account_ids[0] if account_ids else None,
+        status="queued",
         version=1,
         topic=topic,
         content_type="article",

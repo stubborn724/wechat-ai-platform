@@ -26,7 +26,9 @@ interface ScheduledTask {
   public_count: number
   private_count: number
   approval_mode: string
-  account_id: number | null
+  account_ids: number[] | null
+  publish_mode: string
+  image_source: string
   footer_template: string | null
   total_generated: number
   last_run_at: string | null
@@ -36,6 +38,9 @@ interface ScheduledTask {
 
 const loading = ref(false)
 const saving = ref(false)
+const uploadingQr = ref(false)
+const footerQrUrl = ref('')
+const qrFileInput = ref<HTMLInputElement | null>(null)
 const tasks = ref<ScheduledTask[]>([])
 const accounts = ref<Account[]>([])
 const feedSources = ref<FeedSource[]>([])
@@ -58,7 +63,9 @@ const form = reactive({
   public_count: 1,
   private_count: 0,
   approval_mode: 'auto',
-  account_id: null as number | null,
+  account_ids: [] as number[],
+  publish_mode: 'draft',
+  image_source: 'pexels',
   footer_template: '',
 })
 
@@ -92,9 +99,9 @@ const styleOptions = [
   { value: 'humorous', label: '幽默风格' },
 ]
 
-function getAccountName(id: number | null): string {
-  if (!id) return '未指定'
-  return accounts.value.find(a => a.id === id)?.name || `#${id}`
+function getAccountName(ids: number[] | null): string {
+  if (!ids || ids.length === 0) return '未指定'
+  return ids.map(id => accounts.value.find(a => a.id === id)?.name || `#${id}`).join(', ')
 }
 
 function getFeedSourceNames(ids: number[] | null): string {
@@ -133,8 +140,11 @@ function resetForm() {
   form.public_count = 1
   form.private_count = 0
   form.approval_mode = 'auto'
-  form.account_id = null
+  form.account_ids = []
+  form.publish_mode = 'draft'
+  form.image_source = 'pexels'
   form.footer_template = ''
+  footerQrUrl.value = ''
   editing.value = false
   currentId.value = null
 }
@@ -157,8 +167,13 @@ function openEdit(task: ScheduledTask) {
   form.public_count = task.public_count
   form.private_count = task.private_count
   form.approval_mode = task.approval_mode
-  form.account_id = task.account_id
+  form.account_ids = task.account_ids || []
+  form.publish_mode = task.publish_mode || 'draft'
+  form.image_source = task.image_source || 'pexels'
   form.footer_template = task.footer_template || ''
+  // 从 footer_template 中提取二维码 URL 用于预览
+  const qrMatch = form.footer_template.match(/!\[二维码\]\(([^)]+)\)/)
+  footerQrUrl.value = qrMatch ? qrMatch[1] : ''
   showForm.value = true
 }
 
@@ -168,6 +183,30 @@ function addSlot() {
 function removeSlot(i: number) { form.article_slots.splice(i, 1) }
 function addTime() { form.publish_times.push('08:00') }
 function removeTime(i: number) { form.publish_times.splice(i, 1) }
+
+async function uploadFooterQr(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (!input.files?.length) return
+  uploadingQr.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', input.files[0])
+    const res = await client.post('/assets/upload', formData, {
+      params: { asset_type: 'image' },
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    const asset = res.data.data || res.data
+    footerQrUrl.value = asset.preview_url || ''
+    const qrMd = footerQrUrl.value ? `![二维码](${footerQrUrl.value})` : ''
+    form.footer_template = qrMd ? `${qrMd}\n\n${form.footer_template.replace(/!\[二维码\]\(.*?\)\n\n/, '')}` : form.footer_template
+    ElMessage.success('二维码已上传')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '二维码上传失败')
+  } finally {
+    uploadingQr.value = false
+    input.value = '' as any
+  }
+}
 
 async function save() {
   saving.value = true
@@ -186,7 +225,9 @@ async function save() {
       public_count: form.public_count,
       private_count: form.private_count,
       approval_mode: form.approval_mode,
-      account_id: form.account_id,
+      account_ids: form.account_ids.length > 0 ? form.account_ids : null,
+      publish_mode: form.publish_mode,
+      image_source: form.image_source,
       footer_template: form.footer_template || null,
     }
 
@@ -257,7 +298,7 @@ onMounted(load)
         <div class="card-body">
           <div class="info-row">
             <span class="label">目标公众号</span>
-            <span>{{ getAccountName(task.account_id) }}</span>
+            <span>{{ getAccountName(task.account_ids) }}</span>
           </div>
           <div v-if="task.topic" class="info-row">
             <span class="label">主题</span>
@@ -288,6 +329,14 @@ onMounted(load)
           <div class="info-row">
             <span class="label">发布方式</span>
             <span>{{ task.approval_mode === 'auto' ? '自动发布' : '人工审核' }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">发布到</span>
+            <span>{{ task.publish_mode === 'direct' ? '直接发布' : '存草稿箱' }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">图片来源</span>
+            <span>{{ { pexels: 'Pexels 图库', local: '本地素材', DASHSCOPE: 'AI 生图' }[task.image_source] || task.image_source }}</span>
           </div>
           <div class="info-row">
             <span class="label">已生成</span>
@@ -417,13 +466,60 @@ onMounted(load)
         </el-form-item>
 
         <el-form-item label="目标公众号">
-          <el-select v-model="form.account_id" style="width:100%" filterable clearable placeholder="选择公众号（存草稿用）">
+          <el-select v-model="form.account_ids" multiple collapse-tags collapse-tags-tooltip style="width:100%" filterable clearable placeholder="选择公众号（可多选）">
             <el-option v-for="acct in accounts" :key="acct.id" :value="acct.id" :label="acct.name" />
           </el-select>
         </el-form-item>
 
+        <el-form-item label="发布方式">
+          <el-radio-group v-model="form.publish_mode" :disabled="form.account_ids.length === 0">
+            <el-radio value="draft">存草稿箱</el-radio>
+            <el-radio value="direct">直接发布</el-radio>
+          </el-radio-group>
+          <span v-if="form.account_ids.length > 0 && form.publish_mode === 'direct'" class="form-hint" style="display:block;margin-top:4px">
+            ⚠️ 直接发布将立即推送给订阅用户
+          </span>
+          <span v-else class="form-hint" style="display:block;margin-top:4px">保存到微信草稿箱，可手动检查后再发布</span>
+        </el-form-item>
+
+        <el-form-item label="图片来源">
+          <el-radio-group v-model="form.image_source">
+            <el-radio value="pexels">Pexels 图库</el-radio>
+            <el-radio value="local">本地素材</el-radio>
+            <el-radio value="DASHSCOPE">AI 生图（通义万相）</el-radio>
+          </el-radio-group>
+          <span v-if="form.image_source === 'DASHSCOPE'" class="form-hint" style="display:block;margin-top:4px">
+            AI 根据文章内容生成配图，不会包含文字
+          </span>
+        </el-form-item>
+
         <el-form-item label="文章底部固定内容（可选）">
-          <el-input v-model="form.footer_template" type="textarea" :rows="2" placeholder="例如联系方式、二维码说明等" />
+          <div style="width: 100%">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+              <input
+                ref="qrFileInput"
+                type="file"
+                accept="image/*"
+                style="display:none"
+                @change="uploadFooterQr"
+              />
+              <el-button size="small" @click="(qrFileInput as any)?.click()" :loading="uploadingQr">
+                📷 上传二维码
+              </el-button>
+              <span v-if="footerQrUrl" style="color: #67c23a; font-size: 13px;">✅ 已上传</span>
+              <span class="form-hint">上传后自动添加到页脚</span>
+            </div>
+            <el-input
+              v-model="form.footer_template"
+              type="textarea"
+              :rows="2"
+              placeholder="其他固定内容（如联系方式），二维码会自动加在前面"
+            />
+            <div v-if="footerQrUrl" style="margin-top: 8px; display: flex; align-items: center; gap: 8px;">
+              <img :src="footerQrUrl" style="width: 48px; height: 48px; border-radius: 4px; object-fit: cover;" />
+              <span style="font-size: 12px; color: #909399;">二维码将显示在页脚</span>
+            </div>
+          </div>
         </el-form-item>
       </el-form>
 

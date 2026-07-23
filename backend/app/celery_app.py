@@ -38,6 +38,11 @@ celery_app.conf.update(
             "task": "app.tasks.job_tasks.cleanup_old_assets",
             "schedule": 86400.0,
         },
+        # Poll publishing articles every 2 minutes to get msg_data_id
+        "poll-publishing-articles-every-2-minutes": {
+            "task": "app.tasks.job_tasks.poll_publishing_articles",
+            "schedule": 120.0,
+        },
     },
 )
 

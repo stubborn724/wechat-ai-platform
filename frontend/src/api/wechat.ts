@@ -41,6 +41,22 @@ export interface ToggleFavoriteRequest {
   favorited: boolean
 }
 
+export interface AutoConfigResponse {
+  id: number
+  account_id: number
+  auto_reply_enabled: boolean
+  auto_reply_content: string | null
+  auto_msg_enabled: boolean
+  auto_msg_content: string | null
+}
+
+export interface UpdateAutoConfigRequest {
+  auto_reply_enabled?: boolean
+  auto_reply_content?: string
+  auto_msg_enabled?: boolean
+  auto_msg_content?: string
+}
+
 export interface SendTextMessageRequest {
   account_id: number
   openid: string
@@ -109,6 +125,18 @@ export async function replyComment(data: ReplyCommentRequest): Promise<any> {
 
 export async function toggleFavorite(data: ToggleFavoriteRequest): Promise<any> {
   const res = await client.post('/comments/toggle-favorite', data)
+  return res.data
+}
+
+// --- Auto Config ---
+
+export async function getAutoConfig(accountId: number): Promise<AutoConfigResponse> {
+  const res = await client.get(`/comments/auto-config/${accountId}`)
+  return res.data
+}
+
+export async function updateAutoConfig(accountId: number, data: UpdateAutoConfigRequest): Promise<AutoConfigResponse> {
+  const res = await client.put(`/comments/auto-config/${accountId}`, data)
   return res.data
 }
 

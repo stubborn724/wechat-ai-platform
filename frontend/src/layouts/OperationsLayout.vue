@@ -5,7 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import {
   Odometer, ChatDotSquare, Document, Edit, List, Picture,
   Connection, Collection, Calendar, Finished, Fold, Expand,
-  ArrowDown, Key, CopyDocument, Setting,
+  ArrowDown, CopyDocument, Setting,
 } from '@element-plus/icons-vue'
 
 const auth = useAuthStore()
@@ -44,8 +44,7 @@ const menuItems = computed<MenuItem[]>(() => [
   { index: '8', route: '/knowledge', label: '知识库', icon: 'Collection', show: true },
   { index: '9', route: '/scheduled-tasks', label: '定时任务', icon: 'Calendar', show: true },
   { index: '10', route: '/reviews', label: '审核台', icon: 'Finished', show: canReview.value },
-  { index: '11', route: '/wechat-oauth', label: '扫码授权', icon: 'Key', show: true },
-  { index: '12', route: '/comments', label: '评论管理', icon: 'ChatDotSquare', show: true },
+  { index: '11', route: '/comments', label: '评论管理', icon: 'ChatDotSquare', show: true },
   { index: '13', route: '/messages', label: '私信管理', icon: 'ChatDotSquare', show: true },
   { index: '14', route: '/imitation/pools', label: '仿写池', icon: 'CopyDocument', show: true },
   { index: '15', route: '/watermark', label: '水印设置', icon: 'Setting', show: true },

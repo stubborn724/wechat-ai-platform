@@ -37,7 +37,9 @@ class ScheduledTaskCreate(BaseModel):
     public_count: int = 1
     private_count: int = 0
     approval_mode: str = "auto"
-    account_id: Optional[int] = None
+    account_ids: Optional[List[int]] = None
+    publish_mode: str = "draft"  # "draft" 存草稿箱, "direct" 直接发布
+    image_source: str = "pexels"  # 图片来源: pexels/local/DASHSCOPE
     footer_template: Optional[str] = None
 
 
@@ -56,7 +58,9 @@ class ScheduledTaskUpdate(BaseModel):
     public_count: Optional[int] = None
     private_count: Optional[int] = None
     approval_mode: Optional[str] = None
-    account_id: Optional[int] = None
+    account_ids: Optional[List[int]] = None
+    publish_mode: Optional[str] = None
+    image_source: Optional[str] = None
     footer_template: Optional[str] = None
 
 
@@ -77,7 +81,9 @@ class ScheduledTaskResponse(BaseModel):
     public_count: int
     private_count: int
     approval_mode: str
-    account_id: Optional[int] = None
+    account_ids: Optional[list] = None
+    publish_mode: str = "draft"
+    image_source: str = "pexels"
     footer_template: Optional[str] = None
     total_generated: int
     last_run_at: Optional[datetime] = None
@@ -137,7 +143,9 @@ def create_scheduled_task(
         public_count=req.public_count,
         private_count=req.private_count,
         approval_mode=req.approval_mode,
-        account_id=req.account_id,
+        account_ids=req.account_ids,
+        publish_mode=req.publish_mode,
+        image_source=req.image_source,
         footer_template=req.footer_template,
         created_by=principal.user_id,
     )

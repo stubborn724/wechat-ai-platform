@@ -1,4 +1,4 @@
-"""微信互动管理 — 评论回复 + 主动私信"""
+"""微信互动管理 — 评论回复 + 主动私信 + 自动配置"""
 
 import logging
 from datetime import datetime
@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
-from app.models.mysql_models import Article as ArticleModel, WeChatComment, WeChatMessage
+from app.models.mysql_models import Article as ArticleModel, WeChatComment, WeChatMessage, WeChatCommentAutoConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -63,6 +63,26 @@ class CommentListResponse(BaseModel):
     page: int
     page_size: int
     items: List[CommentResponse]
+
+
+class AutoConfigResponse(BaseModel):
+    id: int
+    account_id: int
+    auto_reply_enabled: bool
+    auto_reply_content: Optional[str] = None
+    auto_msg_enabled: bool
+    auto_msg_content: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class UpdateAutoConfigRequest(BaseModel):
+    auto_reply_enabled: Optional[bool] = None
+    auto_reply_content: Optional[str] = None
+    auto_msg_enabled: Optional[bool] = None
+    auto_msg_content: Optional[str] = None
 
 
 class SendTextMessageRequest(BaseModel):
@@ -164,8 +184,8 @@ async def sync_comments(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """从微信同步某篇文章的评论到本地"""
-    from app.services.wechat_comment_service import sync_comments as _sync
+    """从微信同步某篇文章的评论到本地（含自动回复 & 自动私信）"""
+    from app.services.wechat_comment_service import sync_comments_with_auto as _sync
 
     try:
         result = await _sync(db, principal.tenant_id, req.account_id, req.msg_data_id)
@@ -181,8 +201,8 @@ async def sync_comments_by_article(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """通过本地文章 ID 同步评论（自动从 article 取 msg_data_id）"""
-    from app.services.wechat_comment_service import sync_comments as _sync
+    """通过本地文章 ID 同步评论（含自动回复 & 自动私信）"""
+    from app.services.wechat_comment_service import sync_comments_with_auto as _sync
 
     article = db.query(ArticleModel).filter(
         ArticleModel.id == article_id,
@@ -302,6 +322,46 @@ async def toggle_favorite(
         return result
     except RuntimeError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+
+
+# ============================================================================
+# 自动回复 & 自动私信配置
+# ============================================================================
+
+
+@router.get("/comments/auto-config/{account_id}", response_model=AutoConfigResponse)
+async def get_auto_config(
+    account_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取公众号的自动回复/私信配置"""
+    from app.services.wechat_comment_service import get_auto_config as _get
+
+    config = await _get(db, principal.tenant_id, account_id)
+    if not config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Auto-config not found")
+    return config
+
+
+@router.put("/comments/auto-config/{account_id}", response_model=AutoConfigResponse)
+def update_auto_config(
+    account_id: int,
+    req: UpdateAutoConfigRequest,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """创建或更新公众号的自动回复/私信配置"""
+    from app.services.wechat_comment_service import update_auto_config as _update
+
+    config = _update(
+        db, principal.tenant_id, account_id,
+        auto_reply_enabled=req.auto_reply_enabled,
+        auto_reply_content=req.auto_reply_content,
+        auto_msg_enabled=req.auto_msg_enabled,
+        auto_msg_content=req.auto_msg_content,
+    )
+    return config
 
 
 # ============================================================================

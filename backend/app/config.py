@@ -59,13 +59,6 @@ class Settings(BaseSettings):
     minio_bucket: str = "wechat-assets"
     minio_use_ssl: bool = False
 
-    # WeChat Open Platform (第三方平台扫码授权)
-    wechat_component_app_id: str = ""
-    wechat_component_app_secret: str = ""
-    wechat_component_token: str = ""
-    wechat_component_aes_key: str = ""
-    wechat_oauth_callback_url: str = "http://localhost:8000/api/v1/wechat-oauth/callback"
-
     # CORS
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 

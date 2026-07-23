@@ -141,8 +141,9 @@ function formatTime(t?: string) {
 
 async function fetchAccounts() {
   try {
-    const res = await client.get('/wechat-oauth/accounts')
-    accounts.value = res.data || []
+    const res = await client.get('/accounts')
+    const items: any[] = res.data?.items || res.data || []
+    accounts.value = items.filter((a: any) => a.id != null)
   } catch { /* ignore */ }
 }
 

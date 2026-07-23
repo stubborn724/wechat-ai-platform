@@ -25,7 +25,6 @@ const router = createRouter({
         { path: 'publish-plans', name: 'PublishPlans', component: () => import('@/views/PublishPlansView.vue') },
         { path: 'scheduled-tasks', name: 'ScheduledTasks', component: () => import('@/views/ScheduledTasksView.vue') },
         { path: 'reviews', name: 'Reviews', component: () => import('@/views/ReviewsView.vue') },
-        { path: 'wechat-oauth', name: 'WeChatOAuth', component: () => import('@/views/WeChatOAuthView.vue') },
         { path: 'comments', name: 'Comments', component: () => import('@/views/CommentsView.vue') },
         { path: 'messages', name: 'Messages', component: () => import('@/views/MessagesView.vue') },
         { path: 'imitation/pools', name: 'ImitationPools', component: () => import('@/views/ImitationPoolsView.vue') },

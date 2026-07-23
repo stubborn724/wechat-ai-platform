@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models.mysql_models import WeChatAccount, WeChatComment, WeChatOAuthAccount
+from app.models.mysql_models import WeChatAccount, WeChatComment, WeChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +236,49 @@ class WeChatCommentService:
         logger.info("Synced %d new comments for msg_data_id=%s (total=%d)", new_count, msg_data_id, total_count)
         return new_count, total_count
 
+    async def sync_comments_to_db_v2(
+        self, db: Session, tenant_id: int, account_id: int, msg_data_id: str,
+    ) -> Tuple[list[int], int, int]:
+        """同步评论到本地，返回 (新评论 ID 列表, 新增数, 总数)"""
+        wechat_data = await self.list_comments(msg_data_id, count=50, comment_type=0)
+        total_count = wechat_data.get("total", 0)
+        comments = wechat_data.get("comment", [])
+
+        new_ids: list[int] = []
+        for c in comments:
+            comment_id = str(c.get("user_comment_id", c.get("comment_id", "")))
+            if not comment_id:
+                continue
+            existing = db.query(WeChatComment).filter(
+                WeChatComment.comment_id == comment_id,
+            ).first()
+            if existing:
+                continue
+
+            comment = WeChatComment(
+                tenant_id=tenant_id,
+                account_id=account_id,
+                msg_id=msg_data_id,
+                comment_id=comment_id,
+                user_comment_id=str(c.get("user_comment_id", "")),
+                openid=c.get("openid", ""),
+                nickname=c.get("nickname", ""),
+                content=c.get("content", ""),
+                create_time=(
+                    datetime.fromtimestamp(c["create_time"], tz=timezone.utc)
+                    if c.get("create_time") else None
+                ),
+                is_favorited=c.get("comment_type", 0) == 1,
+                status="pending",
+            )
+            db.add(comment)
+            db.flush()
+            new_ids.append(comment.id)
+
+        db.commit()
+        logger.info("Synced %d new comments for msg_data_id=%s (total=%d)", len(new_ids), msg_data_id, total_count)
+        return new_ids, len(new_ids), total_count
+
 
 # ============================================================================
 # 高层业务函数（供 API 路由调用）
@@ -243,21 +286,11 @@ class WeChatCommentService:
 
 
 async def _get_service(db: Session, account_id: int) -> "WeChatCommentService":
-    """从账号获取 access_token（支持 OAuth 和普通凭据两种账号类型）"""
-    from app.services.wechat_oauth_service import get_valid_token
-    from app.models.mysql_models import WeChatOAuthAccount, AccountCredential, WeChatAccount
+    """从账号获取 access_token（使用 AppID + AppSecret）"""
+    from app.models.mysql_models import AccountCredential, WeChatAccount
     import httpx
 
-    # 先查 OAuth 账号
-    oauth = db.query(WeChatOAuthAccount).filter(
-        WeChatOAuthAccount.id == account_id,
-        WeChatOAuthAccount.is_active == True,
-    ).first()
-    if oauth:
-        token = await get_valid_token(db, account_id)
-        return WeChatCommentService(token)
-
-    # 再查普通账号（通过 app_id + app_secret 直接获取 access_token）
+    # 从 AppID + AppSecret 直接获取 access_token
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
@@ -317,6 +350,153 @@ async def reply_comment(
         local.reply_create_time = datetime.now(timezone.utc)
         local.status = "replied"
         db.commit()
+
+    return result
+
+
+# ============================================================================
+# 自动回复 & 自动私信配置
+# ============================================================================
+
+from app.models.mysql_models import WeChatCommentAutoConfig as AutoConfig
+
+
+async def get_auto_config(db: Session, tenant_id: int, account_id: int) -> Optional[AutoConfig]:
+    """获取某公众号的自动回复/私信配置"""
+    return db.query(AutoConfig).filter(
+        AutoConfig.tenant_id == tenant_id,
+        AutoConfig.account_id == account_id,
+    ).first()
+
+
+def update_auto_config(
+    db: Session,
+    tenant_id: int,
+    account_id: int,
+    auto_reply_enabled: Optional[bool] = None,
+    auto_reply_content: Optional[str] = None,
+    auto_msg_enabled: Optional[bool] = None,
+    auto_msg_content: Optional[str] = None,
+) -> AutoConfig:
+    """创建或更新自动回复/私信配置"""
+    config = db.query(AutoConfig).filter(
+        AutoConfig.tenant_id == tenant_id,
+        AutoConfig.account_id == account_id,
+    ).first()
+
+    if not config:
+        config = AutoConfig(
+            tenant_id=tenant_id,
+            account_id=account_id,
+        )
+        db.add(config)
+
+    if auto_reply_enabled is not None:
+        config.auto_reply_enabled = auto_reply_enabled
+    if auto_reply_content is not None:
+        config.auto_reply_content = auto_reply_content
+    if auto_msg_enabled is not None:
+        config.auto_msg_enabled = auto_msg_enabled
+    if auto_msg_content is not None:
+        config.auto_msg_content = auto_msg_content
+
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+async def process_auto_reply_and_msg(
+    db: Session,
+    tenant_id: int,
+    account_id: int,
+    msg_data_id: str,
+    new_comment_ids: list[int],
+) -> dict:
+    """对新同步的评论执行自动回复和自动私信
+
+    1. 如果开启了自动回复 → 回复评论
+    2. 如果开启了自动私信且该用户未收到过私信 → 发送私信
+    """
+    config = await get_auto_config(db, tenant_id, account_id)
+    if not config:
+        return {"replied": 0, "messaged": 0, "skipped_msg": 0}
+
+    # 获取新评论
+    from app.models.mysql_models import WeChatComment
+    comments = db.query(WeChatComment).filter(
+        WeChatComment.id.in_(new_comment_ids),
+        WeChatComment.tenant_id == tenant_id,
+    ).all()
+
+    svc = await _get_service(db, account_id)
+    from app.services.wechat_message_service import send_text_message as _send_msg
+
+    replied = 0
+    messaged = 0
+    skipped_msg = 0
+
+    for comment in comments:
+        # --- 自动回复 ---
+        if config.auto_reply_enabled and config.auto_reply_content:
+            try:
+                await svc.reply_comment(
+                    msg_data_id,
+                    comment.comment_id,
+                    config.auto_reply_content,
+                )
+                comment.reply_content = config.auto_reply_content
+                comment.reply_create_time = datetime.now(timezone.utc)
+                comment.status = "replied"
+                db.commit()
+                replied += 1
+            except RuntimeError as e:
+                logger.warning("Auto-reply failed for comment %s: %s", comment.comment_id, e)
+
+        # --- 自动私信（去重：同一公众号下同一 openid 只发一次）---
+        if config.auto_msg_enabled and config.auto_msg_content and comment.openid:
+            already_sent = db.query(WeChatMessage).filter(
+                WeChatMessage.account_id == account_id,
+                WeChatMessage.openid == comment.openid,
+                WeChatMessage.status == "sent",
+            ).first()
+
+            if already_sent:
+                skipped_msg += 1
+                continue
+
+            try:
+                await _send_msg(
+                    db, tenant_id, account_id,
+                    comment.openid, config.auto_msg_content,
+                )
+                messaged += 1
+            except RuntimeError as e:
+                logger.warning("Auto-msg failed for openid %s: %s", comment.openid, e)
+
+    return {"replied": replied, "messaged": messaged, "skipped_msg": skipped_msg}
+
+
+async def sync_comments_with_auto(
+    db: Session, tenant_id: int, account_id: int, msg_data_id: str,
+) -> dict:
+    """同步评论 + 自动回复/私信（一站式）"""
+    svc = await _get_service(db, account_id)
+    new_ids, new_count, total = await svc.sync_comments_to_db_v2(db, tenant_id, account_id, msg_data_id)
+
+    result = {
+        "new": new_count,
+        "total": total,
+        "msg_data_id": msg_data_id,
+        "auto_replied": 0,
+        "auto_messaged": 0,
+        "auto_skipped_msg": 0,
+    }
+
+    if new_ids:
+        auto_result = await process_auto_reply_and_msg(db, tenant_id, account_id, msg_data_id, new_ids)
+        result["auto_replied"] = auto_result["replied"]
+        result["auto_messaged"] = auto_result["messaged"]
+        result["auto_skipped_msg"] = auto_result["skipped_msg"]
 
     return result
 

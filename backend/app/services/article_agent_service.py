@@ -460,35 +460,62 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
 
             url = images_by_position.get(pos, "")
             if url:
-                # Output image — description cleaned by post-processing if needed
-                return f"{alt}\n\n![{alt}]({url})"
-            # No image available — remove placeholder entirely
+                return (
+                    f'{alt}\n\n'
+                    f'<img src="{url}" alt="{alt}" '
+                    f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />'
+                )
             return ""
 
         content = re.sub(r"\[IMAGE:(.*?)\]", _replace_placeholder, content)
 
     # Post-processing: remove any remaining [IMAGE:] placeholders
-    # (in case the images list was empty or placeholders were missed)
     remaining = re.findall(r'\[IMAGE:[^\]]*\]', content)
     if remaining:
         logger.warning("Found %d unreplaced [IMAGE:] placeholders — removing them", len(remaining))
     content = re.sub(r'\[IMAGE:[^\]]*\]', '', content)
 
     # Post-processing: normalize excessive blank lines (4+ → 2)
-    # This prevents the "poetry-like" formatting with too many line breaks
     content = re.sub(r'\n{4,}', '\n\n', content)
 
     # Post-processing: normalize 3+ spaces at line starts
     content = re.sub(r'^ {3,}', '', content, flags=re.MULTILINE)
 
-    # Append footer template
+    # 去掉 AI 生成内容开头的标题（已由前端独立展示）
+    content = _strip_leading_title(content, state)
+
+    # Append footer template（不加横线）
     if state.footer_template:
         footer = state.footer_template.strip()
         if footer:
-            content = f"{content}\n\n---\n\n{footer}"
+            content = f"{content}\n\n{footer}"
 
     state.full_content = content
     return state
+
+
+def _strip_leading_title(content: str, state: ArticleState) -> str:
+    """去掉正文开头可能重复的标题行"""
+    lines = content.split("\n")
+    while lines:
+        stripped = lines[0].strip()
+        # 去掉 # 标题 格式
+        if stripped.startswith("# ") or stripped.startswith("## "):
+            title_text = stripped.lstrip("#").strip()
+            # 如果是标题本身，去掉
+            if state.title and (title_text == state.title.main_title or title_text == state.title.sub_title):
+                lines.pop(0)
+                continue
+            # 如果内容里只有一个 # 标题，也去掉（AI 经常生成）
+            if not state.title:
+                lines.pop(0)
+                continue
+        # 去掉空的头行
+        elif not stripped:
+            lines.pop(0)
+            continue
+        break
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

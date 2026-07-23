@@ -32,6 +32,7 @@ class WanxiangImageService:
         prompt: str,
         size: str = "1024*1024",
         n: int = 1,
+        no_text: bool = True,
     ) -> Optional[str]:
         """Submit an image generation task and wait for completion.
 
@@ -39,6 +40,7 @@ class WanxiangImageService:
             prompt: Text description of the image to generate.
             size: Image size (e.g. "1024*1024", "720*1280").
             n: Number of images to generate (1-4).
+            no_text: Whether to instruct the model not to generate text.
 
         Returns:
             URL of the first generated image, or None on failure.
@@ -46,6 +48,10 @@ class WanxiangImageService:
         if not self.api_key:
             logger.warning("No DashScope API key configured for image generation")
             return None
+
+        # 如果未明确说要文字，默认添加无文字指令
+        if no_text and "文字" not in prompt and "文本" not in prompt:
+            prompt = f"{prompt}。不要包含任何文字或文本标签，纯图像。"
 
         # Check if Wanxiang is explicitly enabled in settings
         if not getattr(settings, 'wanxiang_enabled', True):

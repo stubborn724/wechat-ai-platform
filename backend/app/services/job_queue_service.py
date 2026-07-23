@@ -289,9 +289,32 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
                 if footer:
                     state.full_content = f"{state.full_content}\n\n---\n\n{footer}"
         else:
+            # Apply watermark before merging if configured
+            if state.images:
+                try:
+                    from app.services.asset_archive_service import save_image_to_asset_library
+                    from app.services.storage_service import storage_service as _ss
+
+                    wm_enabled = None
+                    if job.generation_config:
+                        wm_enabled = job.generation_config.get("watermark_enabled")
+
+                    for img in state.images:
+                        if not img.url:
+                            continue
+                        asset = await save_image_to_asset_library(
+                            db, job.tenant_id, img.url,
+                            keywords=img.keywords or "",
+                            watermark_enabled=wm_enabled,
+                        )
+                        if asset:
+                            img.url = _ss.get_url(asset.storage_key)
+                except Exception as wm_exc:
+                    logger.warning("Watermark failed for job %d slot %d: %s", job.id, slot_index, wm_exc)
+
             state = merge_images_into_content(state)
 
-        # Step 5: Generate AI cover image
+        # Step 5: Generate AI cover image (and watermark it)
         cover_url = next(
             (img.url for img in state.images if getattr(img, "position", None) == 1),
             None,
@@ -307,6 +330,26 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
                     cover_url = ai_cover
             except Exception as cover_err:
                 logger.warning("Cover image generation failed for job %d slot %d: %s", job.id, slot_index, cover_err)
+
+        # Apply watermark to cover image if generated separately
+        if cover_url:
+            try:
+                from app.services.asset_archive_service import save_image_to_asset_library
+                from app.services.storage_service import storage_service as _ss
+
+                wm_enabled = None
+                if job.generation_config:
+                    wm_enabled = job.generation_config.get("watermark_enabled")
+
+                asset = await save_image_to_asset_library(
+                    db, job.tenant_id, cover_url,
+                    keywords="cover",
+                    watermark_enabled=wm_enabled,
+                )
+                if asset:
+                    cover_url = _ss.get_url(asset.storage_key)
+            except Exception as wm_exc:
+                logger.warning("Cover watermark failed for job %d slot %d: %s", job.id, slot_index, wm_exc)
 
         # Post-generation cleanup: strip image description lines using pre-extracted keywords
         raw_body = state.full_content or raw_content
@@ -342,12 +385,13 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
             db.add(version)
             db.flush()
 
-            # Save images to asset library
+            # Save images to asset library (watermark already applied in _run_slot)
             if result["images"]:
                 try:
                     from app.services.asset_archive_service import save_images_to_asset_library
                     asyncio.run(save_images_to_asset_library(
                         db, job.tenant_id, result["images"],
+                        watermark_enabled=False,  # Already watermarked in _run_slot
                     ))
                 except Exception as arch_exc:
                     logger.warning("Slot %d asset archive failed: %s", i, arch_exc)
@@ -407,8 +451,8 @@ def _strip_image_descriptions(text: str, pre_extracted_keywords: list | None = N
             cleaned.append(line)
             continue
 
-        # ALWAYS preserve markdown image lines (![alt](url))
-        if re.match(r'^!\[.*\]\(.*\)$', s):
+        # ALWAYS preserve markdown image lines (![alt](url)) AND HTML img tags
+        if re.match(r'^!\[.*\]\(.*\)$', s) or re.match(r'^<img\s+[^>]+/?>$', s, re.IGNORECASE):
             cleaned.append(line)
             continue
 

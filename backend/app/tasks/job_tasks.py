@@ -6,7 +6,7 @@ import uuid
 
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
-from app.models.mysql_models import ContentJob, ContentVersion, Article, WeChatOAuthAccount
+from app.models.mysql_models import ContentJob, ContentVersion, Article
 from app.services.job_queue_service import process_job_batch, transition_job
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def sync_comments_for_published_articles(self):
     """定时任务：对所有已发布且有 msg_data_id 的文章同步评论"""
     db = MysqlSessionLocal()
     try:
-        from app.models.mysql_models import Article, WeChatComment, WeChatOAuthAccount
+        from app.models.mysql_models import Article, WeChatComment, WeChatAccount
         from app.services.wechat_oauth_service import get_valid_token_sync
 
         articles = (
@@ -97,16 +97,17 @@ def sync_comments_for_published_articles(self):
         if not articles:
             return {"synced": 0, "articles": 0}
 
-        oauth = (
-            db.query(WeChatOAuthAccount)
-            .filter(WeChatOAuthAccount.is_active == True)
+        # 取第一个有凭据的公众号
+        account = (
+            db.query(WeChatAccount)
+            .filter(WeChatAccount.deleted_at.is_(None))
             .first()
         )
-        if not oauth:
-            logger.warning("No OAuth account found for comment sync")
-            return {"synced": 0, "articles": 0, "error": "no_oauth_account"}
+        if not account:
+            logger.warning("No WeChat account found for comment sync")
+            return {"synced": 0, "articles": 0, "error": "no_account"}
 
-        token = get_valid_token_sync(db, oauth.id)
+        token = get_valid_token_sync(db, account.id)
         from app.services.wechat_comment_service import WeChatCommentService
 
         svc = WeChatCommentService(token)
@@ -194,8 +195,8 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
             if not s:
                 cleaned_lines.append(line)
                 continue
-            # Always preserve markdown image lines
-            if re.match(r'^!\[.*\]\(.*\)$', s):
+            # Always preserve markdown image lines AND HTML img tags
+            if re.match(r'^!\[.*\]\(.*\)$', s) or re.match(r'^<img\s+[^>]+/?>$', s, re.IGNORECASE):
                 cleaned_lines.append(line)
                 continue
             # Remove if line matches any IMAGE keyword phrase
@@ -253,10 +254,10 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=30)
 def poll_publishing_articles(self):
-    """定时任务：轮询「发布中」状态的文章，自动获取 msg_data_id"""
+    """定时任务：轮询「发布中」状态的文章，发布完成后自动获取 msg_data_id"""
     db = MysqlSessionLocal()
     try:
-        from app.models.mysql_models import Article
+        from app.models.mysql_models import Article, AccountCredential, WeChatAccount
 
         articles = (
             db.query(Article)
@@ -274,21 +275,36 @@ def poll_publishing_articles(self):
         import requests as _req
         from app.services.wechat_oauth_service import get_valid_token_sync
 
-        # 找第一个 OAuth 账号
-        oauth = db.query(WeChatOAuthAccount).filter(
-            WeChatOAuthAccount.is_active == True,
-        ).first()
-        if not oauth:
-            logger.warning("No OAuth account for publish polling")
-            return {"polled": 0, "error": "no_oauth"}
-
-        token = get_valid_token_sync(db, oauth.id)
         completed = 0
 
         for article in articles:
+            # 找到发布这篇文章所用的公众号
+            publish_info = article.publish_id or ""
+            # publish_id 格式可能是 "publish_id" 或 "media_id"
+            # 从 published_at 等字段找不到 account_id，需要从关联数据推断
+            # 退一步：尝试从 publish_id 匹配
+
+            # 遍历所有有凭据的公众号尝试获取 token
+            accounts = db.query(WeChatAccount).filter(
+                WeChatAccount.deleted_at.is_(None),
+            ).all()
+
+            token = None
+            for acct in accounts:
+                try:
+                    token = get_valid_token_sync(db, acct.id)
+                    break
+                except Exception:
+                    continue
+
+            if not token:
+                logger.warning("No valid token for publish polling")
+                continue
+
             try:
+                # 查询 freepublish 状态
                 resp = _req.post(
-                    "https://api.weixin.qq.com/cgi-bin/draft/get",
+                    "https://api.weixin.qq.com/cgi-bin/freepublish/get",
                     params={"access_token": token},
                     json={"publish_id": article.publish_id},
                     timeout=15,
@@ -297,30 +313,97 @@ def poll_publishing_articles(self):
                 data = resp.json()
 
                 if data.get("errcode", 0) != 0:
+                    errcode = data.get("errcode")
+                    # 710000 表示发布任务不存在或尚未开始处理，跳过
+                    if errcode != 710000:
+                        logger.warning("Publish poll error %d: %s", errcode, data.get("errmsg", ""))
                     continue
 
                 pub_status = data.get("publish_status", -1)
-                if pub_status == 0:
-                    msg_data_id = (
-                        data.get("msg_data_id", "")
-                        or data.get("article_id", "")
-                    )
-                    article.msg_data_id = str(msg_data_id) if msg_data_id else ""
+                if pub_status == 0:  # 发布成功
+                    # freepublish/get 返回 article_id，可以作为 msg_data_id
+                    msg_data_id = str(data.get("article_id", ""))
+                    article.msg_data_id = msg_data_id
                     article.status = "published"
                     article.phase = "PUBLISHED"
+
+                    # 从 article 反查 tenant_id（WeChatAccount 有 tenant_id）
+                    from app.models.mysql_models import WeChatAccount as WxAcct
+                    acct = db.query(WxAcct).filter(
+                        WxAcct.deleted_at.is_(None),
+                    ).first()
+                    tenant_id = acct.tenant_id if acct else 1
+
                     db.commit()
+
+                    # 立即同步评论 + 自动回复 + 自动私信（新开 session 避免状态未提交）
+                    try:
+                        _sync_comments_after_publish(article.id, tenant_id, msg_data_id)
+                    except Exception as sync_err:
+                        logger.warning("Post-publish comment sync failed for article %d: %s", article.id, sync_err)
+
                     completed += 1
-                    logger.info("Auto-poll: article %d published, msg_data_id=%s", article.id, article.msg_data_id)
-                elif pub_status in (1, 3):
+                elif pub_status in (1, 3):  # 发布失败
                     article.status = "failed"
                     article.phase = "PUBLISH_FAILED"
                     article.error_message = f"Publish failed (status={pub_status})"
                     db.commit()
+                    logger.warning("Article %d publish failed (status=%d)", article.id, pub_status)
+                # pub_status == 2: 仍在审核中，跳过
             except Exception as exc:
                 logger.warning("Poll article %d failed: %s", article.id, exc)
 
         return {"polled": len(articles), "completed": completed}
     except Exception as exc:
         logger.error("poll_publishing_articles failed: %s", exc)
+        return {"error": str(exc)}
     finally:
         db.close()
+
+
+def _sync_comments_after_publish(article_id: int, tenant_id: int, msg_data_id: str):
+    """发布完成后，同步评论并执行自动回复/私信"""
+    import asyncio
+
+    async def _do_sync():
+        db_sync = MysqlSessionLocal()
+        try:
+            from app.models.mysql_models import Article as ArtModel, WeChatAccount as WxAcct
+            article = db_sync.query(ArtModel).filter(ArtModel.id == article_id).first()
+            if not article or not article.msg_data_id:
+                return
+
+            account = db_sync.query(WxAcct).filter(
+                WxAcct.deleted_at.is_(None),
+            ).first()
+            if not account:
+                logger.warning("No account for post-publish comment sync")
+                return
+
+            from app.services.wechat_comment_service import sync_comments_with_auto as _sync_auto
+            result = await _sync_auto(db_sync, tenant_id, account.id, msg_data_id)
+
+            # 关联 article_id
+            if result.get("new", 0) > 0:
+                from app.models.mysql_models import WeChatComment
+                db_sync.query(WeChatComment).filter(
+                    WeChatComment.msg_id == msg_data_id,
+                    WeChatComment.article_id.is_(None),
+                ).update({"article_id": article_id})
+                db_sync.commit()
+
+            logger.info(
+                "Post-publish sync for article %d: %d new, auto_replied=%d, auto_msged=%d, skipped=%d",
+                article_id, result["new"], result["auto_replied"],
+                result["auto_messaged"], result["auto_skipped_msg"],
+            )
+        except Exception as exc:
+            logger.error("Post-publish comment sync failed: %s", exc)
+        finally:
+            db_sync.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_do_sync())
+    finally:
+        loop.close()
