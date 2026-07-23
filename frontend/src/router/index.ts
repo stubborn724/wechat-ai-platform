@@ -18,6 +18,7 @@ const router = createRouter({
         { path: 'accounts', name: 'Accounts', component: () => import('@/views/AccountsView.vue') },
         { path: 'articles', name: 'Articles', component: () => import('@/views/article/ArticleCreateView.vue') },
         { path: 'articles/list', name: 'ArticleList', component: () => import('@/views/article/ArticleListView.vue') },
+        { path: 'articles/synced/:id', name: 'SyncedArticleDetail', component: () => import('@/views/article/SyncedArticleDetailView.vue') },
         { path: 'articles/:taskId', name: 'ArticleDetail', component: () => import('@/views/article/ArticleDetailView.vue') },
         { path: 'assets', name: 'Assets', component: () => import('@/views/AssetsView.vue') },
         { path: 'feed-sources', name: 'FeedSources', component: () => import('@/views/FeedSourcesView.vue') },

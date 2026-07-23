@@ -114,6 +114,7 @@ def create_app() -> FastAPI:
         scheduled_tasks,
         statistics,
         watermark_config,
+        wechat_articles,
         wechat_interact,
     )
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
@@ -131,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(imitation.router, prefix="/api/v1", tags=["imitation"])
     app.include_router(watermark_config.router, prefix="/api/v1", tags=["watermark-config"])
     app.include_router(wechat_interact.router, prefix="/api/v1", tags=["wechat-interact"])
+    app.include_router(wechat_articles.router, prefix="/api/v1", tags=["wechat-articles"])
 
     return app
 

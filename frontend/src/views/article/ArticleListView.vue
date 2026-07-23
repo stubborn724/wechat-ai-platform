@@ -1,269 +1,75 @@
-<script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { listArticles, deleteArticle } from '@/api/article'
-import type { Article } from '@/api/types'
-
-const router = useRouter()
-
-// Search & filter
-const keyword = ref('')
-const statusFilter = ref('')
-const loading = ref(false)
-
-// Pagination
-const articles = ref<Article[]>([])
-const total = ref(0)
-const page = ref(1)
-const pageSize = ref(10)
-
-// Selection
-const selectedRows = ref<Article[]>([])
-const tableRef = ref()
-
-const statusOptions = [
-  { value: '', label: '全部状态' },
-  { value: 'COMPLETED', label: '已完成' },
-  { value: 'FAILED', label: '失败' },
-  { value: 'PROCESSING', label: '处理中' },
-  { value: 'PENDING', label: '待处理' },
-]
-
-const statusTagTypeMap: Record<string, string> = {
-  COMPLETED: 'success',
-  FAILED: 'danger',
-  PROCESSING: 'warning',
-  PENDING: 'info',
-}
-
-function getStatusTagType(status: string): string {
-  return statusTagTypeMap[status] || 'info'
-}
-
-const phaseLabels: Record<string, string> = {
-  INPUT: '输入主题',
-  TITLE_GENERATING: '生成标题中',
-  TITLE_SELECTING: '选择标题',
-  OUTLINE_GENERATING: '生成大纲中',
-  OUTLINE_EDITING: '编辑大纲',
-  CONTENT_GENERATING: '生成正文中',
-  MERGE_COMPLETE: '合成完成',
-  ALL_COMPLETE: '全部完成',
-  COMPLETED: '已完成',
-  DRAFT_SAVED: '草稿已存',
-  FAILED: '失败',
-}
-
-function getPhaseLabel(phase: string | undefined): string {
-  if (!phase) return '-'
-  return phaseLabels[phase] || phase
-}
-
-async function fetchArticles() {
-  loading.value = true
-  try {
-    const params: Record<string, any> = {
-      page: page.value,
-      page_size: pageSize.value,
-    }
-    if (statusFilter.value) {
-      params.status = statusFilter.value
-    }
-    if (keyword.value.trim()) {
-      params.keyword = keyword.value.trim()
-    }
-
-    const res = await listArticles(params)
-    // Handle both nested and flat response shapes
-    const data = res.data || res
-    articles.value = data.items || []
-    total.value = data.total || 0
-  } catch (err: any) {
-    ElMessage.error(err?.response?.data?.message || '加载文章列表失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-function handleSearch() {
-  page.value = 1
-  fetchArticles()
-}
-
-function handlePageChange(newPage: number) {
-  page.value = newPage
-  fetchArticles()
-}
-
-function handleSizeChange(newSize: number) {
-  pageSize.value = newSize
-  page.value = 1
-  fetchArticles()
-}
-
-async function handleDelete(row: Article) {
-  try {
-    await ElMessageBox.confirm('确定要删除该文章吗？此操作不可恢复。', '删除确认', {
-      confirmButtonText: '确定',
-      cancelButtonText: '取消',
-      type: 'warning',
-    })
-    await deleteArticle(row.id)
-    ElMessage.success('文章已删除')
-    fetchArticles()
-  } catch (err: any) {
-    if (err !== 'cancel') {
-      ElMessage.error(err?.response?.data?.message || '删除失败')
-    }
-  }
-}
-
-async function handleBatchDelete() {
-  if (selectedRows.value.length === 0) {
-    ElMessage.warning('请先选择要删除的文章')
-    return
-  }
-  try {
-    await ElMessageBox.confirm(
-      `确定要删除选中的 ${selectedRows.value.length} 篇文章吗？此操作不可恢复。`,
-      '批量删除',
-      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
-    )
-    loading.value = true
-    for (const row of selectedRows.value) {
-      try {
-        await deleteArticle(row.id)
-      } catch {
-        // skip individual failures
-      }
-    }
-    ElMessage.success(`已删除 ${selectedRows.value.length} 篇文章`)
-    selectedRows.value = []
-    fetchArticles()
-  } catch {
-    // cancelled
-  } finally {
-    loading.value = false
-  }
-}
-
-function handleView(row: Article) {
-  router.push(`/articles/${row.task_id}`)
-}
-
-function handleRetry(row: Article) {
-  router.push(`/articles?retry=${row.task_id}`)
-}
-
-onMounted(() => {
-  fetchArticles()
-})
-</script>
-
 <template>
-  <div class="article-list">
-    <!-- Search & Filter Bar -->
+  <div class="wechat-article-list">
+    <!-- 顶部操作栏 -->
     <el-card shadow="never" class="filter-card">
       <div class="filter-row">
-        <el-input
-          v-model="keyword"
-          placeholder="搜索文章主题..."
-          clearable
-          class="search-input"
-          @keyup.enter="handleSearch"
-          @clear="handleSearch"
-        />
-        <el-select
-          v-model="statusFilter"
-          placeholder="状态筛选"
-          clearable
-          class="status-select"
-          @change="handleSearch"
-        >
-          <el-option
-            v-for="opt in statusOptions"
-            :key="opt.value"
-            :label="opt.label"
-            :value="opt.value"
-          />
+        <el-select v-model="filterAccountId" placeholder="选择公众号" clearable style="width:220px" @change="onAccountChange">
+          <el-option v-for="a in accounts" :key="a.id" :label="a.label" :value="a.id" />
         </el-select>
-        <el-button type="primary" @click="handleSearch">搜索</el-button>
-        <el-button type="success" @click="router.push('/articles')">新建文章</el-button>
-        <el-button
-          type="danger"
-          plain
-          :disabled="selectedRows.length === 0"
-          @click="handleBatchDelete"
-        >
-          批量删除{{ selectedRows.length > 0 ? ` (${selectedRows.length})` : '' }}
+
+        <el-button type="primary" :loading="syncing" @click="handleSyncAll">
+          同步全部
+        </el-button>
+        <el-button @click="handleSyncDrafts" :loading="syncingDrafts" :disabled="!filterAccountId">
+          同步草稿箱
+        </el-button>
+        <el-button @click="handleSyncPublished" :loading="syncingPublished" :disabled="!filterAccountId">
+          同步已发布
+        </el-button>
+
+        <el-button type="success" @click="$router.push('/articles')" style="margin-left:auto">
+          新建文章
         </el-button>
       </div>
     </el-card>
 
-    <!-- Article Table -->
+    <!-- Tab: 草稿箱 / 已发布 -->
     <el-card shadow="never" class="table-card">
-      <el-table
-        ref="tableRef"
-        :data="articles"
-        v-loading="loading"
-        stripe
-        style="width: 100%"
-        empty-text="暂无文章数据"
-        @selection-change="(rows: any) => selectedRows = rows"
-      >
-        <el-table-column type="selection" width="45" />
-        <el-table-column prop="topic" label="文章主题" min-width="220" show-overflow-tooltip />
+      <el-tabs v-model="activeTab" @tab-change="handleTabChange">
+        <el-tab-pane label="草稿箱" name="draft">
+          <el-table :data="articles" v-loading="loading" stripe style="width:100%" empty-text="暂无数据，请先同步">
+            <el-table-column label="标题" min-width="280" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span class="article-title" @click="viewDetail(row)">{{ row.title || '无标题' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="作者" width="120" prop="author" />
+            <el-table-column label="摘要" min-width="200" show-overflow-tooltip prop="digest" />
+            <el-table-column label="同步时间" width="170">
+              <template #default="{ row }">{{ formatTime(row.last_synced_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="120" fixed="right">
+              <template #default="{ row }">
+                <el-button type="primary" link size="small" @click="viewDetail(row)">查看</el-button>
+                <el-button type="danger" link size="small" @click="handleDelete(row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
 
-        <el-table-column label="风格" width="110">
-          <template #default="{ row }">
-            <el-tag v-if="row.style" size="small" effect="plain">
-              {{ row.style }}
-            </el-tag>
-            <span v-else class="no-style">默认</span>
-          </template>
-        </el-table-column>
+        <el-tab-pane label="已发布" name="published">
+          <el-table :data="articles" v-loading="loading" stripe style="width:100%" empty-text="暂无数据，请先同步">
+            <el-table-column label="标题" min-width="280" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span class="article-title" @click="viewDetail(row)">{{ row.title || '无标题' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="作者" width="120" prop="author" />
+            <el-table-column label="摘要" min-width="200" show-overflow-tooltip prop="digest" />
+            <el-table-column label="发布时间" width="170">
+              <template #default="{ row }">{{ formatTime(row.publish_time) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="180" fixed="right">
+              <template #default="{ row }">
+                <el-button type="primary" link size="small" @click="viewDetail(row)">查看</el-button>
+                <el-button type="success" link size="small" @click="openWechat(row)" v-if="row.wechat_url">打开原文</el-button>
+                <el-button type="danger" link size="small" @click="handleDelete(row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
 
-        <el-table-column label="状态" width="120">
-          <template #default="{ row }">
-            <el-tag :type="getStatusTagType(row.status) as any" size="small">
-              {{ row.status }}
-            </el-tag>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="阶段" width="140">
-          <template #default="{ row }">
-            <el-tag type="info" size="small" effect="plain">
-              {{ getPhaseLabel(row.phase) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-
-        <el-table-column prop="created_at" label="创建时间" width="180" />
-
-        <el-table-column label="操作" width="210" fixed="right">
-          <template #default="{ row }">
-            <el-button type="primary" link size="small" @click="handleView(row)">
-              查看
-            </el-button>
-            <el-button
-              v-if="row.status === 'FAILED'"
-              type="warning"
-              link
-              size="small"
-              @click="handleRetry(row)"
-            >
-              重试
-            </el-button>
-            <el-button type="danger" link size="small" @click="handleDelete(row)">
-              删除
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-
-      <!-- Pagination -->
       <div class="pagination-wrapper">
         <el-pagination
           v-model:current-page="page"
@@ -272,51 +78,172 @@ onMounted(() => {
           :page-sizes="[10, 20, 50]"
           layout="total, sizes, prev, pager, next, jumper"
           background
-          @current-change="handlePageChange"
-          @size-change="handleSizeChange"
+          @current-change="fetchArticles"
+          @size-change="(s: number) => { pageSize = s; page = 1; fetchArticles() }"
         />
       </div>
     </el-card>
   </div>
 </template>
 
+<script setup lang="ts">
+import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { listSyncedArticles, syncDrafts, syncPublished, deleteSyncedArticle } from '@/api/wechat'
+import type { SyncedArticle } from '@/api/wechat'
+import client from '@/api/client'
+
+const router = useRouter()
+
+const accounts = ref<any[]>([])
+const filterAccountId = ref<number | undefined>()
+const activeTab = ref('draft')
+
+const articles = ref<SyncedArticle[]>([])
+const loading = ref(false)
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
+
+const syncing = ref(false)
+const syncingDrafts = ref(false)
+const syncingPublished = ref(false)
+
+function formatTime(t?: string) {
+  if (!t) return '-'
+  return new Date(t).toLocaleString('zh-CN', { hour12: false })
+}
+
+async function fetchAccounts() {
+  try {
+    const res = await client.get('/accounts')
+    const items: any[] = res.data?.items || res.data || []
+    accounts.value = items.filter((a: any) => a.id != null).map((a: any) => ({
+      ...a, label: a.name || a.app_id,
+    }))
+  } catch { /* ignore */ }
+}
+
+async function fetchArticles() {
+  loading.value = true
+  try {
+    const res = await listSyncedArticles({
+      page: page.value,
+      page_size: pageSize.value,
+      account_id: filterAccountId.value,
+      article_type: activeTab.value,
+    })
+    articles.value = res.items
+    total.value = res.total
+  } catch (e: any) {
+    ElMessage.error('加载失败：' + (e.message || ''))
+  } finally {
+    loading.value = false
+  }
+}
+
+function onAccountChange() {
+  page.value = 1
+  fetchArticles()
+}
+
+function handleTabChange() {
+  page.value = 1
+  fetchArticles()
+}
+
+async function handleSyncDrafts() {
+  if (!filterAccountId.value) { ElMessage.warning('请先选择公众号'); return }
+  syncingDrafts.value = true
+  try {
+    const res = await syncDrafts(filterAccountId.value)
+    ElMessage.success(`同步完成：新增 ${res.synced} 条，共 ${res.total} 条`)
+    fetchArticles()
+  } catch (e: any) {
+    const detail = e.response?.data?.detail || e.message || ''
+    if (detail.includes('48001')) {
+      ElMessage.warning('当前公众号类型不支持同步草稿箱（仅认证服务号可用）')
+    } else {
+      ElMessage.error('同步失败：' + detail)
+    }
+  } finally {
+    syncingDrafts.value = false
+  }
+}
+
+async function handleSyncPublished() {
+  if (!filterAccountId.value) { ElMessage.warning('请先选择公众号'); return }
+  syncingPublished.value = true
+  try {
+    const res = await syncPublished(filterAccountId.value)
+    ElMessage.success(`同步完成：新增 ${res.synced} 条，共 ${res.total} 条`)
+    fetchArticles()
+  } catch (e: any) {
+    const detail = e.response?.data?.detail || e.message || ''
+    if (detail.includes('48001')) {
+      ElMessage.warning('当前公众号类型不支持同步已发布文章（仅认证服务号可用）')
+    } else {
+      ElMessage.error('同步失败：' + detail)
+    }
+  } finally {
+    syncingPublished.value = false
+  }
+}
+
+async function handleSyncAll() {
+  if (!filterAccountId.value) { ElMessage.warning('请先选择公众号'); return }
+  syncing.value = true
+  try {
+    const [draftRes, pubRes] = await Promise.all([
+      syncDrafts(filterAccountId.value),
+      syncPublished(filterAccountId.value),
+    ])
+    ElMessage.success(`草稿箱: ${draftRes.synced} 条 / 已发布: ${pubRes.synced} 条`)
+    fetchArticles()
+  } catch (e: any) {
+    const detail = e.response?.data?.detail || e.message || ''
+    if (detail.includes('48001')) {
+      ElMessage.warning('当前公众号不支持同步（仅认证服务号可用），但评论管理仍可正常使用')
+    } else {
+      ElMessage.error('同步失败：' + detail)
+    }
+  } finally {
+    syncing.value = false
+  }
+}
+
+function viewDetail(row: SyncedArticle) {
+  router.push(`/articles/synced/${row.id}`)
+}
+
+function openWechat(row: SyncedArticle) {
+  if (row.wechat_url) window.open(row.wechat_url, '_blank')
+}
+
+async function handleDelete(row: SyncedArticle) {
+  try {
+    await ElMessageBox.confirm('确定删除本地同步记录？不会影响微信端的文章。', '确认', {
+      confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning',
+    })
+    await deleteSyncedArticle(row.id)
+    ElMessage.success('已删除')
+    fetchArticles()
+  } catch { /* ignore */ }
+}
+
+onMounted(() => {
+  fetchAccounts()
+  fetchArticles()
+})
+</script>
+
 <style scoped>
-.article-list {
-  padding: 20px;
-}
-
-.filter-card {
-  margin-bottom: 16px;
-  border-radius: 8px;
-}
-
-.filter-row {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.search-input {
-  width: 300px;
-}
-
-.status-select {
-  width: 160px;
-}
-
-.table-card {
-  border-radius: 8px;
-}
-
-.pagination-wrapper {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 20px;
-}
-
-.no-style {
-  color: #909399;
-  font-size: 12px;
-}
+.wechat-article-list { padding: 20px; }
+.filter-card { margin-bottom: 16px; border-radius: 8px; }
+.filter-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.table-card { border-radius: 8px; }
+.article-title { color: #409eff; cursor: pointer; }
+.article-title:hover { text-decoration: underline; }
+.pagination-wrapper { display: flex; justify-content: flex-end; margin-top: 20px; }
 </style>

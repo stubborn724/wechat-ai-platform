@@ -78,11 +78,24 @@
     <!-- 已发布文章列表（用于同步评论） -->
     <el-card class="articles-card" v-if="publishedArticles.length > 0">
       <template #header>
-        <span>已发布文章（点击同步评论）</span>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span>已发布文章（点击同步评论）</span>
+          <span style="font-size:12px;color:#909399">
+            本地 {{ publishedArticles.filter((a:any) => a._source === 'local').length }} 篇
+            / 微信 {{ publishedArticles.filter((a:any) => a._source === 'wechat').length }} 篇
+          </span>
+        </div>
       </template>
       <el-table :data="publishedArticles" stripe size="small">
-        <el-table-column prop="main_title" label="标题" min-width="250" show-overflow-tooltip />
-        <el-table-column prop="topic" label="主题" width="200" show-overflow-tooltip />
+        <el-table-column label="来源" width="60">
+          <template #default="{ row }">
+            <el-tag v-if="row._source === 'wechat'" size="small" type="success">微信</el-tag>
+            <el-tag v-else size="small" type="info">本地</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="标题" min-width="250" show-overflow-tooltip>
+          <template #default="{ row }">{{ row._label }}</template>
+        </el-table-column>
         <el-table-column label="msg_data_id" width="180">
           <template #default="{ row }">
             <code style="font-size:12px">{{ row.msg_data_id || '未设置' }}</code>
@@ -93,10 +106,10 @@
             <el-button type="primary" size="small" :loading="syncingArticleId === row.id" @click="handleSyncArticle(row)">
               同步评论
             </el-button>
-            <el-button type="warning" size="small" @click="openSetMsgId(row)">
+            <el-button v-if="row._source === 'local'" type="warning" size="small" @click="openSetMsgId(row)">
               设置ID
             </el-button>
-            <el-button type="danger" size="small" @click="handleDebugApi(row)">
+            <el-button v-if="row._source === 'local'" type="danger" size="small" @click="handleDebugApi(row)">
               诊断
             </el-button>
           </template>
@@ -213,12 +226,40 @@ async function fetchAccounts() {
 
 async function fetchPublishedArticles() {
   try {
-    const res = await client.get('/articles', {
-      params: { status: 'published', page_size: 50 }
-    })
-    publishedArticles.value = (res.data?.items || res.data || []).filter(
-      (a: any) => a.msg_data_id || a.status === 'published'
-    )
+    // 本地 AI 文章
+    const [localRes, syncedRes] = await Promise.all([
+      client.get('/articles', { params: { status: 'published', page_size: 50 } }),
+      filterAccountId.value
+        ? client.get('/wechat-articles', { params: { account_id: filterAccountId.value, article_type: 'published', page_size: 100 } })
+        : Promise.resolve({ data: { items: [] } }),
+    ])
+
+    const localArticles: any[] = (localRes.data?.items || localRes.data || [])
+      .filter((a: any) => a.msg_data_id)
+
+    const syncedArticles: any[] = (syncedRes.data?.items || [])
+      .filter((a: any) => a.msg_data_id || a.wechat_article_id)
+
+    // 合并：本地文章 + 微信同步文章（标记来源）
+    const merged = [
+      ...localArticles.map((a: any) => ({
+        ...a,
+        _source: 'local',
+        _label: a.main_title || a.topic || '无标题',
+      })),
+      ...syncedArticles.map((a: any) => ({
+        id: a.id,
+        task_id: `synced_${a.id}`,
+        main_title: a.title,
+        topic: a.digest || '',
+        msg_data_id: a.msg_data_id || a.wechat_article_id,
+        _source: 'wechat',
+        _label: a.title || '无标题',
+        publish_time: a.publish_time,
+      })),
+    ]
+
+    publishedArticles.value = merged
   } catch { /* ignore */ }
 }
 
@@ -260,6 +301,9 @@ async function onAccountChange() {
       auto_msg_content: '',
     }
   }
+  // 切换公众号时刷新已发布文章列表，显示同步过来的微信文章
+  fetchPublishedArticles()
+  fetchComments()
 }
 
 async function saveAutoConfig() {
@@ -282,12 +326,22 @@ async function handleSyncArticle(article: any) {
   }
   syncingArticleId.value = article.id
   try {
-    const res = await client.post('/comments/sync-by-article', null, {
-      params: {
-        article_id: article.id,
+    let res
+    if (article._source === 'wechat') {
+      // 微信同步文章：直接用 msg_data_id
+      res = await client.post('/comments/sync', {
         account_id: filterAccountId.value,
-      }
-    })
+        msg_data_id: article.msg_data_id,
+      })
+    } else {
+      // 本地 AI 文章：通过 article_id 找 msg_data_id
+      res = await client.post('/comments/sync-by-article', null, {
+        params: {
+          article_id: article.id,
+          account_id: filterAccountId.value,
+        }
+      })
+    }
     const d = res.data
     const parts = [`同步完成：新增 ${d.new} 条，共 ${d.total} 条`]
     if (d.auto_replied > 0) parts.push(`已自动回复 ${d.auto_replied} 条`)
@@ -369,9 +423,17 @@ async function handleSyncAll() {
   for (const article of publishedArticles.value) {
     if (!article.msg_data_id) continue
     try {
-      const res = await client.post('/comments/sync-by-article', null, {
-        params: { article_id: article.id, account_id: filterAccountId.value }
-      })
+      let res
+      if (article._source === 'wechat') {
+        res = await client.post('/comments/sync', {
+          account_id: filterAccountId.value,
+          msg_data_id: article.msg_data_id,
+        })
+      } else {
+        res = await client.post('/comments/sync-by-article', null, {
+          params: { article_id: article.id, account_id: filterAccountId.value }
+        })
+      }
       const d = res.data
       totalNew += d.new || 0
       totalReplied += d.auto_replied || 0

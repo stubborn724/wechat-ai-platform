@@ -240,6 +240,11 @@ class WeChatCommentService:
         self, db: Session, tenant_id: int, account_id: int, msg_data_id: str,
     ) -> Tuple[list[int], int, int]:
         """同步评论到本地，返回 (新评论 ID 列表, 新增数, 总数)"""
+        # 先尝试打开评论
+        try:
+            await self.open_comment(msg_data_id)
+        except RuntimeError:
+            pass
         wechat_data = await self.list_comments(msg_data_id, count=50, comment_type=0)
         total_count = wechat_data.get("total", 0)
         comments = wechat_data.get("comment", [])

@@ -164,3 +164,60 @@ export async function sendContact(data: SendContactRequest): Promise<any> {
   const res = await client.post('/messages/send-contact', data)
   return res.data
 }
+
+// --- WeChat Synced Articles ---
+
+export interface SyncedArticle {
+  id: number
+  account_id: number
+  article_type: string  // draft / published
+  media_id?: string
+  wechat_article_id?: string
+  title?: string
+  author?: string
+  digest?: string
+  cover_url?: string
+  wechat_url?: string
+  content?: string
+  publish_time?: string
+  need_open_comment: number
+  last_synced_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SyncedArticleListResponse {
+  total: number
+  page: number
+  page_size: number
+  items: SyncedArticle[]
+}
+
+export async function listSyncedArticles(params: {
+  page?: number, page_size?: number, account_id?: number, article_type?: string,
+}): Promise<SyncedArticleListResponse> {
+  const res = await client.get('/wechat-articles', { params })
+  return res.data
+}
+
+export async function syncDrafts(account_id: number): Promise<any> {
+  const res = await client.post(`/wechat-articles/sync-drafts?account_id=${account_id}`)
+  return res.data
+}
+
+export async function syncPublished(account_id: number): Promise<any> {
+  const res = await client.post(`/wechat-articles/sync-published?account_id=${account_id}`)
+  return res.data
+}
+
+export async function getSyncedArticle(article_id: number, fetch_content?: boolean): Promise<SyncedArticle> {
+  const params: any = {}
+  if (fetch_content) params.fetch_content = true
+  const res = await client.get(`/wechat-articles/${article_id}`, { params })
+  return res.data
+}
+
+export async function deleteSyncedArticle(article_id: number): Promise<any> {
+  const res = await client.delete(`/wechat-articles/${article_id}`)
+  return res.data
+}

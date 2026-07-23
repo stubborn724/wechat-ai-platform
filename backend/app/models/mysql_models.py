@@ -497,7 +497,7 @@ class WeChatComment(MysqlBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    account_id = Column(Integer, ForeignKey("wechat_oauth_accounts.id"), nullable=True, comment="授权公众号 ID")
+    account_id = Column(Integer, nullable=True, comment="授权公众号 ID")
     article_id = Column(Integer, ForeignKey("articles.id"), nullable=True, comment="所属文章")
     # 微信侧数据
     msg_id = Column(String(128), nullable=False, comment="文章 msg_id（群发返回的）")
@@ -533,7 +533,7 @@ class WeChatMessage(MysqlBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    account_id = Column(Integer, ForeignKey("wechat_oauth_accounts.id"), nullable=True, comment="发送公众号")
+    account_id = Column(Integer, nullable=True, comment="发送公众号")
     openid = Column(String(128), nullable=False, index=True, comment="目标用户 OpenID")
     msg_type = Column(String(32), nullable=False, comment="text/image/video/voice/miniprogrampage")
     content = Column(Text, nullable=True, comment="文本内容（文本消息）")
@@ -673,6 +673,46 @@ class TenantWatermarkConfig(MysqlBase):
 
     __table_args__ = (
         Index("ix_tenant_watermark_tenant", "tenant_id"),
+    )
+
+
+class WeChatSyncedArticle(MysqlBase):
+    """从微信同步的文章索引（草稿箱 + 已发布），正文按需实时拉取"""
+    __tablename__ = "wechat_synced_articles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+
+    # 微信侧标识
+    article_type = Column(String(16), nullable=False, comment="draft / published")
+    media_id = Column(String(128), nullable=True, comment="草稿 media_id（仅草稿箱）")
+    wechat_article_id = Column(String(128), nullable=True, comment="已发布文章的 article_id")
+
+    # 文章信息
+    title = Column(String(255), nullable=True)
+    author = Column(String(64), nullable=True)
+    digest = Column(Text, nullable=True)
+    cover_url = Column(String(512), nullable=True)
+    wechat_url = Column(String(512), nullable=True, comment="已发布文章的永久链接")
+    content = Column(Text, nullable=True, comment="缓存正文（可选）")
+    publish_time = Column(DateTime, nullable=True, comment="微信端发布时间")
+
+    # 同步状态
+    is_deleted = Column(Boolean, default=False, nullable=False, comment="微信端已删除")
+    need_open_comment = Column(Integer, default=0, nullable=False, comment="1=已开启评论")
+    msg_data_id = Column(String(128), nullable=True, comment="评论 API 用的 msg_data_id（从 URL mid 提取）")
+    raw_data = Column(JSON, nullable=True, comment="微信原始返回数据")
+    last_synced_at = Column(DateTime, nullable=False, comment="最近同步时间")
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_ws_articles_account_type", "account_id", "article_type"),
+        Index("ix_ws_articles_tenant", "tenant_id"),
+        UniqueConstraint("account_id", "article_type", "media_id", "wechat_article_id",
+                         name="uq_ws_article_identity"),
     )
 
 
