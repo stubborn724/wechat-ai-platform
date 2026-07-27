@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
 from app.config import settings
-from app.models.mysql_models import AgentLog, Article, ContentVersion
+from app.models.mysql_models import AgentLog, Article, ContentVersion, WeChatAccount
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -26,6 +26,7 @@ router = APIRouter()
 
 class CreateArticleRequest(BaseModel):
     topic: str
+    content_type: str = "article"  # article / image / pure_image / video
     style: Optional[str] = None
     image_source: str = "PEXELS"
     enabled_image_methods: Optional[List[str]] = None
@@ -40,6 +41,9 @@ class CreateArticleRequest(BaseModel):
     selected_image_urls: Optional[List[str]] = None  # 本地素材预选图片URL
     footer_template: Optional[str] = None  # 文章底部固定内容
     watermark_enabled: Optional[bool] = None  # 是否加水印，None 则使用租户全局配置
+    # 视频专用字段
+    duration_sec: Optional[int] = None  # 视频时长（秒）
+    aspect_ratio: Optional[str] = None  # 画面比例
 
 
 class ConfirmTitleRequest(BaseModel):
@@ -71,6 +75,7 @@ class AiModifyOutlineRequest(BaseModel):
 class ArticleResponse(BaseModel):
     id: int
     task_id: str
+    tenant_id: Optional[int] = None
     user_id: Optional[int] = None
     topic: Optional[str] = None
     style: Optional[str] = None
@@ -159,6 +164,71 @@ def _strip_photography_text(text: str, pre_extracted_keywords: list | None = Non
             continue
         cleaned.append(line)
     return "\n".join(cleaned)
+
+
+def _render_image_markers(content: str, task_id: str) -> str:
+    """Replace [IMAGE:] markers in content with appropriate HTML.
+
+    Handles type=gallery markers by grouping them into a carousel.
+    """
+    import re as _re
+    gallery_markers = []
+    text_markers = []
+
+    for m in _re.finditer(r'\[IMAGE:(.*?)\]', content):
+        marker = m.group(0)
+        inner = m.group(1)
+        pos = _re.search(r'position=(\d+)', inner)
+        idx = int(pos.group(1)) if pos else 1
+        kw = _re.search(r'keywords=([^,\]]+)', inner)
+        keywords = kw.group(1) if kw else ""
+        is_gallery = 'type=gallery' in inner
+        url = f"https://picsum.photos/seed/{task_id[:8]}{idx}/800/400"
+        if is_gallery:
+            gallery_markers.append((marker, url, keywords, idx))
+        else:
+            text_markers.append((marker, url, keywords, idx))
+
+    result = content
+    for marker, url, keywords, _ in text_markers:
+        img = f'<img src="{url}" alt="{keywords}" style="width:100%;border-radius:8px;margin:16px 0;" />'
+        result = result.replace(marker, img, 1)
+
+    if gallery_markers:
+        thumbs = ""
+        images = []
+        for i, (_, url, kw, _) in enumerate(gallery_markers):
+            images.append((url, kw, i))
+            border = '#07c160' if i == 0 else 'transparent'
+            op = '1' if i == 0 else '0.6'
+            thumbs += (
+                f'<div style="flex:0 0 80px;height:60px;border-radius:6px;overflow:hidden;'
+                f'cursor:pointer;border:2px solid {border};opacity:{op};transition:all .2s;" '
+                f'onclick="let p=this.parentElement;'
+                f'p.querySelectorAll(\'>div\').forEach(d=>{{d.style.border=\'2px solid transparent\';d.style.opacity=\'0.6\'}});'
+                f'this.style.border=\'2px solid #07c160\';this.style.opacity=\'1\';'
+                f'p.parentElement.querySelector(\'.gallery-main img\').src=\'{url}\';">'
+                f'<img src="{url}" alt="{kw}" loading="lazy" '
+                f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
+                f'</div>'
+            )
+
+        first = images[0]
+        html = (
+            f'<div class="image-gallery" style="margin:16px 0;">'
+            f'<div class="gallery-main" style="width:100%;background:#f0f0f0;border-radius:8px;'
+            f'overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:300px;">'
+            f'<img src="{first[0]}" alt="{first[1]}" '
+            f'style="max-width:100%;max-height:65vh;width:auto;height:auto;object-fit:contain;" />'
+            f'</div>'
+            f'<div style="display:flex;gap:8px;margin-top:12px;overflow-x:auto;padding:4px 0;">'
+            f'{thumbs}</div></div>'
+        )
+        for marker, _, _, _ in gallery_markers:
+            result = result.replace(marker, "", 1)
+        result = html + result
+
+    return result
 
 
 def _log_io(agent_name: str, prompt: str, response: str, duration_ms: int):
@@ -277,18 +347,285 @@ def _sample_content(main_title: str, sub_title: str, outline: dict) -> str:
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/articles/create", status_code=status.HTTP_201_CREATED, response_model=ArticleResponse)
+@router.post("/articles/create", status_code=status.HTTP_201_CREATED)
 async def create_article(
     req: CreateArticleRequest,
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Create an article and kick off title generation."""
+    """Create article / image / video content based on content_type."""
+    content_type = req.content_type or "image_text"
+
+    # ========== 纯图片 ==========
+    if content_type in ("pure_image", "image"):
+        # 有仿写参考文章时，使用 Agent 仿写流程
+        if req.feed_article_ids:
+            print(f"\n{'='*60}")
+            print(f"  [纯图片仿写] 使用 Agent 仿写流程 feed_article_ids={req.feed_article_ids}")
+            print(f"{'='*60}")
+            try:
+                from app.agent.nodes.title_imitation_node import imitate_title
+                from app.agent.nodes.image_understanding_node import understand_images
+                from app.agent.nodes.prompt_crafting_node import craft_prompt
+                from app.services.wanxiang_service import WanxiangImageService
+                from app.services.asset_archive_service import save_image_to_asset_library
+                from app.models.mysql_models import FeedSourceArticle as FSA
+                import re as _re
+
+                ref_articles = db.query(FSA).filter(FSA.id.in_(req.feed_article_ids)).all()
+                ref = ref_articles[0] if ref_articles else None
+                ref_title = ref.title if ref else ""
+                ref_body = ref.body_markdown if ref else ""
+                image_urls = _re.findall(r'!\[.*?\]\((.*?)\)', ref_body or "")
+
+                print(f"  参考文章: {ref_title}")
+                print(f"  提取图片: {len(image_urls)} 张")
+
+                if not image_urls:
+                    return {"type": "content_job", "error": "参考文章中没有图片", "status": "fail"}
+
+                # Agent 1: 标题（用户没输入才仿写）
+                new_title = req.topic or ""
+                if not new_title:
+                    titles = imitate_title(ref_title, topic=req.topic or "图片", count=3)
+                    new_title = titles[0] if titles else ref_title
+                print(f"  标题: {new_title}")
+
+                # Agent 3: 视觉理解
+                visual_descs = understand_images(image_urls)
+
+                # Agent 4+5: 逐张生成
+                wanxiang = WanxiangImageService()
+                gen_urls = []
+                for i, desc in enumerate(visual_descs):
+                    print(f"\n  >>> 图片 {i+1}/{len(visual_descs)} <<<")
+                    pd = craft_prompt(desc, topic=new_title, similarity="medium")
+                    prompt = pd["prompt"]
+                    if not prompt:
+                        from app.agent.nodes.image_prompt_builder import build_wanxiang_prompt
+                        prompt = build_wanxiang_prompt(desc, new_title, "medium")
+                    print(f"  生成 prompt ({len(prompt)}字): {prompt[:200]}")
+                    img_url = await wanxiang.generate_image(prompt, size="1024*1365")
+                    if img_url:
+                        asset = await save_image_to_asset_library(db, principal.tenant_id, img_url, keywords=new_title[:50])
+                        gen_urls.append(img_url)
+                        print(f"  ✅ 图片 {i+1} 生成成功")
+                    else:
+                        print(f"  ⚠️ 图片 {i+1} 生成失败")
+
+                if not gen_urls:
+                    return {"type": "content_job", "error": "所有图片生成失败", "status": "fail"}
+
+                # 保存到微信草稿箱
+                if req.publish_mode in ("draft", "direct") and req.account_ids:
+                    print(f"\n  发布到微信草稿箱 accounts={req.account_ids} mode={req.publish_mode}")
+                    from app.models.mysql_models import Article as ArtModel
+                    from app.services.wechat_publisher import publish_article
+                    body_md = "\n\n".join(f"![]({u})" for u in gen_urls)
+                    article = ArtModel(
+                        task_id=f"img_feed_{ref.id if ref else 0}",
+                        tenant_id=principal.tenant_id,
+                        main_title=new_title,
+                        content=body_md,
+                        full_content=body_md,
+                        cover_image=gen_urls[0],
+                    )
+                    for aid in req.account_ids:
+                        try:
+                            pub = publish_article(db, article, aid, mode=req.publish_mode,
+                                                  tenant_id=principal.tenant_id, actor_id=principal.user_id)
+                            print(f"  ✅ 微信发布成功 account={aid}: media_id={pub.get('media_id','?')}")
+                        except Exception as pbe:
+                            print(f"  ⚠️ 微信发布失败 account={aid}: {pbe}")
+
+                return {
+                    "type": "content_job",
+                    "content_type": "image",
+                    "status": "published",
+                    "result": {"image_urls": gen_urls, "images": gen_urls, "count": len(gen_urls)},
+                    "title": new_title,
+                }
+            except Exception as e:
+                print(f"  ❌ 仿写流程失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return {"type": "content_job", "error": str(e), "status": "fail"}
+
+        # 无仿写参考，走旧流程
+        from app.models.mysql_models import ContentJob as CJob
+        import uuid as _uuid
+
+        job = CJob(
+            tenant_id=principal.tenant_id,
+            topic=req.topic or "",
+            content_type="image",
+            status="queued",
+            version=1,
+            approval_mode="auto",
+            idempotency_key=f"img_{_uuid.uuid4().hex}",
+            created_by=principal.user_id,
+            generation_config={
+                "aspect_ratio": "3:4",
+                "brand_style": req.style or "简约现代",
+                "target_audience": req.user_description or "",
+                "publish_mode": req.publish_mode or "draft",
+                "account_ids": req.account_ids or [],
+            },
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        print(f"\n{'='*60}")
+        print(f"  🖼️ 纯图片任务: job_id={job.id}, 主题={req.topic}")
+        print(f"{'='*60}")
+
+        try:
+            from app.tasks.content_tasks import _process_image_job_sync
+            result = await _process_image_job_sync(db, job, req)
+            db.commit()
+            return {
+                "type": "content_job",
+                "job_id": job.id,
+                "content_type": "image",
+                "status": job.status,
+                "result": result,
+            }
+        except Exception as e:
+            print(f"  ❌ 图片处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            job.status = "fail"
+            db.commit()
+            return {"type": "content_job", "job_id": job.id, "content_type": "image", "status": "fail", "error": str(e)}
+
+    # ========== 视频 ==========
+    if content_type == "video":
+        from app.models.mysql_models import ContentJob as CJob
+        import uuid as _uuid
+
+        job = CJob(
+            tenant_id=principal.tenant_id,
+            topic=req.topic or "",
+            content_type="video",
+            status="queued",
+            version=1,
+            approval_mode="auto",
+            idempotency_key=f"vid_{_uuid.uuid4().hex}",
+            created_by=principal.user_id,
+            generation_config={
+                "duration_sec": req.duration_sec or 30,
+                "aspect_ratio": req.aspect_ratio or "9:16",
+                "target_audience": req.user_description or "",
+                "publish_mode": req.publish_mode or "draft",
+                "account_ids": req.account_ids or [],
+                "knowledge_base_ids": req.knowledge_base_ids or [],
+                "source_feed_id": req.source_feed_id,
+                "feed_article_ids": req.feed_article_ids or [],
+                "style": req.style,
+            },
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        from app.services.storage_service import generate_object_key as _gen_key, storage_service as _ss
+
+        # 同步执行视频处理（通义万相文生视频 API 直接生成）
+        try:
+            job.status = "generating"
+            db.commit()
+            print(f"\n{'='*60}")
+            print(f"  [视频 {job.id}] 开始处理: {req.topic}")
+            print(f"{'='*60}")
+
+            config = job.generation_config or {}
+            dur = config.get("duration_sec", 5)
+            ar = config.get("aspect_ratio", "9:16")
+            size = "720*1280" if ar == "9:16" else "1280*720"
+
+            prompt = req.topic or ""
+            if req.user_description:
+                prompt = f"{prompt}，{req.user_description}"
+
+            print(f"  >>> 提交文生视频: {prompt[:80]}")
+            from app.services.video_gen_service import video_gen_service as _vgen
+            video_url = await _vgen.generate_video(prompt=prompt, size=size, duration=dur)
+            if not video_url:
+                raise RuntimeError("视频生成失败，请检查 API Key 是否有万相视频模型权限")
+
+            print(f"  ✅ 视频生成完毕")
+
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=120) as _client:
+                resp = await _client.get(video_url)
+                resp.raise_for_status()
+                video_bytes = resp.content
+
+            vk = _gen_key(principal.tenant_id, f"video_{_uuid.uuid4().hex[:8]}.mp4", prefix="content")
+            _ss.upload_bytes(vk, video_bytes, "video/mp4")
+            vu = _ss.get_url(vk)
+            print(f"  ✅ 视频已保存: {vu[:60]}")
+
+            # 用 AI 生成视频封面
+            cover_url = ""
+            try:
+                from app.services.wanxiang_service import WanxiangImageService as _WX
+                from app.services.asset_archive_service import save_image_to_asset_library
+                cover_prompt = f"{req.topic}，封面图，视觉冲击力，高清，适合做视频封面"
+                print(f"  >>> 生成封面: {req.topic}")
+                _wx = _WX()
+                _cover_img_url = await _wx.generate_image(cover_prompt, size="720*1280")
+                if _cover_img_url:
+                    _asset = await save_image_to_asset_library(db, principal.tenant_id, _cover_img_url, keywords=f"video_cover_{job.id}")
+                    if _asset and _asset.storage_key:
+                        cover_url = _ss.get_url(_asset.storage_key)
+                        print(f"  ✅ 封面已生成")
+                else:
+                    print(f"  ⚠️ 封面生成失败")
+            except Exception as e:
+                print(f"  ⚠️ 封面生成异常: {e}")
+
+            pm = config.get("publish_mode", "")
+            aids = config.get("account_ids", [])
+            if pm in ("draft", "direct") and aids:
+                from app.services.wechat_publisher import publish_article
+                from app.models.mysql_models import Article as _ArtModel
+
+                art = _ArtModel(
+                    task_id=f"vid_{job.id}",
+                    tenant_id=principal.tenant_id,
+                    main_title=req.topic or "视频",
+                    content=f'<p><video src="{vu}" controls style="width:100%" /></p>',
+                    full_content=f'<p><video src="{vu}" controls style="width:100%" /></p>',
+                    cover_image=cover_url,
+                )
+                for aid in aids:
+                    try:
+                        publish_article(db, art, aid, mode=pm,
+                                        tenant_id=principal.tenant_id,
+                                        actor_id=principal.user_id)
+                        print(f"  ✅ 已{'直接发布' if pm == 'direct' else '保存草稿'}到公众号 account={aid}")
+                    except Exception as pub_err:
+                        print(f"  ⚠️ 微信发布失败 account={aid}: {pub_err}")
+
+            job.status = "published"
+            db.commit()
+            print(f"  ✅ 视频完成")
+            return {"type": "content_job", "job_id": job.id, "content_type": "video",
+                    "status": "published", "result": {"video_url": vu}}
+        except Exception as e:
+            print(f"  ❌ 视频失败: {e}")
+            import traceback
+            traceback.print_exc()
+            job.status = "fail"
+            db.commit()
+            return {"type": "content_job", "job_id": job.id, "content_type": "video", "status": "fail", "error": str(e)}
+
+    # ========== 图文（原有逻辑） ==========
     from app.services.article_service import create_article as service_create
 
     article = service_create(
-        db=db, user_id=principal.user_id, topic=req.topic,
-        style=req.style or "", image_source=req.image_source,
+        db=db, user_id=principal.user_id, tenant_id=principal.tenant_id,
+        topic=req.topic, style=req.style or "", image_source=req.image_source,
         footer_template=req.footer_template,
     )
     print(f"\n{'='*60}")
@@ -346,6 +683,7 @@ async def create_article(
                     .filter(
                         FeedSourceArticle.id.in_(req.feed_article_ids),
                         FeedSourceArticle.feed_source_id == req.source_feed_id,
+                        FeedSourceArticle.tenant_id == principal.tenant_id,
                     )
                     .all()
                 )
@@ -374,7 +712,8 @@ async def create_article(
             try:
                 from app.models.mysql_models import FeedSource
                 feed_src = db.query(FeedSource).filter(
-                    FeedSource.id == req.source_feed_id
+                    FeedSource.id == req.source_feed_id,
+                    FeedSource.tenant_id == principal.tenant_id,
                 ).first()
                 if feed_src and feed_src.style_profile:
                     state.style_profile = feed_src.style_profile
@@ -443,13 +782,23 @@ async def create_article(
                     except Exception as cover_err:
                         print(f"  ⚠️ AI封面图生成异常: {cover_err}")
 
-                    print("  ▶ [自动] 分析配图需求...")
-                    state = await agent4_analyze_image_requirements(state)
-                    print(f"     需要 {len(state.image_requirements)} 张配图")
+                    # Detect pure-image gallery BEFORE agent4 (which may hang)
+                    is_gallery = state.content and all(
+                        l.strip().startswith('[IMAGE:') and 'type=gallery' in l
+                        for l in state.content.split('\n') if l.strip()
+                    )
+                    if is_gallery:
+                        print("  ▶ [自动] 纯图画廊模式，跳过配图获取，使用占位图...")
+                        image_keywords_auto = re.findall(r'keywords=([^,\]]+)', content)
+                        content_rich = _render_image_markers(state.content, state.task_id)
+                    else:
+                        print("  ▶ [自动] 分析配图需求...")
+                        state = await agent4_analyze_image_requirements(state)
+                        print(f"     需要 {len(state.image_requirements)} 张配图")
 
-                    print("  ▶ [自动] 获取配图...")
-                    state = await agent5_generate_images(state)
-                    print(f"     已获取 {len(state.images)} 张配图")
+                        print("  ▶ [自动] 获取配图...")
+                        state = await agent5_generate_images(state)
+                        print(f"     已获取 {len(state.images)} 张配图")
 
                     # Extract image keywords BEFORE merge (post-processing needs them)
                     image_keywords_auto = re.findall(r'keywords=([^,\]]+)', content)
@@ -481,27 +830,18 @@ async def create_article(
                         print(f"  ✅ 素材归档完成，已水印 {len(url_map)} 张")
 
                     # Merge images into content AFTER URLs are finalized
-                    state = merge_images_into_content(state)
-                    content_rich = state.full_content or content
+                    if state.images:
+                        state = merge_images_into_content(state)
+                        content_rich = state.full_content or content
 
                     # 封面图不嵌入正文（已存为 article.cover_image，前端自行展示）
                     # 不要在这里往 content_rich 前面加 <img>，避免重复
 
                 except Exception as img_exc:
                     print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
-                    import re as _re
-                    def _ph(m):
-                        pos = _re.search(r'position=(\d+)', m.group(1))
-                        idx = int(pos.group(1)) if pos else 1
-                        return f'<img src="https://picsum.photos/seed/{article.task_id[:8]}{idx}/800/400" style="width:100%;border-radius:8px;margin:16px 0;" />'
-                    content_rich = _re.sub(r'\[IMAGE:(.*?)\]', _ph, content)
+                    content_rich = _render_image_markers(content, article.task_id)
             else:
-                import re as _re
-                def _ph(m):
-                    pos = _re.search(r'position=(\d+)', m.group(1))
-                    idx = int(pos.group(1)) if pos else 1
-                    return f'<img src="https://picsum.photos/seed/{article.task_id[:8]}{idx}/800/400" style="width:100%;border-radius:8px;margin:16px 0;" />'
-                content_rich = _re.sub(r'\[IMAGE:(.*?)\]', _ph, content)
+                content_rich = _render_image_markers(content, article.task_id)
 
             # Footer is already appended by merge_images_into_content() via state.footer_template
 
@@ -524,7 +864,7 @@ async def create_article(
                 success_count = 0
                 for aid in req.account_ids:
                     try:
-                        result = publish_article(db, article, aid, mode=req.publish_mode)
+                        result = publish_article(db, article, aid, mode=req.publish_mode, tenant_id=principal.tenant_id, actor_id=principal.user_id)
                         media_id = result.get("media_id")
                         publish_id = result.get("publish_id")
                         mode_label = "直接发布" if req.publish_mode == "direct" else "存草稿"
@@ -575,7 +915,7 @@ async def confirm_title(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Confirm the selected title, then generate outline (agent2)."""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
 
@@ -624,7 +964,7 @@ async def confirm_outline(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Confirm the outline, then generate content (agent3)."""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
 
@@ -679,13 +1019,24 @@ async def confirm_outline(
                 state.content = content
                 state.footer_template = article.footer_template
 
-                print("  ▶ 分析配图需求...")
-                state = await agent4_analyze_image_requirements(state)
-                print(f"     需要 {len(state.image_requirements)} 张配图")
+                # Detect pure-image gallery BEFORE agent4
+                is_gallery = state.content and all(
+                    l.strip().startswith('[IMAGE:') and 'type=gallery' in l
+                    for l in state.content.split('\n') if l.strip()
+                )
+                if is_gallery:
+                    print("  ▶ 纯图画廊模式，跳过配图获取，使用占位图...")
+                    state.images = []
+                    full_content = _render_image_markers(state.content, state.task_id)
+                    state.full_content = full_content
+                else:
+                    print("  ▶ 分析配图需求...")
+                    state = await agent4_analyze_image_requirements(state)
+                    print(f"     需要 {len(state.image_requirements)} 张配图")
 
-                print("  ▶ 获取配图...")
-                state = await agent5_generate_images(state)
-                print(f"     已获取 {len(state.images)} 张配图")
+                    print("  ▶ 获取配图...")
+                    state = await agent5_generate_images(state)
+                    print(f"     已获取 {len(state.images)} 张配图")
 
                 # ========== Archive images FIRST (watermark applied here) ==========
                 url_map: dict[str, str] = {}
@@ -711,8 +1062,9 @@ async def confirm_outline(
                             cover_image_url = url_map[cover_image_url]
 
                 # Merge images into content (now uses watermarked URLs)
-                state = merge_images_into_content(state)
-                full_content = state.full_content or content
+                if state.images:
+                    state = merge_images_into_content(state)
+                    full_content = state.full_content or content
 
                 # 封面图不嵌入正文（已存为 article.cover_image，前端自行展示）
 
@@ -774,16 +1126,24 @@ def publish_article_draft(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """发布文章到微信公众号（存草稿箱或直接发布）"""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
     if not (article.full_content or article.content):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Article has no content")
 
+    # 验证公众号属于当前租户
+    account = db.query(WeChatAccount).filter(
+        WeChatAccount.id == account_id,
+        WeChatAccount.tenant_id == principal.tenant_id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+
     from app.services.wechat_publisher import publish_article
 
     try:
-        result = publish_article(db, article, account_id, mode=mode)
+        result = publish_article(db, article, account_id, mode=mode, tenant_id=principal.tenant_id, actor_id=principal.user_id)
         if mode == "direct":
             article.status = "publishing"
             article.phase = "PUBLISHING"
@@ -834,7 +1194,10 @@ def set_article_msg_data_id(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """手动设置文章的 msg_data_id（用于在微信后台发布后，手动绑定评论）"""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(
+        Article.task_id == task_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
     article.msg_data_id = msg_data_id
@@ -860,7 +1223,7 @@ def get_article(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Get article detail by task_id."""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
     return article
@@ -874,8 +1237,8 @@ def list_articles(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List articles with pagination."""
-    query = db.query(Article)
+    """List articles with pagination, scoped to current tenant."""
+    query = db.query(Article).filter(Article.tenant_id == principal.tenant_id)
     if status:
         query = query.filter(Article.status == status)
     total = query.count()
@@ -889,8 +1252,8 @@ def delete_article(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Delete an article by id."""
-    article = db.query(Article).filter(Article.id == article_id).first()
+    """Delete an article by id, scoped to current tenant."""
+    article = db.query(Article).filter(Article.id == article_id, Article.tenant_id == principal.tenant_id).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
     # Nullify foreign keys before deleting
@@ -908,7 +1271,10 @@ async def article_progress_stream(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """SSE progress stream for article generation."""
-    article = db.query(Article).filter(Article.task_id == task_id).first()
+    article = db.query(Article).filter(
+        Article.task_id == task_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
     if not article:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
 
@@ -969,5 +1335,244 @@ def get_article_logs(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Get execution logs for an article generation task."""
+    # 验证文章属于当前租户
+    article = db.query(Article).filter(
+        Article.task_id == task_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
+
     logs = db.query(AgentLog).filter(AgentLog.task_id == task_id).order_by(AgentLog.id.asc()).all()
     return logs
+
+
+# =====================================================================
+# 阅读指标与质量评分
+# =====================================================================
+
+
+@router.get("/articles/{article_id}/metrics/latest")
+def get_article_metrics_latest(
+    article_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取文章最新阅读指标"""
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    return {
+        "article_id": article.id,
+        "task_id": article.task_id,
+        "read_count": article.latest_read_count or 0,
+        "like_count": article.latest_like_count or 0,
+        "share_count": article.latest_share_count or 0,
+        "comment_count": article.latest_comment_count or 0,
+        "fav_count": article.latest_fav_count or 0,
+        "updated_at": article.metrics_updated_at,
+    }
+
+
+@router.get("/articles/{article_id}/metrics")
+def get_article_metrics_history(
+    article_id: int,
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取文章历史阅读指标趋势"""
+    from app.models.mysql_models import ArticleMetrics
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    query = db.query(ArticleMetrics).filter(
+        ArticleMetrics.article_id == article_id,
+    )
+    if start_date:
+        query = query.filter(ArticleMetrics.metric_date >= start_date)
+    if end_date:
+        query = query.filter(ArticleMetrics.metric_date <= end_date)
+
+    items = query.order_by(ArticleMetrics.metric_date.asc()).all()
+    return [
+        {
+            "date": m.metric_date.isoformat() if hasattr(m.metric_date, 'isoformat') else str(m.metric_date),
+            "read_count": m.read_count,
+            "like_count": m.like_count,
+            "share_count": m.share_count,
+            "comment_count": m.comment_count,
+        }
+        for m in items
+    ]
+
+
+@router.post("/articles/{article_id}/metrics/sync")
+def sync_article_metrics(
+    article_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """手动触发文章指标同步"""
+    from app.tasks.metrics_tasks import sync_single_article_metrics
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    sync_single_article_metrics.delay(article_id)
+    return {"message": "Metrics sync triggered", "article_id": article_id}
+
+
+@router.get("/articles/{article_id}/quality/latest")
+def get_article_quality_latest(
+    article_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取文章最新 AI 质量评分"""
+    from app.models.mysql_models import ArticleQualityEvaluation
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    evaluation = (
+        db.query(ArticleQualityEvaluation)
+        .filter(
+            ArticleQualityEvaluation.article_id == article_id,
+            ArticleQualityEvaluation.status == "success",
+        )
+        .order_by(ArticleQualityEvaluation.id.desc())
+        .first()
+    )
+    if not evaluation:
+        return {"article_id": article_id, "status": "not_evaluated"}
+
+    return {
+        "article_id": article_id,
+        "overall_score": evaluation.overall_score,
+        "dimensions": {
+            "content_score": evaluation.content_score,
+            "readability_score": evaluation.readability_score,
+            "structure_score": evaluation.structure_score,
+            "value_score": evaluation.value_score,
+            "title_score": evaluation.title_score,
+            "title_consistency_score": evaluation.title_consistency_score,
+            "credibility_score": evaluation.credibility_score,
+        },
+        "issues": evaluation.issues,
+        "suggestions": evaluation.suggestions,
+        "confidence": evaluation.confidence,
+        "evaluated_at": evaluation.evaluated_at,
+    }
+
+
+@router.get("/articles/{article_id}/quality-evaluations")
+def get_article_quality_history(
+    article_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取文章历史评分记录"""
+    from app.models.mysql_models import ArticleQualityEvaluation
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    evals = (
+        db.query(ArticleQualityEvaluation)
+        .filter(
+            ArticleQualityEvaluation.article_id == article_id,
+        )
+        .order_by(ArticleQualityEvaluation.id.desc())
+        .limit(20)
+        .all()
+    )
+    return [
+        {
+            "id": e.id,
+            "overall_score": e.overall_score,
+            "model_name": e.model_name,
+            "prompt_version": e.prompt_version,
+            "status": e.status,
+            "evaluated_at": e.evaluated_at,
+        }
+        for e in evals
+    ]
+
+
+@router.post("/articles/{article_id}/quality-evaluations")
+def trigger_quality_evaluation(
+    article_id: int,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """手动触发文章质量评分"""
+    from app.tasks.quality_tasks import evaluate_article_quality
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    evaluate_article_quality.delay(article_id)
+    return {"message": "Quality evaluation triggered", "article_id": article_id}
+
+
+# =====================================================================
+# 优化稿
+# =====================================================================
+
+
+@router.post("/articles/{article_id}/optimization-drafts")
+async def create_optimization_draft(
+    article_id: int,
+    req: dict,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """为文章创建优化草稿"""
+    from app.services.article_optimization_service import optimization_service
+
+    article = db.query(Article).filter(
+        Article.id == article_id,
+        Article.tenant_id == principal.tenant_id,
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    opt_type = req.get("optimization_type", "structure_optimize")
+    instruction = req.get("instruction", "")
+    evaluation_id = req.get("evaluation_id", 0)
+
+    try:
+        result = await optimization_service.generate(
+            db, article, opt_type,
+            instruction=instruction,
+            evaluation_id=evaluation_id or None,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

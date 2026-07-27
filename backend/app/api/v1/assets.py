@@ -74,8 +74,8 @@ def list_assets(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List assets with pagination, filterable by type and tags."""
-    query = db.query(Asset)
+    """List assets with pagination, filterable by type and tags, scoped to current tenant."""
+    query = db.query(Asset).filter(Asset.tenant_id == principal.tenant_id)
 
     if asset_type:
         query = query.filter(Asset.asset_type == asset_type)
@@ -233,7 +233,7 @@ def get_asset(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Get asset detail."""
-    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.tenant_id == principal.tenant_id).first()
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
@@ -249,7 +249,7 @@ def get_asset_file(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Redirect to the actual file URL (MinIO presigned URL or public URL)."""
-    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.tenant_id == principal.tenant_id).first()
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
@@ -264,7 +264,7 @@ def delete_asset(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Delete an asset (from database and MinIO storage)."""
-    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.tenant_id == principal.tenant_id).first()
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
@@ -295,7 +295,7 @@ async def apply_watermark(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """对素材图片叠加水印，生成新的水印版本"""
-    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.tenant_id == principal.tenant_id).first()
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
@@ -351,7 +351,7 @@ def remove_watermark(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """去除水印，恢复到原始版本"""
-    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.tenant_id == principal.tenant_id).first()
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     if not asset.is_watermarked:

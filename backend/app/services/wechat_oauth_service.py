@@ -14,8 +14,16 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.models.mysql_models import AccountCredential, WeChatAccount
+from app.services.encryption_service import derive_key, decrypt_secret
+from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _get_decrypted_secret(cred: AccountCredential) -> str:
+    """解密凭证中的 app_secret"""
+    key = derive_key(settings.credential_key)
+    return decrypt_secret(cred.encrypted_secret, key)
 
 
 async def get_valid_token(db: Session, account_id: int) -> str:
@@ -39,7 +47,7 @@ async def get_valid_token(db: Session, account_id: int) -> str:
             params={
                 "grant_type": "client_credential",
                 "appid": account.app_id,
-                "secret": cred.encrypted_secret,
+                "secret": _get_decrypted_secret(cred),
             },
         )
         resp.raise_for_status()

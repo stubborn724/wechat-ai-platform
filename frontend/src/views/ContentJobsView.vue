@@ -23,11 +23,19 @@ const canCreate = computed(() =>
 const form = reactive({
   topic: '',
   account_id: '',
+  content_type: 'image',
   approval_mode: 'manual',
   use_multi_article: false,
   articles: [] as any[],
   footer_template: '',
   feed_source_ids: [] as string[],
+  // 纯图片配置
+  aspect_ratio: '3:4',
+  brand_style: '简约现代',
+  // 视频配置
+  voice: 'zh-CN-XiaoxiaoNeural',
+  target_audience: '',
+  extra_notes: '',
 })
 
 const labels: Record<string, string> = {
@@ -38,9 +46,9 @@ const labels: Record<string, string> = {
 }
 
 const contentTypeOptions = [
-  { value: 'image_text', label: '图文' },
+  { value: 'article', label: '图文' },
+  { value: 'image', label: '纯图片' },
   { value: 'video', label: '视频' },
-  { value: 'pure_image', label: '纯图片' },
 ]
 
 async function load() {
@@ -64,6 +72,7 @@ async function load() {
 function openForm() {
   form.topic = ''
   form.account_id = accounts.value[0]?.id.toString() || ''
+  form.content_type = 'article'
   form.approval_mode = 'manual'
   form.use_multi_article = false
   form.articles = []
@@ -89,14 +98,48 @@ function removeArticleSlot(index: number) {
 async function create() {
   saving.value = true
   try {
-    await client.post('/content-jobs', {
+    const articleSlots = form.use_multi_article
+      ? form.articles.map((a: any) => ({
+          content_type: a.content_type,
+          publish_domain: a.publish_domain,
+        }))
+      : [{ content_type: form.content_type, publish_domain: 'public' }]
+
+    const payload: Record<string, any> = {
       topic: form.topic,
       account_id: form.account_id || null,
-      content_type: 'article',
+      content_type: form.content_type,
+      article_count: articleSlots.length,
       approval_mode: form.approval_mode,
       idempotency_key: crypto.randomUUID(),
       footer_template: form.footer_template || undefined,
-    })
+    }
+
+    // 纯图片/视频特有参数
+    if (form.content_type === 'image') {
+      payload.generation_config = {
+        article_slots: articleSlots,
+        aspect_ratio: form.aspect_ratio,
+        brand_style: form.brand_style,
+      }
+      payload.aspect_ratio = form.aspect_ratio
+      payload.brand_style = form.brand_style
+      payload.target_audience = form.target_audience || undefined
+      payload.extra_notes = form.extra_notes || undefined
+    } else if (form.content_type === 'video') {
+      payload.generation_config = {
+        article_slots: articleSlots,
+        voice: form.voice,
+        aspect_ratio: '9:16',
+      }
+      payload.voice = form.voice
+      payload.target_audience = form.target_audience || undefined
+      payload.extra_notes = form.extra_notes || undefined
+    } else {
+      payload.generation_config = { article_slots: articleSlots }
+    }
+
+    await client.post('/content-jobs', payload)
     showForm.value = false
     ElMessage.success('内容任务已创建')
     await load()
@@ -156,7 +199,7 @@ function statusType(status: string): string {
 }
 
 const contentTypeLabels: Record<string, string> = {
-  image_text: '图文', video: '视频', pure_image: '纯图片',
+  article: '图文', image: '纯图片', video: '视频',
 }
 
 onMounted(load)
@@ -190,6 +233,13 @@ onMounted(load)
             <strong>{{ row.latest_version?.title || row.topic }}</strong>
             <span class="job-summary">{{ row.latest_version?.summary || row.topic }}</span>
           </div>
+        </template>
+      </el-table-column>
+      <el-table-column label="类型" width="80">
+        <template #default="{ row }">
+          <el-tag size="small" type="info" effect="plain">
+            {{ contentTypeLabels[row.content_type] || row.content_type }}
+          </el-tag>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="120">
@@ -259,6 +309,14 @@ onMounted(load)
         </el-form-item>
 
         <el-form-item>
+          <div v-if="!form.use_multi_article" style="margin-bottom:12px;">
+            <span style="font-size:13px;font-weight:500;margin-right:8px;">内容类型：</span>
+            <el-radio-group v-model="form.content_type">
+              <el-radio value="article">图文</el-radio>
+              <el-radio value="image">纯图片</el-radio>
+              <el-radio value="video">视频</el-radio>
+            </el-radio-group>
+          </div>
           <el-checkbox v-model="form.use_multi_article">
             多文章模式（一次生成多篇不同风格的文章）
           </el-checkbox>
@@ -279,6 +337,54 @@ onMounted(load)
           </div>
           <el-button size="small" @click="addArticleSlot">+ 添加文章槽</el-button>
         </div>
+
+        <!-- 纯图片配置 -->
+        <el-form-item v-if="form.content_type === 'image'" label="图片比例">
+          <el-radio-group v-model="form.aspect_ratio">
+            <el-radio value="1:1">1:1 方形</el-radio>
+            <el-radio value="3:4">3:4 竖版</el-radio>
+            <el-radio value="9:16">9:16 手机海报</el-radio>
+          </el-radio-group>
+        </el-form-item>
+
+        <el-form-item v-if="form.content_type === 'image'" label="品牌风格">
+          <el-select v-model="form.brand_style" style="width: 100%">
+            <el-option value="简约现代" label="简约现代" />
+            <el-option value="科技感" label="科技感" />
+            <el-option value="温暖生活" label="温暖生活" />
+            <el-option value="高端奢华" label="高端奢华" />
+            <el-option value="活泼年轻" label="活泼年轻" />
+          </el-select>
+        </el-form-item>
+
+
+        <el-form-item v-if="form.content_type === 'video'" label="画面比例">
+          <el-radio-group v-model="form.aspect_ratio">
+            <el-radio value="9:16">9:16 竖屏</el-radio>
+            <el-radio value="16:9">16:9 横屏</el-radio>
+          </el-radio-group>
+          <div style="font-size:12px;color:#999;margin-top:4px;">注意：视频暂设为 9:16 竖屏</div>
+        </el-form-item>
+
+
+        <el-form-item v-if="form.content_type === 'video'" label="配音角色">
+          <el-select v-model="form.voice" style="width: 100%">
+            <el-option value="zh-CN-XiaoxiaoNeural" label="女声 温柔（推荐）" />
+            <el-option value="zh-CN-XiaoyiNeural" label="女声 活泼" />
+            <el-option value="zh-CN-YunjianNeural" label="男声 成熟" />
+            <el-option value="zh-CN-YunxiNeural" label="男声 阳光" />
+            <el-option value="zh-CN-YunyangNeural" label="男声 新闻" />
+            <el-option value="zh-CN-XiaochenNeural" label="女声 知性" />
+          </el-select>
+        </el-form-item>
+
+        <el-form-item v-if="form.content_type === 'video' || form.content_type === 'image'" label="目标用户（可选）">
+          <el-input v-model="form.target_audience" placeholder="例如：25-35 岁职场白领" />
+        </el-form-item>
+
+        <el-form-item v-if="form.content_type === 'video' || form.content_type === 'image'" label="补充说明（可选）">
+          <el-input v-model="form.extra_notes" type="textarea" :rows="2" placeholder="额外要求或注意事项" />
+        </el-form-item>
 
         <el-form-item label="文章底部固定内容（可选）">
           <el-input

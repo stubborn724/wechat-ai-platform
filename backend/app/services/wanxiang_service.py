@@ -3,8 +3,8 @@
 Uses the async task API: submit -> poll -> return image URL.
 """
 
+import asyncio
 import logging
-import time
 from typing import Optional
 
 import httpx
@@ -83,19 +83,25 @@ class WanxiangImageService:
                 resp.raise_for_status()
                 data = resp.json()
             except httpx.HTTPError as e:
-                logger.warning("通义万相图片生成请求异常: %s", e)
+                err_text = repr(e) if not str(e) else str(e)
+                logger.warning("通义万相图片生成请求异常: %s", err_text)
+                print(f"  ⚠️ 通义万相请求失败: {err_text}")
+                return None
+            except Exception as e:
+                logger.warning("通义万相请求未知异常: %s", repr(e))
+                print(f"  ⚠️ 通义万相请求未知异常: {repr(e)}")
                 return None
 
             task_id = data.get("output", {}).get("task_id")
             if not task_id:
-                logger.debug("No task_id in Wanxiang response: %s", data)
+                logger.warning("No task_id in Wanxiang response: %s", data)
                 return None
 
             logger.info("Wanxiang task submitted: task_id=%s, prompt='%s'", task_id, prompt[:80])
 
             # Step 2: Poll for completion
             for attempt in range(MAX_POLL_ATTEMPTS):
-                time.sleep(POLL_INTERVAL)
+                await asyncio.sleep(POLL_INTERVAL)
                 try:
                     poll_resp = await client.get(
                         WANXIANG_TASK_URL.format(task_id=task_id),
@@ -104,8 +110,9 @@ class WanxiangImageService:
                     poll_resp.raise_for_status()
                     poll_data = poll_resp.json()
                 except httpx.HTTPError as e:
-                    logger.debug("Wanxiang poll attempt %d/%d failed: %s",
-                                   attempt + 1, MAX_POLL_ATTEMPTS, e)
+                    err_text = repr(e) if not str(e) else str(e)
+                    logger.warning("Wanxiang poll attempt %d/%d failed: %s",
+                                   attempt + 1, MAX_POLL_ATTEMPTS, err_text)
                     continue
 
                 task_status = poll_data.get("output", {}).get("task_status")
@@ -117,11 +124,11 @@ class WanxiangImageService:
                         url = results[0].get("url", "")
                         logger.info("Wanxiang image generated: %s", url[:80])
                         return url
-                    logger.debug("Wanxiang succeeded but no results returned")
+                    logger.warning("Wanxiang succeeded but no results returned")
                     return None
                 elif task_status in ("FAILED", "CANCELED"):
                     err_msg = poll_data.get("output", {}).get("message", "unknown error")
-                    logger.debug("Wanxiang task %s: %s", task_status, err_msg)
+                    logger.warning("Wanxiang task %s: %s", task_status, err_msg)
                     return None
 
             logger.debug("Wanxiang task timed out after %d attempts", MAX_POLL_ATTEMPTS)

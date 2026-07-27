@@ -15,12 +15,14 @@ import client from '@/api/client'
 import type { TitleOption, Article, Account, KnowledgeBase, FeedSource } from '@/api/types'
 import { SseConnection } from '@/utils/sse'
 import { marked } from 'marked'
+import { sanitizeHtml } from '@/utils/sanitizer'
 
 const router = useRouter()
 
 // ==================== State ====================
 const topic = ref('')
 const style = ref('')
+const contentType = ref('article')
 const imageSource = ref<'local' | 'pexels'>('pexels')
 const enabledImageMethods = ref<string[]>(['PEXELS', 'DASHSCOPE'])
 const userDescription = ref('')
@@ -58,6 +60,9 @@ const aiModifyingOutline = ref(false)
 // Content streaming
 const streamedContent = ref('')
 const isStreaming = ref(false)
+
+// 视频配置
+const videoAspectRatio = ref('9:16')
 
 // Image progress
 const imageProgress = ref<{ total: number; completed: number; items: any[] }>({
@@ -111,7 +116,7 @@ const scheduleForm = reactive({
   day_of_week: -1,
   publish_times: ['08:00'] as string[],
   articles_per_day: 1,
-  approval_mode: 'auto',
+  publish_mode: 'draft',
 })
 
 const dayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
@@ -280,7 +285,11 @@ const sseConnected = ref(false)
 const sseCompleted = ref(false)
 
 // ==================== Computed ====================
-const canCreate = computed(() => topic.value.trim().length >= 5)
+const canCreate = computed(() => {
+  // 有投喂源参考时，主题可以简短（标题由仿写生成）
+  if (selectedFeedArticleIds.value.length > 0) return true
+  return topic.value.trim().length >= 5
+})
 
 const styleOptions = [
   { value: '', label: '默认风格' },
@@ -293,34 +302,157 @@ const styleOptions = [
 const imageMethodOptions = [
   { value: 'PEXELS', label: 'Pexels 图库' },
   { value: 'DASHSCOPE', label: 'AI 生图（通义万相）' },
+  { value: 'LOCAL', label: '素材库' },
 ]
 
 // ==================== Methods ====================
+// 纯图片/视频任务轮询
+const contentJobId = ref<number | null>(null)
+const contentJobType = ref<string>('')
+const contentAssets = ref<any[]>([])
+const contentVersion = ref<any>(null)  // gallery HTML from ContentVersion
+const pollingTimer = ref<number | null>(null)
+const jobError = ref('')
+const galleryIndex = ref(0)
+const galleryThumbsRef = ref<HTMLElement | null>(null)
+const galleryUrls = computed(() => {
+  const html = contentVersion.value?.body_html || ''
+  const urls: string[] = []
+  const re = /src="([^"]+)"/g
+  let m
+  while ((m = re.exec(html)) !== null) {
+    if (!urls.includes(m[1])) urls.push(m[1])
+  }
+  return urls
+})
+
+function downloadFile(url: string, filename: string) {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.target = '_blank'
+  a.click()
+}
+
+function pollContentAssets(jobId: number) {
+  pollingTimer.value = window.setInterval(async () => {
+    try {
+      const [res, jobRes] = await Promise.all([
+        client.get(`/content-assets?job_id=${jobId}`),
+        client.get(`/content-jobs/${jobId}`),
+      ])
+      const items = res.data?.items || []
+      const jobStatus = jobRes.data?.status
+
+      // 任务失败
+      if (jobStatus === 'failed') {
+        jobError.value = jobRes.data?.error_message || '生成失败'
+        loading.value = false
+        contentAssets.value = items
+        currentPhase.value = 'COMPLETED'
+        if (pollingTimer.value) clearInterval(pollingTimer.value)
+        pollingTimer.value = null
+        ElMessage.error(jobError.value)
+        return
+      }
+
+      // 任务完成（published）才显示结果
+      if (jobStatus === 'published') {
+        contentAssets.value = items
+        try {
+          const verRes = await client.get(`/content-jobs/${jobId}/versions`)
+          const versions = verRes.data || []
+          contentVersion.value = versions.find((v: any) => v.body_html) || versions[0] || null
+        } catch { contentVersion.value = null }
+        loading.value = false
+        currentPhase.value = 'COMPLETED'
+        if (pollingTimer.value) clearInterval(pollingTimer.value)
+        pollingTimer.value = null
+        ElMessage.success('内容生成完成')
+        return
+      }
+    } catch {
+      // ignore polling errors
+    }
+  }, 3000)
+}
+
 async function handleCreate() {
   if (!canCreate.value) return
   loading.value = true
+  jobError.value = ''
+  contentAssets.value = []
+  contentJobId.value = null
 
   try {
-    const article = await createArticle({
+    // 构建请求参数
+    const payload: Record<string, any> = {
       topic: topic.value,
+      content_type: contentType.value,
       style: style.value,
-      image_source: imageSource.value === 'ai' ? 'DASHSCOPE' : imageSource.value,
-      enabled_image_methods: enabledImageMethods.value,
-      user_description: userDescription.value || undefined,
-      mode: mode.value,
-      article_count: articleCount.value,
       account_ids: selectedAccountIds.value.length > 0 ? selectedAccountIds.value : undefined,
       publish_mode: publishMode.value,
-      knowledge_base_ids: selectedKbIds.value.length > 0 ? selectedKbIds.value : undefined,
-      source_feed_id: selectedFeedSourceId.value ?? undefined,
-      feed_article_ids: selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined,
-      selected_image_urls: imageSelectionMode.value === 'manual' && selectedImageUrls.value.length > 0
-        ? selectedImageUrls.value : undefined,
       footer_template: footerTemplate.value || undefined,
       watermark_enabled: enableWatermark.value || undefined,
-    })
+    }
 
+    // 图文专属参数
+    if (contentType.value === 'article') {
+      payload.image_source = imageSource.value === 'ai' ? 'DASHSCOPE' : imageSource.value
+      payload.enabled_image_methods = enabledImageMethods.value
+      payload.mode = mode.value
+      payload.article_count = articleCount.value
+      payload.knowledge_base_ids = selectedKbIds.value.length > 0 ? selectedKbIds.value : undefined
+      payload.source_feed_id = selectedFeedSourceId.value ?? undefined
+      payload.feed_article_ids = selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined
+      payload.selected_image_urls = imageSelectionMode.value === 'manual' && selectedImageUrls.value.length > 0
+        ? selectedImageUrls.value : undefined
+    }
+
+    // 纯图片 & 视频共享参数（投喂源参考）
+    if (contentType.value === 'image' || contentType.value === 'video') {
+      payload.source_feed_id = selectedFeedSourceId.value ?? undefined
+      payload.feed_article_ids = selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined
+    }
+
+    // 视频专属参数
+    if (contentType.value === 'video') {
+      payload.aspect_ratio = videoAspectRatio.value
+      payload.knowledge_base_ids = selectedKbIds.value.length > 0 ? selectedKbIds.value : undefined
+      payload.source_feed_id = selectedFeedSourceId.value ?? undefined
+      payload.feed_article_ids = selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined
+    }
+
+    const resp = await client.post('/articles/create', payload)
+
+    const data = resp.data
+
+    // 纯图片/视频：检查是否已完成（同步处理）或需要轮询
+    if (data.type === 'content_job') {
+      contentJobId.value = data.job_id
+      contentJobType.value = data.content_type
+
+      if (data.status === 'published' && data.result?.image_urls?.length) {
+        const urls: string[] = data.result.image_urls
+        contentAssets.value = urls.map((url, i) => ({
+          id: i, asset_type: 'final_image', file_url: url,
+        }))
+        contentVersion.value = { body_html: urls.map(u => `<img src="${u}" />`).join('\n') }
+        currentPhase.value = 'COMPLETED'
+        loading.value = false
+        ElMessage.success('内容生成完成')
+      } else {
+        currentPhase.value = 'CONTENT_GENERATING'
+        ElMessage.info('内容正在生成，请稍候...')
+        pollContentAssets(data.job_id)
+      }
+      return
+    }
+
+    // 图文：原有逻辑
+    const article = data
     currentTaskId.value = article.task_id
+    currentArticle.value = article
     currentArticle.value = article
     console.log('[DEBUG] createArticle response:', JSON.stringify(article).slice(0, 500))
 
@@ -337,9 +469,8 @@ async function handleCreate() {
           day_of_week: scheduleForm.day_of_week,
           publish_times: scheduleForm.publish_times,
           articles_per_day: scheduleForm.articles_per_day,
-          approval_mode: scheduleForm.approval_mode,
           account_ids: selectedAccountIds.value.length > 0 ? selectedAccountIds.value : null,
-          publish_mode: publishMode.value,
+          publish_mode: scheduleForm.publish_mode,
           footer_template: footerTemplate.value || null,
         }
         await client.post('/scheduled-tasks', schedulePayload)
@@ -608,7 +739,8 @@ function handleReset() {
 
 function renderMarkdown(text: string): string {
   if (!text) return ''
-  return marked.parse(text, { async: false }) as string
+  const html = marked.parse(text, { async: false }) as string
+  return sanitizeHtml(html)
 }
 
 onMounted(() => {
@@ -643,7 +775,16 @@ onUnmounted(() => {
           </el-form-item>
 
           <el-row :gutter="20">
-            <el-col :span="8">
+            <el-col :span="6">
+              <el-form-item label="内容类型">
+                <el-radio-group v-model="contentType">
+                  <el-radio value="article">图文</el-radio>
+                  <el-radio value="image">纯图片</el-radio>
+                  <el-radio value="video">视频</el-radio>
+                </el-radio-group>
+              </el-form-item>
+            </el-col>
+            <el-col :span="6">
               <el-form-item label="写作风格">
                 <el-select v-model="style" placeholder="选择风格" clearable class="full-width">
                   <el-option
@@ -655,21 +796,21 @@ onUnmounted(() => {
                 </el-select>
               </el-form-item>
             </el-col>
-            <el-col :span="8">
+            <el-col v-if="contentType === 'article'" :span="6">
               <el-form-item label="生成模式">
                 <el-radio-group v-model="mode">
                   <el-radio value="manual">手动配合</el-radio>
                   <el-radio value="auto">全自动</el-radio>
                 </el-radio-group>
-                <span class="form-hint">{{ mode === 'auto' ? '自动选标题→生成大纲→写正文，无需人工干预' : 'AI生成标题→您选择→AI生成大纲→您确认→AI写正文' }}</span>
+                <span class="form-hint">{{ mode === 'auto' ? '自动选标题→生成大纲→写正文' : 'AI生成→您选择→AI确认→AI写正文' }}</span>
               </el-form-item>
             </el-col>
-            <el-col :span="8">
-              <el-form-item label="图片来源">
+            <el-col v-if="contentType === 'article' || contentType === 'image'" :span="6">
+              <el-form-item label="封面图片来源">
                 <el-radio-group v-model="imageSource" @change="handleImageSourceChange">
                   <el-radio value="pexels">Pexels 图库</el-radio>
-                  <el-radio value="local">本地素材</el-radio>
-                  <el-radio value="ai">AI 生图（通义万相）</el-radio>
+                  <el-radio value="local">素材库</el-radio>
+                  <el-radio value="ai">AI 生图</el-radio>
                 </el-radio-group>
               </el-form-item>
               <!-- Local asset selection mode -->
@@ -693,16 +834,14 @@ onUnmounted(() => {
             </el-col>
           </el-row>
 
-          <el-form-item label="配图方式（可多选）">
+          <!-- 正文配图方式 -->
+          <el-form-item v-if="contentType === 'article' || contentType === 'image'" label="正文配图方式（可多选）">
             <el-checkbox-group v-model="enabledImageMethods">
-              <el-checkbox
-                v-for="opt in imageMethodOptions"
-                :key="opt.value"
-                :value="opt.value"
-              >
+              <el-checkbox v-for="opt in imageMethodOptions" :key="opt.value" :value="opt.value">
                 {{ opt.label }}
               </el-checkbox>
             </el-checkbox-group>
+            <span class="form-hint">正文中插入的图片来源。封面已单独设置，不受此项影响</span>
           </el-form-item>
 
           <!-- Knowledge Base Selector -->
@@ -763,6 +902,23 @@ onUnmounted(() => {
               <span class="form-hint">需要先在「投喂源」中添加来源并执行「分析」才能获取风格特征；选择具体文章可让 AI 直接仿写原文风格</span>
             </div>
           </el-form-item>
+
+          <!-- ===================== 视频专属配置 ===================== -->
+          <template v-if="contentType === 'video'">
+            <el-divider />
+            <p class="section-subtitle">视频设置</p>
+            <el-row :gutter="16">
+              <el-col :span="8">
+                <el-form-item label="画面比例">
+                  <el-radio-group v-model="videoAspectRatio">
+                    <el-radio value="9:16">9:16 竖屏</el-radio>
+                    <el-radio value="16:9">16:9 横屏</el-radio>
+                  </el-radio-group>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-divider />
+          </template>
 
           <!-- Footer Template + QR Code -->
           <el-form-item label="文章底部固定内容（可选）">
@@ -860,11 +1016,14 @@ onUnmounted(() => {
                   <el-input-number v-model="scheduleForm.articles_per_day" :min="1" :max="10" style="width:100%" />
                 </el-form-item>
               </el-col>
+            </el-row>
+
+            <el-row :gutter="16">
               <el-col :span="8">
                 <el-form-item label="发布方式">
-                  <el-radio-group v-model="scheduleForm.approval_mode" size="small">
-                    <el-radio value="auto" border>自动</el-radio>
-                    <el-radio value="manual" border>人工审核</el-radio>
+                  <el-radio-group v-model="scheduleForm.publish_mode">
+                    <el-radio value="draft">存草稿箱</el-radio>
+                    <el-radio value="direct">直接发布</el-radio>
                   </el-radio-group>
                 </el-form-item>
               </el-col>
@@ -1035,7 +1194,22 @@ onUnmounted(() => {
 
     <!-- ======== Phase: CONTENT_GENERATING ======== -->
     <div v-if="currentPhase === 'CONTENT_GENERATING'" class="phase-generating">
-      <el-card class="content-stream-card">
+      <!-- 图片/视频：轮询等待 -->
+      <el-card v-if="contentJobId">
+        <template #header>
+          <span class="card-title">{{ contentJobType === 'image' ? 'AI 正在生成图片...' : 'AI 正在生成视频...' }}</span>
+        </template>
+        <div style="padding:40px;text-align:center;">
+          <el-progress :percentage="50" :stroke-width="6" indeterminate />
+          <p style="margin-top:16px;color:#909399;" v-if="!jobError">
+            {{ contentJobType === 'image' ? '正在生成素材并保存...' : '正在生成视频...' }}
+          </p>
+          <p v-if="jobError" style="color:#f56c6c;">{{ jobError }}</p>
+        </div>
+      </el-card>
+
+      <!-- 图文：流式生成 -->
+      <el-card v-if="!contentJobId" class="content-stream-card">
         <template #header>
           <span class="card-title">AI 正在生成正文...</span>
         </template>
@@ -1061,9 +1235,60 @@ onUnmounted(() => {
 
     <!-- ======== Phase: COMPLETED ======== -->
     <div v-if="currentPhase === 'COMPLETED'" class="phase-completed">
-      <el-alert title="文章生成完成！" type="success" show-icon :closable="false" />
+      <!-- 纯图片结果 -->
+      <template v-if="contentJobType === 'image'">
+        <el-alert title="图片生成完成！" type="success" show-icon :closable="false" />
+        <el-card class="image-preview-card" v-if="galleryUrls.length">
+          <template #header><span>生成结果（画廊模式）</span></template>
+          <div class="gallery-widget">
+            <div class="gallery-main">
+              <img :src="galleryUrls[galleryIndex] || ''" referrerpolicy="no-referrer" />
+            </div>
+            <div class="gallery-thumbs" ref="galleryThumbsRef">
+              <div
+                v-for="(url, idx) in galleryUrls"
+                :key="idx"
+                class="thumb-item"
+                :class="{ active: idx === galleryIndex }"
+                @click="galleryIndex = idx"
+              >
+                <img :src="url" referrerpolicy="no-referrer" />
+              </div>
+            </div>
+          </div>
+        </el-card>
+        <el-card class="image-preview-card" v-else-if="contentAssets.length > 0">
+          <template #header><span>生成结果</span></template>
+          <div class="poster-gallery" style="display:flex;flex-wrap:wrap;gap:16px;">
+            <div v-for="(asset, idx) in contentAssets.filter(a => a.asset_type === 'final_image')" :key="asset.id" style="flex:0 0 auto;">
+              <el-image :src="asset.file_url" fit="contain" style="max-width:380px;max-height:500px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);display:block;" :preview-src-list="contentAssets.filter(a => a.asset_type === 'final_image').map(a => a.file_url)" :initial-index="idx" preview-teleported />
+              <div style="margin-top:8px;text-align:center;">
+                <el-button size="small" @click="downloadFile(asset.file_url, `image_${idx+1}.png`)">下载</el-button>
+                <span style="font-size:12px;color:#999;margin-left:8px;">图片 {{ idx + 1 }}</span>
+              </div>
+            </div>
+          </div>
+        </el-card>
+      </template>
 
-      <el-card class="article-preview" v-if="currentArticle || streamedContent">
+      <!-- 视频结果 -->
+      <template v-else-if="contentJobType === 'video'">
+        <el-alert title="视频生成完成！" type="success" show-icon :closable="false" />
+        <el-card class="video-preview-card" v-if="contentAssets.length > 0">
+          <template #header><span>生成结果</span></template>
+          <div v-for="asset in contentAssets.filter(a => a.asset_type === 'video')" :key="asset.id">
+            <video :src="asset.file_url" controls style="max-width:100%;max-height:500px;border-radius:8px;">您的浏览器不支持视频播放</video>
+            <div style="margin-top:12px;text-align:center;">
+              <el-button size="small" @click="downloadFile(asset.file_url, 'video.mp4')">下载视频</el-button>
+            </div>
+          </div>
+        </el-card>
+      </template>
+
+      <!-- 图文结果 -->
+      <el-alert v-if="contentJobType !== 'image' && contentJobType !== 'video'" title="文章生成完成！" type="success" show-icon :closable="false" />
+
+      <el-card class="article-preview" v-if="currentArticle || (streamedContent && !contentJobId)">
         <template #header>
           <span class="card-title">{{ currentArticle?.main_title || '文章完成' }}</span>
           <span class="card-subtitle">{{ currentArticle?.sub_title }}</span>
@@ -1675,5 +1900,47 @@ onUnmounted(() => {
   place-items: center;
   font-size: 12px;
   font-weight: 700;
+}
+
+/* Gallery card renders */
+.image-preview-card .gallery-main {
+  width: 100%;
+  background: #f0f0f0;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+.image-preview-card .gallery-main img {
+  max-width: 100%;
+  max-height: 65vh;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+/* Gallery widget */
+.gallery-widget { width: 100%; }
+.gallery-widget .gallery-main {
+  width: 100%; background: #f0f0f0; border-radius: 8px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; min-height: 300px;
+}
+.gallery-widget .gallery-main img {
+  max-width: 100%; max-height: 65vh; width: auto; height: auto; object-fit: contain;
+}
+.gallery-widget .gallery-thumbs {
+  display: flex; gap: 8px; margin-top: 12px; overflow-x: auto; padding: 4px 0;
+}
+.gallery-widget .thumb-item {
+  flex: 0 0 80px; height: 60px; border-radius: 6px; overflow: hidden;
+  cursor: pointer; border: 2px solid transparent; opacity: 0.6; transition: all .2s;
+}
+.gallery-widget .thumb-item.active {
+  border-color: #07c160; opacity: 1;
+}
+.gallery-widget .thumb-item img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
 }
 </style>

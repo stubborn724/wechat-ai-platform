@@ -6,6 +6,7 @@ import { ArrowLeft, ArrowUp, ArrowDown } from '@element-plus/icons-vue'
 import { getArticle, getExecutionLogs } from '@/api/article'
 import type { Article } from '@/api/types'
 import { marked } from 'marked'
+import { sanitizeHtml } from '@/utils/sanitizer'
 
 const router = useRouter()
 const route = useRoute()
@@ -21,7 +22,8 @@ const taskId = computed(() => route.params.taskId as string)
 
 function renderMarkdown(text: string | undefined | null): string {
   if (!text) return ''
-  return marked.parse(text, { async: false }) as string
+  const html = marked.parse(text, { async: false }) as string
+  return sanitizeHtml(html)
 }
 
 async function loadArticle() {
@@ -60,6 +62,21 @@ const images = computed(() => {
   return article.value?.images || []
 })
 
+const currentImageIndex = ref(0)
+const thumbTrackRef = ref<HTMLElement | null>(null)
+
+const galleryImages = computed(() => {
+  return images.value.map((img: any) => ({
+    url: img.url || img,
+    caption: img.section_title || img.alt || '',
+  }))
+})
+
+function scrollThumbs(dir: number) {
+  if (!thumbTrackRef.value) return
+  thumbTrackRef.value.scrollBy({ left: dir * 160, behavior: 'smooth' })
+}
+
 const outline = computed(() => {
   return article.value?.outline
 })
@@ -68,10 +85,91 @@ function goBack() {
   router.push('/articles/list')
 }
 
+// ── Metrics & Quality ──
+import client from '@/api/client'
+
+const metricsList = ref<any[]>([])
+const metricsUpdatedAt = ref('')
+const syncing = ref(false)
+const qualityScore = ref<number | null>(null)
+const evaluating = ref(false)
+const qualityIssues = ref<any[]>([])
+const qualitySuggestions = ref<string[]>([])
+const showOptDlg = ref(false)
+const optType = ref('structure_optimize')
+const optInstruction = ref('')
+const optimizing = ref(false)
+const scoreType = computed(() => {
+  if (qualityScore.value === null) return 'info'
+  if (qualityScore.value >= 70) return 'success'
+  if (qualityScore.value >= 50) return 'warning'
+  return 'danger'
+})
+
+async function loadMetrics() {
+  if (!article.value?.id) return
+  try {
+    const [metricsRes, qualityRes] = await Promise.all([
+      client.get(`/articles/${article.value.id}/metrics/latest`),
+      client.get(`/articles/${article.value.id}/quality/latest`),
+    ])
+    const m = metricsRes.data
+    metricsList.value = [
+      { label: '阅读', value: m.read_count ?? 0 },
+      { label: '点赞', value: m.like_count ?? 0 },
+      { label: '分享', value: m.share_count ?? 0 },
+      { label: '评论', value: m.comment_count ?? 0 },
+      { label: '收藏', value: m.fav_count ?? 0 },
+    ]
+    metricsUpdatedAt = m.updated_at || ''
+    const q = qualityRes.data
+    if (q.status !== 'not_evaluated') {
+      qualityScore.value = q.overall_score
+      qualityIssues.value = q.issues || []
+      qualitySuggestions.value = q.suggestions || []
+    }
+  } catch (_) { /* ignore */ }
+}
+
+async function syncMetrics() {
+  if (!article.value?.id) return
+  syncing.value = true
+  try {
+    await client.post(`/articles/${article.value.id}/metrics/sync`)
+    await loadMetrics()
+  } finally { syncing.value = false }
+}
+
+async function triggerEval() {
+  if (!article.value?.id) return
+  evaluating.value = true
+  try {
+    await client.post(`/articles/${article.value.id}/quality-evaluations`)
+    // Wait a few seconds for async task to complete
+    setTimeout(async () => { await loadMetrics() }, 3000)
+  } finally { evaluating.value = false }
+}
+
+async function createOptimization() {
+  if (!article.value?.id) return
+  optimizing.value = true
+  try {
+    await client.post(`/articles/${article.value.id}/optimization-drafts`, {
+      optimization_type: optType.value,
+      instruction: optInstruction.value,
+    })
+    showOptDlg.value = false
+    ElMessage.success('优化稿生成中，请稍后在审核页面查看')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '创建失败')
+  } finally { optimizing.value = false }
+}
+
 onMounted(async () => {
   await loadArticle()
   if (article.value) {
     await loadLogs()
+    await loadMetrics()
   }
 })
 </script>
@@ -154,18 +252,33 @@ onMounted(async () => {
         <template #header>
           <span class="section-title">配图列表 ({{ images.length }})</span>
         </template>
-        <div class="image-gallery">
-          <div v-for="(img, index) in images" :key="index" class="gallery-item">
+        <div class="image-gallery-wrapper">
+          <div class="gallery-main">
             <el-image
-              :src="img.url || img"
-              fit="cover"
-              :preview-src-list="[img.url || img]"
+              :src="galleryImages[currentImageIndex].url"
+              fit="contain"
+              :preview-src-list="galleryImages.map(i => i.url)"
               preview-teleported
-              class="gallery-image"
+              class="gallery-main-image"
             />
-            <p v-if="img.section_title || img.alt" class="gallery-caption">
-              {{ img.section_title || img.alt }}
+            <p v-if="galleryImages[currentImageIndex].caption" class="gallery-main-caption">
+              {{ galleryImages[currentImageIndex].caption }}
             </p>
+          </div>
+          <div class="gallery-thumbs">
+            <button class="thumb-scroll thumb-prev" @click="scrollThumbs(-1)">‹</button>
+            <div class="thumb-track" ref="thumbTrackRef">
+              <div
+                v-for="(img, idx) in galleryImages"
+                :key="idx"
+                class="thumb-item"
+                :class="{ active: idx === currentImageIndex }"
+                @click="currentImageIndex = idx"
+              >
+                <el-image :src="img.url" fit="cover" />
+              </div>
+            </div>
+            <button class="thumb-scroll thumb-next" @click="scrollThumbs(1)">›</button>
           </div>
         </div>
       </el-card>
@@ -230,6 +343,68 @@ onMounted(async () => {
           <el-table-column prop="error_message" label="错误信息" min-width="200" show-overflow-tooltip />
         </el-table>
       </el-card>
+
+      <!-- Data & Optimization -->
+      <el-card v-if="article?.status === 'published'" shadow="never" class="metrics-card" style="margin-top:16px;">
+        <template #header>
+          <span class="section-title">数据与优化</span>
+        </template>
+        <el-row :gutter="12" style="margin-bottom:12px;">
+          <el-col :span="4" v-for="m in metricsList" :key="m.label">
+            <el-statistic :value="m.value" :title="m.label" />
+          </el-col>
+        </el-row>
+        <div style="font-size:12px;color:#999;margin-bottom:12px;">
+          更新时间：{{ metricsUpdatedAt || '暂无数据' }}
+          <el-button size="small" text @click="syncMetrics" :loading="syncing">同步</el-button>
+        </div>
+        <el-divider />
+        <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
+          <span style="font-weight:600;">AI 质量评分：</span>
+          <el-tag v-if="qualityScore !== null" :type="scoreType" size="large">{{ qualityScore }}</el-tag>
+          <el-tag v-else type="info" size="large">未评估</el-tag>
+          <el-button size="small" text @click="triggerEval" :loading="evaluating">
+            {{ qualityScore !== null ? '重新评分' : '开始评分' }}
+          </el-button>
+        </div>
+        <div v-if="qualityIssues?.length" style="margin-bottom:12px;">
+          <div v-for="(issue, i) in qualityIssues" :key="i" style="font-size:13px;color:#666;margin-bottom:4px;">
+            • <el-tag :type="issue.severity==='high'?'danger':'warning'" size="small">{{ issue.type }}</el-tag>
+            {{ issue.description }}
+          </div>
+        </div>
+        <div v-if="qualitySuggestions?.length">
+          <p style="font-weight:600;font-size:13px;">优化建议：</p>
+          <div v-for="(s, i) in qualitySuggestions" :key="i" style="font-size:13px;color:#409eff;margin-bottom:4px;">• {{ s }}</div>
+        </div>
+        <el-button type="primary" size="small" style="margin-top:8px;" @click="showOptDlg=true">创建优化稿</el-button>
+      </el-card>
+
+      <el-dialog v-model="showOptDlg" title="创建优化稿" width="500px">
+        <el-form label-position="top">
+          <el-form-item label="优化类型">
+            <el-select v-model="optType" style="width:100%;">
+              <el-option label="标题优化" value="title_optimize" />
+              <el-option label="开头优化" value="opening_optimize" />
+              <el-option label="结构优化" value="structure_optimize" />
+              <el-option label="可读性优化" value="readability_optimize" />
+              <el-option label="内容扩充" value="content_expand" />
+              <el-option label="内容精简" value="content_condense" />
+              <el-option label="用户价值强化" value="value_enhance" />
+              <el-option label="事实修正" value="fact_correct" />
+              <el-option label="全文重写" value="full_rewrite" />
+              <el-option label="风格转换" value="style_transform" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="额外指令（可选）">
+            <el-input v-model="optInstruction" type="textarea" placeholder="保持专业风格/增加数据案例" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="showOptDlg=false">取消</el-button>
+          <el-button type="primary" @click="createOptimization" :loading="optimizing">生成</el-button>
+        </template>
+      </el-dialog>
     </template>
   </div>
 </template>
@@ -421,28 +596,105 @@ onMounted(async () => {
   border-radius: 8px;
 }
 
-.image-gallery {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 16px;
-}
-
-.gallery-item {
-  text-align: center;
-}
-
-.gallery-image {
+.image-gallery-wrapper {
   width: 100%;
-  height: 140px;
-  border-radius: 6px;
-  object-fit: cover;
 }
 
-.gallery-caption {
-  font-size: 12px;
-  color: #909399;
-  margin-top: 6px;
-  line-height: 1.4;
+.gallery-main {
+  width: 100%;
+  background: #f0f0f0;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
+.gallery-main-image {
+  max-width: 100%;
+  max-height: 65vh;
+  width: auto;
+  height: auto;
+  display: block;
+}
+
+.gallery-main-caption {
+  font-size: 13px;
+  color: #606266;
+  margin: 8px 0;
+  padding: 0 16px;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.gallery-thumbs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 0;
+}
+
+.thumb-track {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scroll-behavior: smooth;
+  flex: 1;
+  padding: 4px 0;
+}
+
+.thumb-track::-webkit-scrollbar {
+  height: 4px;
+}
+.thumb-track::-webkit-scrollbar-thumb {
+  background: #ccc;
+  border-radius: 2px;
+}
+
+.thumb-item {
+  flex: 0 0 80px;
+  height: 60px;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color 0.2s;
+  opacity: 0.6;
+}
+
+.thumb-item.active {
+  border-color: #07c160;
+  opacity: 1;
+}
+
+.thumb-item .el-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.thumb-scroll {
+  flex: 0 0 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid #ddd;
+  background: #fff;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  transition: all 0.2s;
+}
+
+.thumb-scroll:hover {
+  background: #f5f5f5;
+  border-color: #bbb;
 }
 
 /* Outline */

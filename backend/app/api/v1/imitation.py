@@ -57,6 +57,7 @@ class PoolSourceResponse(BaseModel):
 class TaskCreate(BaseModel):
     name: str
     pool_id: int
+    title: Optional[str] = None
     strategy: str = "random"
     articles_per_day: int = 1
     content_types: Optional[List[str]] = None
@@ -156,6 +157,12 @@ def list_pool_sources(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """列出仿写池中的来源"""
+    pool = db.query(ImitationPool).filter(
+        ImitationPool.id == pool_id,
+        ImitationPool.tenant_id == principal.tenant_id,
+    ).first()
+    if not pool:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pool not found")
     from app.services.imitation_service import list_pool_sources as svc_list
     sources = svc_list(db, pool_id)
     return [PoolSourceResponse(**s) for s in sources]
@@ -172,7 +179,10 @@ def add_pool_source(
     from app.services.imitation_service import add_source_to_pool
 
     # 验证仿写池存在
-    pool = db.query(ImitationPool).filter(ImitationPool.id == pool_id).first()
+    pool = db.query(ImitationPool).filter(
+        ImitationPool.id == pool_id,
+        ImitationPool.tenant_id == principal.tenant_id,
+    ).first()
     if not pool:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pool not found")
 
@@ -194,6 +204,12 @@ def remove_pool_source(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """从仿写池移除来源"""
+    pool = db.query(ImitationPool).filter(
+        ImitationPool.id == pool_id,
+        ImitationPool.tenant_id == principal.tenant_id,
+    ).first()
+    if not pool:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pool not found")
     from app.services.imitation_service import remove_source_from_pool
     if not remove_source_from_pool(db, source_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source not found")
@@ -209,6 +225,13 @@ def analyze_pool(
     import asyncio
     from app.services.imitation_service import analyze_pool_sources
 
+    # Verify pool ownership (the analyze function will check pool_id)
+    pool = db.query(ImitationPool).filter(
+        ImitationPool.id == pool_id,
+        ImitationPool.tenant_id == principal.tenant_id,
+    ).first()
+    if not pool:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pool not found")
     results = analyze_pool_sources(db, pool_id)
     return {"pool_id": pool_id, "results": results}
 
@@ -242,6 +265,7 @@ def create_task(
         db=db,
         tenant_id=principal.tenant_id,
         name=req.name,
+        title=req.title,
         pool_id=req.pool_id,
         strategy=req.strategy,
         articles_per_day=req.articles_per_day,
@@ -267,7 +291,10 @@ async def execute_task(
     """手动立即执行一次仿写任务"""
     from app.services.imitation_service import execute_imitation_task
 
-    task = db.query(ImitationTask).filter(ImitationTask.id == task_id).first()
+    task = db.query(ImitationTask).filter(
+        ImitationTask.id == task_id,
+        ImitationTask.tenant_id == principal.tenant_id,
+    ).first()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
@@ -283,7 +310,10 @@ def toggle_task(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """暂停/恢复仿写任务"""
-    task = db.query(ImitationTask).filter(ImitationTask.id == task_id).first()
+    task = db.query(ImitationTask).filter(
+        ImitationTask.id == task_id,
+        ImitationTask.tenant_id == principal.tenant_id,
+    ).first()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
@@ -302,7 +332,10 @@ def delete_task(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """删除仿写任务"""
-    task = db.query(ImitationTask).filter(ImitationTask.id == task_id).first()
+    task = db.query(ImitationTask).filter(
+        ImitationTask.id == task_id,
+        ImitationTask.tenant_id == principal.tenant_id,
+    ).first()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     task.status = "completed"

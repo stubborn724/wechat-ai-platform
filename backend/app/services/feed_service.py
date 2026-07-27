@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.mysql_models import FeedSource, FeedSourceArticle
+from app.services.url_safety import validate_url
 
 logger = logging.getLogger(__name__)
 
@@ -21,14 +22,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def fetch_source(db: Session, source_id: int) -> dict:
+async def fetch_source(db: Session, source_id: int, tenant_id: int = 0) -> dict:
     """Fetch articles from a feed source and store them.
 
     Supports RSS/Atom feeds (via feedparser) and single URLs (via readability).
     """
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    query = db.query(FeedSource).filter(FeedSource.id == source_id)
+    if tenant_id:
+        query = query.filter(FeedSource.tenant_id == tenant_id)
+    source = query.first()
     if not source:
-        raise ValueError(f"Feed source {source_id} not found")
+        raise ValueError(f"Feed source {source_id} not found (tenant={tenant_id})")
 
     articles = []
     errors = []
@@ -57,30 +61,44 @@ async def fetch_source(db: Session, source_id: int) -> dict:
             except Exception as exc:
                 errors.append(f"Official account fetch failed: {exc}")
 
-    # Save articles
+    # Save articles — update existing or insert new
     saved_count = 0
     for article_data in articles:
-        exists = db.query(FeedSourceArticle).filter(
-            FeedSourceArticle.feed_source_id == source_id,
-            FeedSourceArticle.title == article_data.get("title"),
-        ).first()
-        if exists:
-            continue
+        title = article_data.get("title", "")[:255]
+        article_url = article_data.get("link", "")[:512]
+        body_md = article_data.get("body_markdown", "")
+        body_html = article_data.get("body_html", "")
 
-        fa = FeedSourceArticle(
-            tenant_id=source.tenant_id,
-            feed_source_id=source_id,
-            title=article_data.get("title", "")[:255],
-            article_url=article_data.get("link", "")[:512],
-            body_markdown=article_data.get("body_markdown", ""),
-            body_html=article_data.get("body_html", ""),
-            summary=article_data.get("summary", "")[:500],
-            cover_image_url=article_data.get("cover_image_url", "")[:512],
-            published_at=article_data.get("published_at"),
-            word_count=article_data.get("word_count", 0),
-            is_analyzed=False,
-        )
-        db.add(fa)
+        existing = db.query(FeedSourceArticle).filter(
+            FeedSourceArticle.feed_source_id == source_id,
+            FeedSourceArticle.title == title,
+        ).first()
+
+        if existing:
+            # Update existing so re-fetch replaces stale content
+            existing.body_markdown = body_md
+            existing.body_html = body_html
+            existing.summary = article_data.get("summary", "")[:500]
+            existing.article_url = article_url or existing.article_url
+            existing.cover_image_url = article_data.get("cover_image_url", "")[:512] or existing.cover_image_url
+            existing.published_at = article_data.get("published_at") or existing.published_at
+            existing.word_count = len(body_md)
+            existing.is_analyzed = False
+        else:
+            fa = FeedSourceArticle(
+                tenant_id=source.tenant_id,
+                feed_source_id=source_id,
+                title=title,
+                article_url=article_url,
+                body_markdown=body_md,
+                body_html=body_html,
+                summary=article_data.get("summary", "")[:500],
+                cover_image_url=article_data.get("cover_image_url", "")[:512],
+                published_at=article_data.get("published_at"),
+                word_count=len(body_md),
+                is_analyzed=False,
+            )
+            db.add(fa)
         saved_count += 1
 
     # Update last_fetched_at
@@ -101,6 +119,7 @@ async def _fetch_rss(feed_url: str) -> List[dict]:
     import feedparser
 
     logger.info("Fetching RSS feed: %s", feed_url)
+    validate_url(feed_url)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(feed_url, headers=_headers())
@@ -182,7 +201,7 @@ def _html_to_markdown(html: str) -> str:
     converter.ignore_tables = False    # 保留表格
     converter.protect_links = True     # 链接不被截断
     converter.skip_internal_links = False
-    converter.single_line_break = True  # 精简换行
+    converter.single_line_break = False  # 段落间保留空行（否则图片挤在一起）
     converter.mark_code = True         # 标记代码块
     converter.decode_errors = "replace"
 
@@ -198,6 +217,8 @@ def _html_to_markdown(html: str) -> str:
     md = converter.handle(html)
     # 清理过多空行
     md = _re.sub(r'\n{4,}', '\n\n', md)
+    # 清理 [code] [/code] 等 artifact 标签
+    md = _re.sub(r'\[/?code\]', '', md)
     return md.strip()
 
 
@@ -215,6 +236,7 @@ async def _scrape_url(url: str) -> Optional[dict]:
 
     Falls back to readability for non-WeChat URLs.
     """
+    validate_url(url)
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
             resp = await client.get(url, headers=_headers())
@@ -232,12 +254,14 @@ async def _scrape_url(url: str) -> Optional[dict]:
         summary = ""
         title = ""
 
+        found_js_content = False
         if is_wechat:
-            summary, title = _extract_wechat_article(cleaned, html)
-            logger.info("WeChat article extraction: title='%s', content_len=%d",
-                        title[:50] if title else "", len(summary))
+            summary, title, found_js_content = _extract_wechat_article(cleaned, html)
+            logger.info("WeChat article extraction: title='%s', content_len=%d, found_js_content=%s",
+                        title[:50] if title else "", len(summary), found_js_content)
 
-        if not summary or len(summary.strip()) < 100:
+        # 纯图文章可能 HTML 内容短（全是 <img>），但只要找到了 js_content 就不回退到 readability
+        if (not summary or len(summary.strip()) < 100) and not found_js_content:
             # Fall back to readability
             from readability import Document as ReadabilityDoc
             doc = ReadabilityDoc(cleaned)
@@ -268,12 +292,15 @@ async def _scrape_url(url: str) -> Optional[dict]:
             if t:
                 title = t.group(1)
 
+        # Summary: skip entirely — preview shows full content
+        summary_text = ""
+
         return {
             "title": title.strip() if title else "",
             "link": url,
             "body_markdown": body_md.strip(),
             "body_html": summary,
-            "summary": body_md[:500] if body_md else "",
+            "summary": summary_text,
             "cover_image_url": _extract_cover_image(html),
             "published_at": None,
             "word_count": len(body_md.strip()),
@@ -295,6 +322,8 @@ def _preprocess_html(html: str) -> str:
 
 def _extract_wechat_article(cleaned: str, raw_html: str) -> tuple:
     """Extract content and title from a WeChat official account article."""
+    from bs4 import BeautifulSoup
+
     title = ""
 
     # Extract title from WeChat embedded data
@@ -311,26 +340,44 @@ def _extract_wechat_article(cleaned: str, raw_html: str) -> tuple:
         if t:
             title = t.group(1)
 
-    # Extract content from js_content div (WeChat's article container)
-    m = re.search(
-        r'<div\s+id=["\']js_content["\'][^>]*>(.*?)</div>\s*</div>\s*</div>',
-        cleaned, re.DOTALL
-    )
-    if not m:
-        m = re.search(r'<div\s+id=["\']js_content["\'][^>]*>(.*?)</div>',
-                      cleaned, re.DOTALL)
-    if not m:
-        # Try rich_media_content
-        m = re.search(r'<div\s+id=["\']rich_media_content["\'][^>]*>(.*?)</div>',
-                      cleaned, re.DOTALL)
+    content = ""
+    found_js_content = False
 
-    content = m.group(1) if m else ""
+    # Method 1: Try to find js_content / rich_media_content via BeautifulSoup
+    soup = BeautifulSoup(cleaned, 'html.parser')
+    js_content = soup.find(id='js_content')
+    if js_content:
+        content = str(js_content.decode_contents())
+        found_js_content = True
+    else:
+        rich_content = soup.find(id='rich_media_content')
+        if rich_content:
+            content = str(rich_content.decode_contents())
+            found_js_content = True
+
+    # Method 2: New-format pure-image article — images are in picture_page_info_list
+    if not content:
+        idx = raw_html.find('picture_page_info_list:')
+        if idx >= 0:
+            # Extract only the FIRST cdn_url of each entry (excludes watermark_info)
+            section = raw_html[idx:idx+35000]
+            urls = re.findall(
+                r"(?:\[|},)\s*\n\s*\{\s*\n\s+cdn_url:\s*'(https?://mmbiz\.qpic\.cn[^']+)'",
+                section
+            )
+            if urls:
+                content = "\n\n".join(
+                    f'<p><img src="{u.replace("http://", "https://")}" '
+                    f'referrerpolicy="no-referrer" style="width:100%"></p>'
+                    for u in urls
+                )
+                found_js_content = True
 
     # Fix remaining data-src in WeChat images
     if content:
         content = re.sub(r'data-src\s*=\s*"([^"]+)"', r'src="\1"', content)
 
-    return content, title
+    return content, title, found_js_content
 
 
 def _headers() -> dict:
@@ -390,15 +437,18 @@ Return a JSON object with these fields:
 Output ONLY valid JSON:"""
 
 
-async def analyze_source_style(db: Session, source_id: int) -> dict:
+async def analyze_source_style(db: Session, source_id: int, tenant_id: int = 0) -> dict:
     """Analyze the writing style of articles from a feed source.
 
     Uses the LLM to extract a structured style profile from the top 3-5
     unanalyzed articles and updates ``FeedSource.style_profile``.
     """
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    query = db.query(FeedSource).filter(FeedSource.id == source_id)
+    if tenant_id:
+        query = query.filter(FeedSource.tenant_id == tenant_id)
+    source = query.first()
     if not source:
-        raise ValueError(f"Feed source {source_id} not found")
+        raise ValueError(f"Feed source {source_id} not found (tenant={tenant_id})")
 
     # Get unanalyzed articles, or fall back to any articles
     articles = (

@@ -1,13 +1,24 @@
 """插入初始数据：租户 + 管理员用户"""
+import os
+import warnings
 from app.database import MysqlSessionLocal
 from app.models.mysql_models import Tenant, User, Membership
 from app.services.auth_service import hash_password
+from app.config import settings
 
-EMAIL = "admin@wechat.ai"
-PASSWORD = "admin123"
+EMAIL = os.getenv("SEED_EMAIL", "admin@wechat.ai")
+PASSWORD = os.getenv("SEED_PASSWORD", "admin123")
 DISPLAY_NAME = "管理员"
 
 def seed():
+    # 检查默认密码（所有环境）
+    if PASSWORD in ("admin123", "123456", "password"):
+        msg = "SEED_PASSWORD 使用了弱密码 '{}'，请通过环境变量 SEED_PASSWORD 设置强密码".format(PASSWORD)
+        if settings.environment == "production":
+            print("ERROR: 生产环境禁止使用默认密码，请设置 SEED_PASSWORD 环境变量")
+            return
+        else:
+            warnings.warn(msg)
     db = MysqlSessionLocal()
     try:
         # 检查是否已有数据

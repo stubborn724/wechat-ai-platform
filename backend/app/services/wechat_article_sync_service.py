@@ -8,7 +8,9 @@ from typing import List, Optional, Tuple
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models.mysql_models import WeChatAccount, AccountCredential, WeChatSyncedArticle
+from app.config import settings
+from app.models.mysql_models import AccountCredential, WeChatAccount, WeChatSyncedArticle
+from app.services.encryption_service import derive_key, decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -80,26 +82,34 @@ class WeChatArticleSyncService:
 # ============================================================================
 
 
-async def _get_token(db: Session, account_id: int) -> str:
-    """获取公众号 access_token"""
-    account = db.query(WeChatAccount).filter(
+async def _get_token(db: Session, account_id: int, tenant_id: int = 0) -> str:
+    """获取公众号 access_token（可选验证租户归属）"""
+    account_query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
-    ).first()
+    )
+    if tenant_id:
+        account_query = account_query.filter(WeChatAccount.tenant_id == tenant_id)
+    account = account_query.first()
     if not account:
         raise RuntimeError(f"Account {account_id} not found")
-    cred = db.query(AccountCredential).filter(
+    cred_query = db.query(AccountCredential).filter(
         AccountCredential.account_id == account_id,
-    ).first()
+    )
+    if tenant_id:
+        cred_query = cred_query.filter(AccountCredential.tenant_id == tenant_id)
+    cred = cred_query.first()
     if not cred:
         raise RuntimeError(f"Credential for account {account_id} not found")
+    key = derive_key(settings.credential_key)
+    app_secret = decrypt_secret(cred.encrypted_secret, key)
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             "https://api.weixin.qq.com/cgi-bin/token",
             params={
                 "grant_type": "client_credential",
                 "appid": account.app_id,
-                "secret": cred.encrypted_secret,
+                "secret": app_secret,
             },
         )
         resp.raise_for_status()
@@ -110,19 +120,27 @@ async def _get_token(db: Session, account_id: int) -> str:
     return token
 
 
-def _make_svc(db: Session, account_id: int) -> "WeChatArticleSyncService":
+def _make_svc(db: Session, account_id: int, tenant_id: int = 0) -> "WeChatArticleSyncService":
     """同步版获取 service（不依赖 asyncio 上下文）"""
-    account = db.query(WeChatAccount).filter(
+    account_query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
-    ).first()
+    )
+    if tenant_id:
+        account_query = account_query.filter(WeChatAccount.tenant_id == tenant_id)
+    account = account_query.first()
     if not account:
         raise RuntimeError(f"Account {account_id} not found")
-    cred = db.query(AccountCredential).filter(
+    cred_query = db.query(AccountCredential).filter(
         AccountCredential.account_id == account_id,
-    ).first()
+    )
+    if tenant_id:
+        cred_query = cred_query.filter(AccountCredential.tenant_id == tenant_id)
+    cred = cred_query.first()
     if not cred:
         raise RuntimeError(f"Credential for account {account_id} not found")
+    key = derive_key(settings.credential_key)
+    app_secret = decrypt_secret(cred.encrypted_secret, key)
 
     import requests
     resp = requests.get(
@@ -130,7 +148,7 @@ def _make_svc(db: Session, account_id: int) -> "WeChatArticleSyncService":
         params={
             "grant_type": "client_credential",
             "appid": account.app_id,
-            "secret": cred.encrypted_secret,
+            "secret": app_secret,
         },
         timeout=15,
     )
@@ -144,7 +162,7 @@ def _make_svc(db: Session, account_id: int) -> "WeChatArticleSyncService":
 
 async def sync_drafts(db: Session, tenant_id: int, account_id: int) -> dict:
     """同步草稿箱文章到本地"""
-    token = await _get_token(db, account_id)
+    token = await _get_token(db, account_id, tenant_id=tenant_id)
     svc = WeChatArticleSyncService(token)
 
     all_items = []
@@ -213,7 +231,7 @@ async def sync_drafts(db: Session, tenant_id: int, account_id: int) -> dict:
 
 async def sync_published(db: Session, tenant_id: int, account_id: int) -> dict:
     """同步已发布文章到本地"""
-    token = await _get_token(db, account_id)
+    token = await _get_token(db, account_id, tenant_id=tenant_id)
     svc = WeChatArticleSyncService(token)
 
     all_items = []

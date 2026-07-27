@@ -16,6 +16,7 @@ def _now() -> datetime:
 def create_article(
     db: Session,
     user_id: int,
+    tenant_id: int,
     topic: str,
     style: str,
     image_source: Optional[str] = None,
@@ -27,6 +28,7 @@ def create_article(
     """
     article = Article(
         task_id=str(uuid.uuid4()),
+        tenant_id=tenant_id,
         user_id=user_id,
         topic=topic,
         style=style,
@@ -48,16 +50,20 @@ def get_article(db: Session, task_id: str) -> Optional[Article]:
 def list_articles(
     db: Session,
     user_id: Optional[int] = None,
+    tenant_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ) -> Tuple[List[Article], int]:
     """Return a paginated list of articles together with the total count.
 
     If *user_id* is provided, results are filtered to that user.
+    If *tenant_id* is provided, results are filtered to that tenant.
     """
     query = db.query(Article)
     if user_id is not None:
         query = query.filter(Article.user_id == user_id)
+    if tenant_id is not None:
+        query = query.filter(Article.tenant_id == tenant_id)
 
     total = query.count()
     articles = (
@@ -69,10 +75,21 @@ def list_articles(
     return articles, total
 
 
-def delete_article(db: Session, article_id: int) -> bool:
+def get_article_by_id(db: Session, article_id: int, tenant_id: Optional[int] = None) -> Optional[Article]:
+    """Fetch an article by its primary-key id, optionally scoped to tenant."""
+    query = db.query(Article).filter(Article.id == article_id)
+    if tenant_id is not None:
+        query = query.filter(Article.tenant_id == tenant_id)
+    return query.first()
+
+
+def delete_article(db: Session, article_id: int, tenant_id: Optional[int] = None) -> bool:
     """Delete an article by its primary-key *id*. Returns ``True`` if a row
     was actually deleted."""
-    article = db.query(Article).filter(Article.id == article_id).first()
+    query = db.query(Article).filter(Article.id == article_id)
+    if tenant_id is not None:
+        query = query.filter(Article.tenant_id == tenant_id)
+    article = query.first()
     if article is None:
         return False
     db.delete(article)

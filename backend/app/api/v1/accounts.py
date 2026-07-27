@@ -7,9 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
-from app.models.mysql_models import WeChatAccount, AccountCredential, Membership
+from app.models.mysql_models import WeChatAccount, AccountCredential
+from app.services.encryption_service import derive_key, encrypt_secret
 
 router = APIRouter()
 
@@ -65,7 +67,10 @@ def list_accounts(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """List WeChat accounts for the current tenant."""
-    query = db.query(WeChatAccount).filter(WeChatAccount.deleted_at.is_(None))
+    query = db.query(WeChatAccount).filter(
+        WeChatAccount.tenant_id == principal.tenant_id,
+        WeChatAccount.deleted_at.is_(None),
+    )
 
     if status:
         query = query.filter(WeChatAccount.status == status)
@@ -85,6 +90,7 @@ def get_account(
     """Get WeChat account detail."""
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
+        WeChatAccount.tenant_id == principal.tenant_id,
         WeChatAccount.deleted_at.is_(None),
     ).first()
     if not account:
@@ -101,21 +107,14 @@ def create_account(
     """Create a new WeChat account."""
     existing = db.query(WeChatAccount).filter(
         WeChatAccount.app_id == req.app_id,
+        WeChatAccount.tenant_id == principal.tenant_id,
         WeChatAccount.deleted_at.is_(None),
     ).first()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Account with this app_id already exists")
 
-    # resolve tenant_id from the current user's active membership
-    membership = db.query(Membership).filter(
-        Membership.user_id == principal.user_id,
-        Membership.is_active.is_(True),
-    ).first()
-    if not membership:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No active tenant membership")
-
     account = WeChatAccount(
-        tenant_id=membership.tenant_id,
+        tenant_id=principal.tenant_id,
         name=req.name,
         app_id=req.app_id,
         auth_mode=req.auth_mode,
@@ -125,10 +124,11 @@ def create_account(
     db.flush()
 
     if req.app_secret:
+        key = derive_key(settings.credential_key)
         credential = AccountCredential(
-            tenant_id=membership.tenant_id,
+            tenant_id=principal.tenant_id,
             account_id=account.id,
-            encrypted_secret=req.app_secret,
+            encrypted_secret=encrypt_secret(req.app_secret, key),
             key_version="v1",
         )
         db.add(credential)
@@ -148,6 +148,7 @@ def update_account(
     """Update a WeChat account."""
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
+        WeChatAccount.tenant_id == principal.tenant_id,
         WeChatAccount.deleted_at.is_(None),
     ).first()
     if not account:
@@ -171,6 +172,7 @@ def delete_account(
     """Soft delete a WeChat account."""
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
+        WeChatAccount.tenant_id == principal.tenant_id,
         WeChatAccount.deleted_at.is_(None),
     ).first()
     if not account:

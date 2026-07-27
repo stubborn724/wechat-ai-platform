@@ -175,14 +175,20 @@ def list_knowledge_bases(db: Session, tenant_id: int) -> List[KnowledgeBase]:
     )
 
 
-def get_knowledge_base(db: Session, kb_id: int) -> Optional[KnowledgeBase]:
+def get_knowledge_base(db: Session, kb_id: int, tenant_id: Optional[int] = None) -> Optional[KnowledgeBase]:
     """Get a single knowledge base by id."""
-    return db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
+    query = db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id)
+    if tenant_id is not None:
+        query = query.filter(KnowledgeBase.tenant_id == tenant_id)
+    return query.first()
 
 
-def delete_knowledge_base(db: Session, kb_id: int) -> bool:
+def delete_knowledge_base(db: Session, kb_id: int, tenant_id: Optional[int] = None) -> bool:
     """Soft-delete a knowledge base (set is_active=0)."""
-    kb = db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
+    query = db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id)
+    if tenant_id is not None:
+        query = query.filter(KnowledgeBase.tenant_id == tenant_id)
+    kb = query.first()
     if not kb:
         return False
     kb.is_active = 0
@@ -310,25 +316,34 @@ def process_document(db: Session, kb_id: int, tenant_id: int,
         return doc
 
 
-def list_documents(db: Session, kb_id: int) -> List[KbDocument]:
+def list_documents(db: Session, kb_id: int,
+                    tenant_id: Optional[int] = None) -> List[KbDocument]:
     """List documents in a knowledge base, newest first."""
-    return (
-        db.query(KbDocument)
-        .filter(KbDocument.knowledge_base_id == kb_id,
-                KbDocument.status != "deleted")
-        .order_by(KbDocument.id.desc())
-        .all()
+    query = db.query(KbDocument).filter(
+        KbDocument.knowledge_base_id == kb_id,
+        KbDocument.status != "deleted",
     )
+    if tenant_id is not None:
+        query = query.filter(KbDocument.tenant_id == tenant_id)
+    return query.order_by(KbDocument.id.desc()).all()
 
 
-def get_document(db: Session, doc_id: int) -> Optional[KbDocument]:
+def get_document(db: Session, doc_id: int,
+                 tenant_id: Optional[int] = None) -> Optional[KbDocument]:
     """Get a single document by id."""
-    return db.query(KbDocument).filter(KbDocument.id == doc_id).first()
+    query = db.query(KbDocument).filter(KbDocument.id == doc_id)
+    if tenant_id is not None:
+        query = query.filter(KbDocument.tenant_id == tenant_id)
+    return query.first()
 
 
-def delete_document(db: Session, doc_id: int) -> bool:
+def delete_document(db: Session, doc_id: int,
+                    tenant_id: Optional[int] = None) -> bool:
     """Delete a document and its chunks."""
-    doc = db.query(KbDocument).filter(KbDocument.id == doc_id).first()
+    query = db.query(KbDocument).filter(KbDocument.id == doc_id)
+    if tenant_id is not None:
+        query = query.filter(KbDocument.tenant_id == tenant_id)
+    doc = query.first()
     if not doc:
         return False
     # Delete chunks first
@@ -346,7 +361,8 @@ def delete_document(db: Session, doc_id: int) -> bool:
 
 
 def search_knowledge_base(db: Session, kb_id: int, query: str,
-                           top_k: int = 5) -> List[dict]:
+                           top_k: int = 5,
+                           tenant_id: Optional[int] = None) -> List[dict]:
     """Vector similarity search within a knowledge base.
 
     Embeds the query text, then performs cosine similarity search via pgvector

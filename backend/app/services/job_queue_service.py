@@ -9,23 +9,71 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.mysql_models import ContentJob, ContentJobArticle, ContentVersion
+from app.models.mysql_models import ContentJob, ContentJobArticle, ContentVersion, PublishAttempt
 
 logger = logging.getLogger(__name__)
 
-# ── State machine ──────────────────────────────────────────────────────────
+# ── ContentJob state machine ──────────────────────────────────────────────
 
 VALID_TRANSITIONS = {
     "queue": ["pending"],
     "cancel": ["pending", "queued", "generating", "awaiting_review", "approved", "scheduled"],
     "pause": ["queued", "generating"],
     "resume": ["paused"],
-    "approve": ["awaiting_review", "generating"],
+    "approve": ["queued", "awaiting_review", "generating"],
     "reject": ["awaiting_review"],
     "schedule": ["approved"],
-    "publish": ["approved", "scheduled"],
-    "fail": ["pending", "queued", "generating"],
+    "publish": ["approved", "scheduled", "partially_published"],
+    "partial_success": ["publishing"],
+    "complete": ["publishing", "partially_published"],
+    "fail": ["pending", "queued", "generating", "publishing"],
 }
+
+# ── PublishAttempt state machine ──────────────────────────────────────────
+
+PUBLISH_ATTEMPT_TRANSITIONS = {
+    "pending": ["queued"],
+    "queued": ["publishing", "failed"],
+    "publishing": ["success", "failed", "retrying"],
+    "retrying": ["publishing", "failed"],
+    "success": [],
+    "failed": [],
+}
+
+
+def validate_publish_transition(attempt: PublishAttempt, action: str) -> str:
+    """Validate action for a PublishAttempt and return new status."""
+    allowed_from = PUBLISH_ATTEMPT_TRANSITIONS.get(action)
+    if allowed_from is None:
+        raise ValueError(f"Unknown publish action '{action}'")
+
+    if attempt.status not in allowed_from:
+        raise ValueError(
+            f"Cannot '{action}' a PublishAttempt in status '{attempt.status}'. "
+            f"Allowed from: {allowed_from}"
+        )
+    status_map = {
+        "queue": "queued",
+        "publishing": "publishing",
+        "success": "success",
+        "failed": "failed",
+        "retrying": "retrying",
+    }
+    return status_map[action]
+
+
+def transition_publish_attempt(db: Session, attempt_id: int, action: str) -> Optional[PublishAttempt]:
+    """Execute a state transition on a PublishAttempt."""
+    attempt = db.query(PublishAttempt).filter(PublishAttempt.id == attempt_id).first()
+    if not attempt:
+        return None
+
+    new_status = validate_publish_transition(attempt, action)
+    attempt.status = new_status
+    db.commit()
+    db.refresh(attempt)
+    logger.info("PublishAttempt %d transitioned: %s -> %s", attempt_id, action, new_status)
+    return attempt
 
 
 def validate_transition(job: ContentJob, action: str) -> str:
@@ -53,6 +101,8 @@ def validate_transition(job: ContentJob, action: str) -> str:
         "reject": "rejected",
         "schedule": "scheduled",
         "publish": "publishing",
+        "partial_success": "partially_published",
+        "complete": "published",
         "fail": "failed",
     }
     return status_map[action]
@@ -82,24 +132,67 @@ def transition_job(db: Session, job_id: int, action: str) -> Optional[ContentJob
 def create_slot_articles(db: Session, job: ContentJob) -> List[ContentJobArticle]:
     """Create ContentJobArticle records based on the job's generation_config.
 
-    If ``article_count`` is specified in generation_config, that many slots
-    are created. Otherwise a single default slot is created.
+    Priority order:
+    1. article_slots from generation_config (individual slot configs)
+    2. article_count from generation_config (simple count)
+    3. Default: 1 slot
     """
     config = job.generation_config or {}
-    count = config.get("article_count", 1)
+    slots_data = config.get("article_slots")
+    public_count = config.get("public_count", 0)
+    private_count = config.get("private_count", 0)
 
     slots = []
-    for i in range(count):
-        slot = ContentJobArticle(
-            tenant_id=job.tenant_id,
-            job_id=job.id,
-            content_type=job.content_type or "article",
-            sort_order=i,
-            publish_domain="public",
-            status="pending",
-        )
-        db.add(slot)
-        slots.append(slot)
+
+    if slots_data:
+        # Use article_slots configuration (from scheduled tasks / publish plans)
+        for i, slot_cfg in enumerate(slots_data):
+            content_type = (
+                slot_cfg.get("content_type", "image_text")
+                if isinstance(slot_cfg, dict)
+                else "image_text"
+            )
+            publish_domain = (
+                slot_cfg.get("publish_domain", "public")
+                if isinstance(slot_cfg, dict)
+                else "public"
+            )
+            slot = ContentJobArticle(
+                tenant_id=job.tenant_id,
+                job_id=job.id,
+                content_type=content_type,
+                sort_order=i,
+                publish_domain=publish_domain,
+                status="pending",
+            )
+            db.add(slot)
+            slots.append(slot)
+    else:
+        # Fallback: create based on article_count
+        count = config.get("article_count", 1)
+        remaining_public = max(public_count, count) if public_count else count
+        remaining_private = private_count or 0
+
+        for i in range(count):
+            if remaining_private > 0:
+                domain = "private"
+                remaining_private -= 1
+            elif remaining_public > 0:
+                domain = "public"
+                remaining_public -= 1
+            else:
+                domain = "public"
+
+            slot = ContentJobArticle(
+                tenant_id=job.tenant_id,
+                job_id=job.id,
+                content_type=job.content_type or "article",
+                sort_order=i,
+                publish_domain=domain,
+                status="pending",
+            )
+            db.add(slot)
+            slots.append(slot)
 
     db.commit()
     for s in slots:
@@ -367,31 +460,62 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
     job.status = "generating"
     db.commit()
 
+    # Load slots with their content_type
+    slots = (
+        db.query(ContentJobArticle)
+        .filter(
+            ContentJobArticle.job_id == job.id,
+            ContentJobArticle.tenant_id == job.tenant_id,
+        )
+        .order_by(ContentJobArticle.sort_order)
+        .all()
+    )
+
     for i in range(count):
+        slot = slots[i] if i < len(slots) else None
+        content_type = slot.content_type if slot else "image_text"
+
         try:
-            result = asyncio.run(_run_slot(i))
+            if content_type == "image_text":
+                # Use standard 5-agent pipeline for image_text
+                result = asyncio.run(_run_slot(i))
+                body_md = result["body_markdown"]
+                cover = result.get("cover_url")
+                images = result.get("images", [])
+            else:
+                # Use adapter for video / pure_image
+                from app.services.content_adapters import get_generator
+                gen = get_generator(content_type)
+                gen_result = gen.generate(db, job, slot)
+
+                body_md = gen_result.get("body_markdown", "")
+                cover = gen_result.get("cover_url")
+                images = gen_result.get("images", [])
+                result = gen_result  # for the asset block below
 
             version = ContentVersion(
                 tenant_id=job.tenant_id,
                 job_id=job.id,
                 version_number=i + 1,
-                title=result["title"],
-                body_markdown=result["body_markdown"],
-                summary=result["summary"][:200] if result["summary"] else topic[:200],
+                title=result.get("title", topic)[:255],
+                body_markdown=body_md,
+                summary=result.get("summary", topic)[:200],
+                article_content_type=content_type,
                 source="agent",
                 created_by=job.created_by,
-                model_metadata={"cover_url": result.get("cover_url")} if result.get("cover_url") else None,
+                model_metadata={"cover_url": cover} if cover else None,
             )
             db.add(version)
             db.flush()
 
-            # Save images to asset library (watermark already applied in _run_slot)
-            if result["images"]:
+            # Save images to asset library
+            if images:
+                image_urls = [img["url"] if isinstance(img, dict) else img for img in images]
                 try:
                     from app.services.asset_archive_service import save_images_to_asset_library
                     asyncio.run(save_images_to_asset_library(
-                        db, job.tenant_id, result["images"],
-                        watermark_enabled=False,  # Already watermarked in _run_slot
+                        db, job.tenant_id, image_urls,
+                        watermark_enabled=False,
                     ))
                 except Exception as arch_exc:
                     logger.warning("Slot %d asset archive failed: %s", i, arch_exc)

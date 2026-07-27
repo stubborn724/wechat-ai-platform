@@ -10,12 +10,22 @@ from sqlalchemy.orm import Session
 
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
-from app.models.mysql_models import ContentJob, ContentVersion
+from app.models.mysql_models import ContentAsset, ContentJob, ContentVersion, PublishAttempt
 from app.services.job_queue_service import (
     create_slot_articles,
     transition_job,
     validate_transition,
 )
+
+def _get_job_or_404(db: Session, job_id: int, tenant_id: int) -> ContentJob:
+    """Get a content job scoped to tenant, or raise 404."""
+    job = db.query(ContentJob).filter(
+        ContentJob.id == job_id,
+        ContentJob.tenant_id == tenant_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
+    return job
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -33,10 +43,31 @@ class JobCreateRequest(BaseModel):
     generation_config: Optional[dict] = None
     footer_template: Optional[str] = None
     signature_config: Optional[dict] = None
+    # 纯图片/视频配置快捷字段（自动合并到 generation_config）
+    aspect_ratio: Optional[str] = None  # 图片/视频比例: 1:1, 3:4, 9:16, 16:9
+    duration_sec: Optional[int] = None  # 视频时长（秒）
+    storyboard_count: Optional[int] = None  # 视频分镜数量
+    brand_style: Optional[str] = None  # 品牌风格
+
+    target_audience: Optional[str] = None  # 目标用户
+    extra_notes: Optional[str] = None  # 补充说明
 
 
 class JobTransitionRequest(BaseModel):
     action: str  # e.g. "queue", "cancel", "approve", "reject"
+
+
+class PublishAttemptResponse(BaseModel):
+    id: int
+    account_id: int
+    mode: str
+    status: str
+    platform_media_id: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
 
 
 class JobResponse(BaseModel):
@@ -56,6 +87,7 @@ class JobResponse(BaseModel):
     generation_config: Optional[dict] = None
     footer_template: Optional[str] = None
     signature_config: Optional[dict] = None
+    publish_attempts: List[PublishAttemptResponse] = []
     created_at: datetime
     updated_at: datetime
 
@@ -93,6 +125,15 @@ class ContentVersionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+def _attach_publish_attempts(db: Session, resp: JobResponse) -> JobResponse:
+    """Load PublishAttempt records for a job response."""
+    attempts = db.query(PublishAttempt).filter(
+        PublishAttempt.job_id == resp.id
+    ).order_by(PublishAttempt.account_id).all()
+    resp.publish_attempts = [PublishAttemptResponse.model_validate(a) for a in attempts]
+    return resp
+
+
 # --- Routes ---
 
 @router.get("/content-jobs", response_model=JobListResponse)
@@ -103,8 +144,8 @@ def list_content_jobs(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List content jobs with pagination and optional status filter."""
-    query = db.query(ContentJob)
+    """List content jobs for the current tenant with pagination and optional status filter."""
+    query = db.query(ContentJob).filter(ContentJob.tenant_id == principal.tenant_id)
 
     if status:
         query = query.filter(ContentJob.status == status)
@@ -112,7 +153,9 @@ def list_content_jobs(
     total = query.count()
     items = query.order_by(ContentJob.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
-    return JobListResponse(total=total, page=page, page_size=page_size, items=items)
+    jobs = [JobResponse.model_validate(j) for j in items]
+    jobs = [_attach_publish_attempts(db, j) for j in jobs]
+    return JobListResponse(total=total, page=page, page_size=page_size, items=jobs)
 
 
 @router.post("/content-jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -124,6 +167,7 @@ def create_content_job(
     """Create a new content job for batch generation."""
     existing = db.query(ContentJob).filter(
         ContentJob.idempotency_key == req.idempotency_key,
+        ContentJob.tenant_id == principal.tenant_id,
     ).first()
     if existing:
         raise HTTPException(
@@ -134,6 +178,13 @@ def create_content_job(
     config = req.generation_config or {}
     if req.article_count > 1 and "article_count" not in config:
         config["article_count"] = req.article_count
+
+    # 合并快捷配置字段到 generation_config
+    for field in ("aspect_ratio", "duration_sec", "storyboard_count",
+                  "brand_style", "target_audience", "extra_notes"):
+        val = getattr(req, field, None)
+        if val is not None and field not in config:
+            config[field] = val
 
     job = ContentJob(
         tenant_id=principal.tenant_id,
@@ -159,11 +210,10 @@ def get_content_job(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Get content job detail."""
-    job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
-    return job
+    """Get content job detail with publish attempts."""
+    job = _get_job_or_404(db, job_id, principal.tenant_id)
+    resp = JobResponse.model_validate(job)
+    return _attach_publish_attempts(db, resp)
 
 
 @router.delete("/content-jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -173,9 +223,7 @@ def delete_content_job(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Delete a content job (only allowed if status is cancelled or failed)."""
-    job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
+    job = _get_job_or_404(db, job_id, principal.tenant_id)
     if job.status not in ("cancelled", "failed", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -196,9 +244,7 @@ def transition_content_job(
 
     Supported actions: queue, cancel, pause, resume, approve, reject, schedule, publish.
     """
-    job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
+    job = _get_job_or_404(db, job_id, principal.tenant_id)
 
     try:
         validate_transition(job, req.action)
@@ -208,13 +254,25 @@ def transition_content_job(
     if req.action == "queue":
         # Create slot articles for batch processing
         create_slot_articles(db, job)
-        job = transition_job(db, job_id, "queue")
-        # Dispatch to Celery worker
+        # 先发派 Celery 任务，再改状态 — 防止 _bg_worker / poll_queued_jobs 抢走
+        content_type = job.content_type or "article"
+        logger.info("Dispatching job %d with content_type=%s to Celery", job_id, content_type)
         try:
-            from app.tasks.job_tasks import process_content_job
-            process_content_job.delay(job_id)
+            if content_type in ("image", "pure_image"):
+                from app.tasks.content_tasks import process_image_job
+                process_image_job.delay(job_id)
+                logger.info("Dispatched job %d to process_image_job", job_id)
+            elif content_type == "video":
+                from app.tasks.content_tasks import process_video_job
+                process_video_job.delay(job_id)
+                logger.info("Dispatched job %d to process_video_job", job_id)
+            else:
+                from app.tasks.job_tasks import process_content_job
+                process_content_job.delay(job_id)
+                logger.info("Dispatched job %d to process_content_job", job_id)
         except Exception as exc:
             logger.error("Failed to dispatch job %d to Celery: %s", job_id, exc)
+        job = transition_job(db, job_id, "queue")
     else:
         job = transition_job(db, job_id, req.action)
 
@@ -228,15 +286,17 @@ def list_content_versions(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List content versions for a job."""
-    job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
+    """List content versions for a job, scoped to current tenant."""
+    job = _get_job_or_404(db, job_id, principal.tenant_id)
 
     versions = (
         db.query(ContentVersion)
-        .filter(ContentVersion.job_id == job_id)
+        .filter(
+            ContentVersion.job_id == job_id,
+            ContentVersion.tenant_id == principal.tenant_id,
+        )
         .order_by(ContentVersion.version_number.desc())
         .all()
     )
     return versions
+

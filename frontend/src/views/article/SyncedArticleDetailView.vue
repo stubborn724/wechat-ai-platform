@@ -26,7 +26,7 @@
       <!-- 正文 -->
       <div v-if="article.content" class="content">
         <h4>正文</h4>
-        <div class="html-content" v-html="article.content" />
+        <div class="html-content" v-html="sanitizeHtml(article.content)" />
       </div>
       <div v-else class="no-content">
         <p>正文未缓存</p>
@@ -41,6 +41,31 @@
       <div v-if="article.cover_url" class="cover">
         <h4>封面</h4>
         <img :src="article.cover_url" alt="封面" style="max-width: 300px; border-radius: 6px;" />
+      </div>
+
+      <!-- 图片画廊 -->
+      <div v-if="galleryImages.length > 0" class="gallery-section">
+        <h4>正文图片 ({{ galleryImages.length }})</h4>
+        <div class="image-gallery-wrapper">
+          <div class="gallery-main">
+            <img :src="galleryImages[currentImageIndex]" alt="正文图片" class="gallery-main-image" />
+          </div>
+          <div class="gallery-thumbs">
+            <button class="thumb-scroll thumb-prev" @click="scrollThumbs(-1)">‹</button>
+            <div class="thumb-track" ref="thumbTrackRef">
+              <div
+                v-for="(url, idx) in galleryImages"
+                :key="idx"
+                class="thumb-item"
+                :class="{ active: idx === currentImageIndex }"
+                @click="currentImageIndex = idx"
+              >
+                <img :src="url" alt="" />
+              </div>
+            </div>
+            <button class="thumb-scroll thumb-next" @click="scrollThumbs(1)">›</button>
+          </div>
+        </div>
       </div>
 
       <!-- 原文链接 -->
@@ -59,16 +84,39 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getSyncedArticle } from '@/api/wechat'
 import type { SyncedArticle } from '@/api/wechat'
+import { sanitizeHtml } from '@/utils/sanitizer'
 
 const route = useRoute()
 const article = ref<SyncedArticle | null>(null)
 const loading = ref(false)
 const fetchingContent = ref(false)
+const currentImageIndex = ref(0)
+const thumbTrackRef = ref<HTMLElement | null>(null)
+
+const galleryImages = computed(() => {
+  if (!article.value?.content) return []
+  const div = document.createElement('div')
+  div.innerHTML = article.value.content
+  const urls: string[] = []
+  // 处理 <img> 标签的 src 和 data-src 属性
+  div.querySelectorAll('img').forEach(img => {
+    const src = img.getAttribute('src') || img.getAttribute('data-src') || ''
+    if (src && !urls.includes(src)) {
+      urls.push(src)
+    }
+  })
+  return urls
+})
+
+function scrollThumbs(dir: number) {
+  if (!thumbTrackRef.value) return
+  thumbTrackRef.value.scrollBy({ left: dir * 160, behavior: 'smooth' })
+}
 
 function formatTime(t?: string) {
   if (!t) return '-'
@@ -98,6 +146,15 @@ onMounted(async () => {
     const id = Number(route.params.id)
     const res = await getSyncedArticle(id)
     article.value = res
+    // 如果正文内容为空，自动拉取（用于图片画廊）
+    if (!article.value?.content) {
+      try {
+        const full = await getSyncedArticle(id, true)
+        article.value = full
+      } catch {
+        // 静默失败，用户仍可手动点击"从微信拉取正文"
+      }
+    }
   } catch (e: any) {
     ElMessage.error('加载失败：' + (e.response?.data?.detail || e.message || ''))
   } finally {
@@ -117,6 +174,33 @@ onMounted(async () => {
 .html-content img { max-width: 100%; border-radius: 6px; margin: 8px 0; }
 .no-content { text-align: center; padding: 40px; color: #909399; }
 .cover { margin: 16px 0; }
+.gallery-section { margin: 16px 0; }
+.gallery-section h4 { margin-bottom: 8px; }
 .wechat-link { margin: 16px 0; }
 .raw-json { font-size: 11px; background: #f5f7fa; padding: 12px; border-radius: 4px; max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+
+/* Image Gallery */
+.image-gallery-wrapper { width: 100%; }
+.gallery-main {
+  width: 100%; background: #f0f0f0; border-radius: 8px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 250px;
+}
+.gallery-main-image { max-width: 100%; max-height: 55vh; width: auto; height: auto; display: block; object-fit: contain; }
+.gallery-thumbs { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px 0; }
+.thumb-track { display: flex; gap: 8px; overflow-x: auto; scroll-behavior: smooth; flex: 1; padding: 4px 0; }
+.thumb-track::-webkit-scrollbar { height: 4px; }
+.thumb-track::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+.thumb-item {
+  flex: 0 0 80px; height: 60px; border-radius: 6px; overflow: hidden; cursor: pointer;
+  border: 2px solid transparent; transition: border-color 0.2s; opacity: 0.6;
+}
+.thumb-item.active { border-color: #07c160; opacity: 1; }
+.thumb-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb-scroll {
+  flex: 0 0 32px; height: 32px; border-radius: 50%; border: 1px solid #ddd; background: #fff;
+  cursor: pointer; font-size: 18px; line-height: 1; display: flex; align-items: center;
+  justify-content: center; color: #666; transition: all 0.2s;
+}
+.thumb-scroll:hover { background: #f5f5f5; border-color: #bbb; }
 </style>

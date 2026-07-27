@@ -66,7 +66,7 @@ class PexelsService(ImageSearchService):
         async with httpx.AsyncClient() as client:
             try:
                 resp = await client.get(
-                    self.SEARCH_URL, headers=headers, params=params, timeout=15.0
+                    self.SEARCH_URL, headers=headers, params=params, timeout=60.0
                 )
                 resp.raise_for_status()
                 data = resp.json()

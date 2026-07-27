@@ -128,7 +128,7 @@ def list_feed_sources(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """List all feed sources."""
-    sources = db.query(FeedSource).order_by(FeedSource.id.desc()).all()
+    sources = db.query(FeedSource).filter(FeedSource.tenant_id == principal.tenant_id).order_by(FeedSource.id.desc()).all()
     items = [_enrich_source(s, db) for s in sources]
     return FeedSourceListResponse(total=len(items), items=items)
 
@@ -141,7 +141,7 @@ def create_feed_source(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Create a new feed source."""
-    existing = db.query(FeedSource).filter(FeedSource.slug == req.slug).first()
+    existing = db.query(FeedSource).filter(FeedSource.slug == req.slug, FeedSource.tenant_id == principal.tenant_id).first()
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -171,7 +171,7 @@ def get_feed_source(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Get a single feed source by id."""
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
@@ -186,7 +186,7 @@ def update_feed_source(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Update a feed source."""
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
@@ -207,7 +207,7 @@ def delete_feed_source(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Delete a feed source."""
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
@@ -235,12 +235,12 @@ async def trigger_fetch(
     """
     from app.services.feed_service import fetch_source
 
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
 
-    result = await fetch_source(db, source_id)
+    result = await fetch_source(db, source_id, tenant_id=principal.tenant_id)
     return FetchResultResponse(**result)
 
 
@@ -258,12 +258,12 @@ async def analyze_style(
     """
     from app.services.feed_service import analyze_source_style
 
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
 
-    result = await analyze_source_style(db, source_id)
+    result = await analyze_source_style(db, source_id, tenant_id=principal.tenant_id)
     return AnalyzeResultResponse(**result)
 
 
@@ -282,7 +282,7 @@ def list_articles(
     """List articles for a feed source."""
     from app.services.feed_service import list_source_articles
 
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")
@@ -310,7 +310,7 @@ def add_article(
     """Manually add an article to a feed source."""
     from app.services.feed_service import add_manual_article
 
-    source = db.query(FeedSource).filter(FeedSource.id == source_id).first()
+    source = db.query(FeedSource).filter(FeedSource.id == source_id, FeedSource.tenant_id == principal.tenant_id).first()
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Feed source not found")

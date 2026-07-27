@@ -8,7 +8,9 @@ from typing import Optional
 import httpx
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.mysql_models import WeChatMessage
+from app.services.encryption_service import derive_key, decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -91,22 +93,31 @@ class WeChatMessageService:
 # ============================================================================
 
 
-async def _get_service(db: Session, account_id: int) -> WeChatMessageService:
+async def _get_service(db: Session, account_id: int, tenant_id: int = 0) -> WeChatMessageService:
     from app.models.mysql_models import AccountCredential, WeChatAccount
     import httpx
 
     # 用 AppID + AppSecret 获取 access_token
-    account = db.query(WeChatAccount).filter(
+    query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
-    ).first()
+    )
+    if tenant_id:
+        query = query.filter(WeChatAccount.tenant_id == tenant_id)
+    account = query.first()
     if not account:
         raise ValueError(f"Account {account_id} not found")
-    cred = db.query(AccountCredential).filter(
+    cred_query = db.query(AccountCredential).filter(
         AccountCredential.account_id == account_id,
-    ).first()
+    )
+    if tenant_id:
+        cred_query = cred_query.filter(AccountCredential.tenant_id == tenant_id)
+    cred = cred_query.first()
     if not cred:
         raise ValueError(f"Credential for account {account_id} not found")
+
+    key = derive_key(settings.credential_key)
+    app_secret = decrypt_secret(cred.encrypted_secret, key)
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
@@ -114,7 +125,7 @@ async def _get_service(db: Session, account_id: int) -> WeChatMessageService:
             params={
                 "grant_type": "client_credential",
                 "appid": account.app_id,
-                "secret": cred.encrypted_secret,
+                "secret": app_secret,
             },
         )
         resp.raise_for_status()
@@ -170,17 +181,20 @@ async def send_text_message(
     openid: str,
     text: str,
 ) -> dict:
-    """发送文本私信"""
-    svc = await _get_service(db, account_id)
-    result = await svc.send_text(openid, text)
+    """发送文本私信（mock 模式下不调微信 API）"""
+    if settings.wechat_send_mode == "mock":
+        logger.info("Mock send_text to %s: %s", openid[:8], text[:50])
+        _record_message(db, tenant_id, account_id, openid, "text",
+                        content=text, status="sent")
+        return {"errcode": 0, "errmsg": "ok", "is_mock": True}
 
+    svc = await _get_service(db, account_id, tenant_id=tenant_id)
+    result = await svc.send_text(openid, text)
     is_ok = result.get("errcode", -1) == 0
-    _record_message(
-        db, tenant_id, account_id, openid, "text",
-        content=text,
-        status="sent" if is_ok else "failed",
-        error_message=result.get("errmsg") if not is_ok else None,
-    )
+    _record_message(db, tenant_id, account_id, openid, "text",
+                    content=text,
+                    status="sent" if is_ok else "failed",
+                    error_message=result.get("errmsg") if not is_ok else None)
     return result
 
 
@@ -192,17 +206,20 @@ async def send_image_message(
     media_id: str,
     media_url: Optional[str] = None,
 ) -> dict:
-    """发送图片私信"""
-    svc = await _get_service(db, account_id)
-    result = await svc.send_image(openid, media_id)
+    """发送图片私信（mock 模式下不调微信 API）"""
+    if settings.wechat_send_mode == "mock":
+        logger.info("Mock send_image to %s: media_id=%s", openid[:8], media_id)
+        _record_message(db, tenant_id, account_id, openid, "image",
+                        media_id=media_id, media_url=media_url, status="sent")
+        return {"errcode": 0, "errmsg": "ok", "is_mock": True}
 
+    svc = await _get_service(db, account_id, tenant_id=tenant_id)
+    result = await svc.send_image(openid, media_id)
     is_ok = result.get("errcode", -1) == 0
-    _record_message(
-        db, tenant_id, account_id, openid, "image",
-        media_id=media_id, media_url=media_url,
-        status="sent" if is_ok else "failed",
-        error_message=result.get("errmsg") if not is_ok else None,
-    )
+    _record_message(db, tenant_id, account_id, openid, "image",
+                    media_id=media_id, media_url=media_url,
+                    status="sent" if is_ok else "failed",
+                    error_message=result.get("errmsg") if not is_ok else None)
     return result
 
 
@@ -218,7 +235,7 @@ async def send_contact_card(
 
     微信客服消息不支持富文本混排，所以联系方式文字和二维码图片要分两次发。
     """
-    svc = await _get_service(db, account_id)
+    svc = await _get_service(db, account_id, tenant_id=tenant_id)
 
     # 1. 发联系方式文字
     text_result = await svc.send_text(openid, contact_text)

@@ -206,6 +206,7 @@ def create_imitation_task(
     tenant_id: int,
     name: str,
     pool_id: int,
+    title: Optional[str] = None,
     strategy: str = "random",
     articles_per_day: int = 1,
     content_types: Optional[list] = None,
@@ -223,6 +224,7 @@ def create_imitation_task(
         tenant_id=tenant_id,
         pool_id=pool_id,
         name=name,
+        title=title or None,
         strategy=strategy,
         articles_per_day=articles_per_day,
         content_types=content_types or ["article"],
@@ -326,7 +328,7 @@ def select_sources_for_task(db: Session, task: ImitationTask, count: int) -> Lis
 
 
 # ============================================================================
-# 融合生成 — 执行一篇仿写生成
+# 融合生成 — 执行一篇仿写生成（图文文章）
 # ============================================================================
 
 
@@ -454,6 +456,234 @@ async def execute_imitation_generation(
 
 
 # ============================================================================
+# 融合生成 — 执行一篇媒体仿写（纯图片 / 视频）
+# ============================================================================
+
+
+async def execute_imitation_media_generation(
+    db: Session,
+    task: ImitationTask,
+    source_info: dict,
+    slot_index: int,
+) -> dict:
+    """执行一篇纯图片或视频仿写（5 Agent 流程）
+
+    Agent 1: 标题仿写
+    Agent 2: 视频镜头分析（仅视频）
+    Agent 3: 视觉理解
+    Agent 4: 提示词构建
+    Agent 5: 图片生成
+    """
+    import re
+    from app.agent.nodes.title_imitation_node import imitate_title
+    from app.agent.nodes.image_understanding_node import understand_images
+    from app.agent.nodes.prompt_crafting_node import craft_prompt
+    from app.services.wanxiang_service import WanxiangImageService
+    from app.services.storage_service import generate_object_key, storage_service
+    from app.services.asset_archive_service import save_image_to_asset_library
+
+    is_video = "video" in (task.content_types or [])
+    ref_articles = source_info.get("articles", [])
+    ref = ref_articles[0] if ref_articles else {}
+    ref_title = ref.get("title", "") or ""
+    ref_body = ref.get("body_markdown", "") or ""
+
+    # 1. 提取图片 URLs
+    image_urls = re.findall(r'!\[.*?\]\((.*?)\)', ref_body)
+    if not image_urls:
+        return {
+            "success": False,
+            "error": "参考文章中没有图片",
+            "title": ref_title,
+            "images": [],
+        }
+
+    print(f"\n{'='*60}")
+    print(f"  参考文章标题: {ref_title}")
+    print(f"  参考图片数: {len(image_urls)}")
+    print(f"  任务主题: {task.name}")
+    print(f"  用户指定标题: {task.title}")
+    print(f"{'='*60}")
+
+    similarity = "medium"
+
+    # 标题处理：用户有输入标题就直接用，否则 Agent 1 仿写
+    if task.title:
+        new_title = task.title
+        print(f"\n  标题: 使用用户输入「{new_title}」（跳过 Agent 1）")
+    else:
+        print(f"\n{'='*60}")
+        print(f"  >>> Agent 1: 标题仿写 <<<")
+        print(f"{'='*60}")
+        new_titles = imitate_title(ref_title, topic=task.name, count=3)
+        new_title = new_titles[0] if new_titles else ref_title
+        print(f"\n  最终标题: {new_title}")
+
+    print(f"\n{'='*60}")
+    print(f"  >>> Agent 3: 视觉理解 <<<")
+    print(f"{'='*60}")
+    visual_descs = understand_images(image_urls)
+    if not visual_descs:
+        return {"success": False, "error": "图片理解失败", "title": new_title, "images": []}
+
+    # Agent 2: 视频镜头分析（仅视频）
+    shot_plan = None
+    if is_video:
+        print(f"\n{'='*60}")
+        print(f"  >>> Agent 2: 视频镜头分析 <<<")
+        print(f"{'='*60}")
+        from app.agent.nodes.video_shot_analysis_node import analyze_shots
+        shot_summaries = [
+            f"{d.get('subject', '')}，{d.get('scene', '')}，{d.get('visual_style', '')}"
+            for d in visual_descs
+        ]
+        shot_plan = analyze_shots(shot_summaries, total_duration=min(len(visual_descs) * 3, 15))
+
+    wanxiang = WanxiangImageService()
+    generated_urls = []
+
+    if is_video:
+        # ===== 视频模式：AI 直接生成 =====
+        # Agent 4: 构建综合性视频 prompt（包含所有场景描述）
+        from app.agent.nodes.prompt_crafting_node import VIDEO_PROMPT_CRAFTING_PROMPT
+
+        scene_descs = []
+        for i, desc in enumerate(visual_descs):
+            motion = "static"
+            duration = 3
+            if shot_plan and "shots" in shot_plan:
+                for s in shot_plan["shots"]:
+                    if s.get("image_index") == i:
+                        motion = s.get("motion", "static")
+                        duration = s.get("duration_sec", 3)
+                        break
+            scene_descs.append({
+                "index": i,
+                "description": f"{desc.get('subject', '')}，{desc.get('scene', '')}，"
+                              f"构图：{desc.get('composition', '')}，"
+                              f"光线：{desc.get('lighting', '')}，"
+                              f"色调：{desc.get('color_palette', '')}，"
+                              f"风格：{desc.get('visual_style', '')}",
+                "motion": motion,
+                "duration_sec": duration,
+            })
+
+        from langchain_core.messages import HumanMessage
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            api_key=settings.dashscope_api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model=settings.dashscope_model,
+            temperature=0.5,
+        )
+        video_prompt_input = {
+            "topic": task.name,
+            "total_duration": shot_plan.get("total_duration", 12) if shot_plan else 12,
+            "scenes": scene_descs,
+        }
+        try:
+            import json as _json
+            resp = llm.invoke([HumanMessage(content=VIDEO_PROMPT_CRAFTING_PROMPT.format(
+                video_plan=_json.dumps(video_prompt_input, ensure_ascii=False, indent=2)
+            ))])
+            vp_text = resp.content
+            if isinstance(vp_text, list):
+                vp_text = "".join(b["text"] for b in vp_text if isinstance(b, dict) and b.get("text"))
+            vp_text = vp_text.strip()
+            if vp_text.startswith("```"):
+                vp_text = vp_text.split("\n", 1)[-1]
+            if vp_text.endswith("```"):
+                vp_text = vp_text.rsplit("```", 1)[0]
+            vp_text = vp_text.strip()
+            video_gen_prompt = _json.loads(vp_text).get("prompt", "")
+        except Exception as e:
+            logger.warning("Video prompt crafting failed: %s", e)
+            video_gen_prompt = task.name
+
+        logger.info("=== AI 视频生成 ===")
+        logger.info("Video prompt (%d chars): %s", len(video_gen_prompt), video_gen_prompt[:200])
+        from app.services.video_gen_service import VideoGenService
+        vgs = VideoGenService()
+        aspect = shot_plan.get("aspect_ratio", "9:16") if shot_plan else "9:16"
+        size_map = {"9:16": "720*1280", "16:9": "1280*720", "1:1": "1024*1024"}
+        video_size = size_map.get(aspect, "720*1280")
+        video_url = await vgs.generate_video(video_gen_prompt, size=video_size, duration=12)
+        video_result = None
+        if video_url:
+            import httpx
+            video_key = generate_object_key(
+                task.tenant_id, f"imitation_video_{task.id}_{slot_index}.mp4", prefix="content",
+            )
+            try:
+                vresp = httpx.get(video_url, timeout=120)
+                if vresp.status_code == 200:
+                    storage_service.upload_bytes(video_key, vresp.content, "video/mp4")
+                    video_result = {"storage_key": video_key, "url": storage_service.get_url(video_key)}
+                else:
+                    logger.warning("Failed to download generated video: HTTP %s", vresp.status_code)
+            except Exception as dle:
+                logger.warning("Failed to download generated video: %s", dle)
+
+        result = {
+            "success": video_result is not None,
+            "title": new_title,
+            "ref_title": ref_title,
+            "video": video_result,
+            "visual_descs": visual_descs,
+            "video_prompt": video_gen_prompt,
+        }
+        return result
+
+    # ===== 纯图片模式：逐张生成 =====
+    for i, desc in enumerate(visual_descs):
+        logger.info("=== Agent 4+5: 图片 %d/%d ===", i + 1, len(visual_descs))
+
+        prompt_data = craft_prompt(desc, topic=task.name, similarity=similarity)
+        gen_prompt = prompt_data["prompt"]
+        if not gen_prompt:
+            from app.agent.nodes.image_prompt_builder import build_wanxiang_prompt
+            gen_prompt = build_wanxiang_prompt(desc, task.name, similarity)
+
+        logger.info("Prompt (%d chars): %s", len(gen_prompt), gen_prompt[:200])
+
+        img_url = None
+        try:
+            img_url = await wanxiang.generate_image(gen_prompt, size="1024*1365")
+        except Exception as e:
+            logger.warning("Image %d generation failed: %s", i + 1, e)
+
+        if img_url:
+            try:
+                asset = await save_image_to_asset_library(
+                    db, task.tenant_id, img_url,
+                    keywords=gen_prompt[:50], usage_type="generated_image",
+                )
+                generated_urls.append({
+                    "url": img_url,
+                    "storage_key": asset.storage_key if asset else "",
+                    "index": i,
+                    "prompt": gen_prompt,
+                    "motion": "",
+                    "duration_sec": 3,
+                })
+            except Exception as e:
+                logger.warning("Image %d save failed: %s", i + 1, e)
+
+    if not generated_urls:
+        return {"success": False, "error": "所有图片生成失败", "title": new_title, "images": []}
+
+    body_md = "\n\n".join(f"![]({g['url']})" for g in generated_urls)
+    return {
+        "success": True,
+        "title": new_title,
+        "ref_title": ref_title,
+        "body_markdown": body_md,
+        "images": [g["url"] for g in generated_urls],
+        "visual_descs": visual_descs,
+    }
+
+
+# ============================================================================
 # 执行一次仿写任务（一天的量）
 # ============================================================================
 
@@ -473,9 +703,16 @@ async def execute_imitation_task(db: Session, task_id: int) -> dict:
     if not sources:
         return {"error": "No sources available in pool"}
 
+    # 判断内容类型
+    content_types = task.content_types or ["article"]
+    is_media = any(ct in ("pure_image", "image", "video") for ct in content_types)
+
     results = []
     for i, source in enumerate(sources):
-        result = await execute_imitation_generation(db, task, source, i)
+        if is_media:
+            result = await execute_imitation_media_generation(db, task, source, i)
+        else:
+            result = await execute_imitation_generation(db, task, source, i)
 
         # 保存结果
         task_result = ImitationTaskResult(

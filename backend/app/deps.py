@@ -28,13 +28,20 @@ class CurrentPrincipal:
 
 
 async def get_current_principal(
+    request: Request,
     token: Optional[str] = Depends(oauth2_scheme),
     token_query: Optional[str] = Query(None, alias="token"),
     db: Session = Depends(get_mysql_db),
 ) -> Optional[CurrentPrincipal]:
     """从 JWT token 解析当前用户。优先取 Authorization header，
-    若没有（如 SSE EventSource 无法设置自定义 header）则回退到查询参数 ?token=。"""
+    若没有则尝试 HttpOnly Cookie，最后回退到查询参数 ?token=。
+
+    Cookie 方式用于 XSS 防护，避免 token 暴露给 JS。
+    """
     jwt_token = token or token_query
+    # 尝试从 HttpOnly Cookie 读取
+    if not jwt_token:
+        jwt_token = request.cookies.get("access_token")
     if not jwt_token:
         return None
     from app.services.auth_service import decode_token
@@ -60,5 +67,15 @@ def require_auth(principal: Optional[CurrentPrincipal] = Depends(get_current_pri
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    return principal
+
+
+def require_admin(principal: CurrentPrincipal = Depends(require_auth)):
+    """仅超级管理员可访问"""
+    if principal.role != "super_administrator":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
         )
     return principal

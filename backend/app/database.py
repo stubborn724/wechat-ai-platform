@@ -42,12 +42,15 @@ def get_mysql_db():
 # ============================================================
 # PostgreSQL - 向量数据库 (pgvector)
 # ============================================================
-pg_engine = create_engine(
-    settings.pg_url,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-)
+try:
+    pg_engine = create_engine(
+        settings.pg_url,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+    )
+except Exception:
+    pg_engine = None
 
 PgSessionLocal = sessionmaker(
     bind=pg_engine,

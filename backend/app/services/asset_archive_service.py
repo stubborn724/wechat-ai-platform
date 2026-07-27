@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models.mysql_models import Asset, AssetUsage, TenantWatermarkConfig
 from app.services.storage_service import generate_object_key, storage_service
+from app.services.url_safety import validate_url
 from app.services.watermark_service import watermark_service
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ async def save_image_to_asset_library(
         return None
 
     try:
+        validate_url(image_url)
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(image_url)
             resp.raise_for_status()

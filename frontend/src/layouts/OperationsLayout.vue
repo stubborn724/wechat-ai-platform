@@ -43,9 +43,10 @@ const menuItems = computed<MenuItem[]>(() => [
   { index: '7', route: '/feed-sources', label: '投喂源', icon: 'Connection', show: true },
   { index: '8', route: '/knowledge', label: '知识库', icon: 'Collection', show: true },
   { index: '9', route: '/scheduled-tasks', label: '定时任务', icon: 'Calendar', show: true },
-  { index: '10', route: '/reviews', label: '审核台', icon: 'Finished', show: canReview.value },
-  { index: '11', route: '/comments', label: '评论管理', icon: 'ChatDotSquare', show: true },
-  { index: '13', route: '/messages', label: '私信管理', icon: 'ChatDotSquare', show: true },
+{ index: '10', route: '/reviews', label: '审核台', icon: 'Finished', show: canReview.value },
+  { index: '16', route: '/optimizations', label: '优化审核', icon: 'CopyDocument', show: true },
+  { index: '17', route: '/statistics', label: '统计报表', icon: 'Odometer', show: true },
+  { index: '11', route: '/leads', label: '评论线索', icon: 'ChatDotSquare', show: true },
   { index: '14', route: '/imitation/pools', label: '仿写池', icon: 'CopyDocument', show: true },
   { index: '15', route: '/watermark', label: '水印设置', icon: 'Setting', show: true },
 ].filter(item => item.show))

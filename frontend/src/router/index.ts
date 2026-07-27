@@ -26,9 +26,18 @@ const router = createRouter({
         { path: 'publish-plans', name: 'PublishPlans', component: () => import('@/views/PublishPlansView.vue') },
         { path: 'scheduled-tasks', name: 'ScheduledTasks', component: () => import('@/views/ScheduledTasksView.vue') },
         { path: 'reviews', name: 'Reviews', component: () => import('@/views/ReviewsView.vue') },
+        { path: 'optimizations', name: 'OptimizationReview', component: () => import('@/views/OptimizationReviewView.vue') },
+        { path: 'statistics', name: 'Statistics', component: () => import('@/views/StatisticsView.vue') },
         { path: 'comments', name: 'Comments', component: () => import('@/views/CommentsView.vue') },
         { path: 'messages', name: 'Messages', component: () => import('@/views/MessagesView.vue') },
-        { path: 'imitation/pools', name: 'ImitationPools', component: () => import('@/views/ImitationPoolsView.vue') },
+        { path: 'leads', name: 'CommentLeads', component: () => import('@/views/CommentLeadWorkbench.vue') },
+        { path: 'leads/packages', name: 'ContactPackages', component: () => import('@/views/config/ContactPackageList.vue') },
+        { path: 'leads/packages/new', name: 'NewContactPackage', component: () => import('@/views/config/ContactPackageForm.vue') },
+        { path: 'leads/packages/:id/edit', name: 'EditContactPackage', component: () => import('@/views/config/ContactPackageForm.vue') },
+        { path: 'leads/rules', name: 'AutomationRules', component: () => import('@/views/config/AutomationRulesView.vue') },
+        { path: 'leads/templates', name: 'MessageTemplates', component: () => import('@/views/config/MessageTemplatesView.vue') },
+        { path: 'leads/stats', name: 'LeadStats', component: () => import('@/views/config/LeadStatsView.vue') },
+{ path: 'imitation/pools', name: 'ImitationPools', component: () => import('@/views/ImitationPoolsView.vue') },
         { path: 'imitation/tasks', name: 'ImitationTasks', component: () => import('@/views/ImitationTasksView.vue') },
         { path: 'watermark', name: 'WatermarkSettings', component: () => import('@/views/WatermarkSettingsView.vue') },
       ],
@@ -38,10 +47,18 @@ const router = createRouter({
 })
 
 // Navigation guard
-router.beforeEach((to, from, next) => {
+router.beforeEach(async (to, from, next) => {
   const requiresAuth = to.matched.some(record => record.meta.requiresAuth !== false)
-  const token = localStorage.getItem('access_token')
-  if (requiresAuth && !token && to.path !== '/login') {
+  if (!requiresAuth || to.path === '/login') {
+    next()
+    return
+  }
+
+  // 优先通过 HttpOnly cookie 认证（由后端自动处理）
+  // 检查 localStorage 中是否有 token（兼容旧版）
+  const hasToken = !!localStorage.getItem('access_token')
+
+  if (!hasToken && to.path !== '/login') {
     next('/login')
   } else {
     next()

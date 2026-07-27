@@ -107,7 +107,7 @@ def get_knowledge_base(
 ):
     """Get a single knowledge base by id."""
     from app.services.knowledge_base_service import get_knowledge_base as svc_get
-    kb = svc_get(db, kb_id)
+    kb = svc_get(db, kb_id, tenant_id=principal.tenant_id)
     if not kb:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Knowledge base not found")
@@ -122,7 +122,7 @@ def delete_knowledge_base(
 ):
     """Delete (soft) a knowledge base."""
     from app.services.knowledge_base_service import delete_knowledge_base as svc_delete
-    if not svc_delete(db, kb_id):
+    if not svc_delete(db, kb_id, tenant_id=principal.tenant_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Knowledge base not found")
 
@@ -162,7 +162,7 @@ def list_documents(
 ):
     """List documents in a knowledge base."""
     from app.services.knowledge_base_service import list_documents as svc_list_docs
-    items = svc_list_docs(db, kb_id)
+    items = svc_list_docs(db, kb_id, tenant_id=principal.tenant_id)
     return DocumentListResponse(total=len(items), items=items)
 
 
@@ -175,7 +175,7 @@ def get_document(
 ):
     """Get a single document by id."""
     from app.services.knowledge_base_service import get_document as svc_get_doc
-    doc = svc_get_doc(db, doc_id)
+    doc = svc_get_doc(db, doc_id, tenant_id=principal.tenant_id)
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Document not found")
@@ -192,7 +192,7 @@ def delete_document(
 ):
     """Delete a document and its chunks from a knowledge base."""
     from app.services.knowledge_base_service import delete_document as svc_delete_doc
-    if not svc_delete_doc(db, doc_id):
+    if not svc_delete_doc(db, doc_id, tenant_id=principal.tenant_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Document not found")
 
@@ -212,7 +212,7 @@ def search_knowledge_base(
     Uses pgvector cosine distance on DashScope text-embedding-v2 vectors.
     """
     from app.services.knowledge_base_service import search_knowledge_base as svc_search
-    results = svc_search(db, kb_id, q, top_k)
+    results = svc_search(db, kb_id, q, top_k, tenant_id=principal.tenant_id)
     return SearchResponse(results=[SearchResult(**r) for r in results])
 
 

@@ -12,7 +12,7 @@ ENV_FILE = BASE_DIR / ".env"
 
 class Settings(BaseSettings):
     # Server
-    server_port: int = 8000
+    server_port: int = 8002
     server_host: str = "0.0.0.0"
     environment: str = "development"
 
@@ -43,6 +43,9 @@ class Settings(BaseSettings):
 
     # Credential Encryption
     credential_key: str = "change-this-to-a-32-char-key!!"
+
+    # 微信发送模式: live 真实发送 / mock 模拟发送
+    wechat_send_mode: str = "mock"
 
     # DashScope AI
     dashscope_api_key: str = ""

@@ -14,6 +14,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.services.encryption_service import derive_key, decrypt_secret
+from app.services.url_safety import validate_url
+
 from app.models.mysql_models import Article, AccountCredential, WeChatAccount
 
 logger = logging.getLogger(__name__)
@@ -226,34 +230,41 @@ class WechatPublisher:
 
         logger.info("上传图片到微信 CDN: %s", image_url[:80])
         try:
-            # 下载外部图片 — 优先用 requests，失败则尝试 MinIO SDK
+            # SSRF 防护：校验 URL 安全
+            validate_url(image_url)
+
+            # 下载外部图片 — 统一走 HTTP，限制响应大小 10MB
             img_data = None
             content_type = "image/jpeg"
             try:
-                img_resp = requests.get(image_url, timeout=15)
+                img_resp = requests.get(image_url, timeout=15, stream=True)
                 img_resp.raise_for_status()
-                img_data = img_resp.content
+                max_size = 10 * 1024 * 1024
+                content = bytearray()
+                for chunk in img_resp.iter_content(chunk_size=8192):
+                    content.extend(chunk)
+                    if len(content) > max_size:
+                        raise ValueError(f"Image exceeds max size of {max_size} bytes")
+                img_data = bytes(content)
                 content_type = img_resp.headers.get("Content-Type", "image/jpeg")
             except Exception as download_err:
-                logger.warning("HTTP 下载图片失败，尝试 MinIO 读取: %s", download_err)
-                # 如果 URL 是 MinIO 地址，直接用 SDK 读
-                if "minio" in image_url.lower() or "localhost:900" in image_url:
-                    try:
-                        from app.services.storage_service import storage_service
-                        # 解析 object_name: http://host:port/bucket/key -> key
-                        path_parts = image_url.split("/")
-                        if len(path_parts) >= 4:
-                            obj_key = "/".join(path_parts[4:])  # skip http://host:port/bucket/
-                            img_data = storage_service.download_bytes(obj_key)
-                            ext = obj_key.split(".")[-1].lower() if "." in obj_key else "jpg"
-                            content_type = {
-                                "png": "image/png", "jpg": "image/jpeg",
-                                "jpeg": "image/jpeg", "gif": "image/gif",
-                                "webp": "image/webp",
-                            }.get(ext, "image/jpeg")
-                            logger.info("MinIO SDK 读取成功: %s (%d bytes)", obj_key, len(img_data))
-                    except Exception as minio_err:
-                        logger.warning("MinIO SDK 读取也失败: %s", minio_err)
+                logger.warning("HTTP 下载图片失败，尝试 MinIO SDK: %s", download_err)
+                # 从 MinIO public URL 提取对象 key 并通过 SDK 下载
+                try:
+                    public_url = settings.minio_public_endpoint.rstrip("/")
+                    bucket = settings.minio_bucket
+                    prefix = f"{public_url}/{bucket}/"
+                    if prefix in image_url:
+                        obj_key = image_url[image_url.index(prefix) + len(prefix):]
+                        from app.services.storage_service import storage_service as _ss
+                        img_data = _ss.download_bytes(obj_key)
+                        ext = obj_key.rsplit(".", 1)[-1].lower() if "." in obj_key else "jpg"
+                        ct_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                  "gif": "image/gif", "webp": "image/webp"}
+                        content_type = ct_map.get(ext, "image/jpeg")
+                        logger.info("MinIO SDK 下载成功: %s", obj_key)
+                except Exception as minio_err:
+                    logger.warning("MinIO SDK 也失败: %s", minio_err)
 
             if not img_data:
                 logger.warning("无法下载图片，保留原始 URL: %s", image_url[:60])
@@ -311,10 +322,17 @@ class WechatPublisher:
             cover_dir = _tf.gettempdir()
 
             if cover_image_url:
-                # 尝试下载自定义封面
+                validate_url(cover_image_url)
+                # 尝试下载自定义封面（限制 10MB）
                 try:
-                    img_resp = requests.get(cover_image_url, timeout=15)
+                    img_resp = requests.get(cover_image_url, timeout=15, stream=True)
                     img_resp.raise_for_status()
+                    max_size = 10 * 1024 * 1024
+                    content = bytearray()
+                    for chunk in img_resp.iter_content(chunk_size=8192):
+                        content.extend(chunk)
+                        if len(content) > max_size:
+                            raise ValueError(f"Cover image exceeds max size of {max_size} bytes")
                     ext = ".jpg"
                     ct = img_resp.headers.get("Content-Type", "")
                     if "png" in ct:
@@ -326,7 +344,7 @@ class WechatPublisher:
                         f"wechat_cover_{int(time.time())}_{random.randint(100,999)}{ext}",
                     )
                     with open(temp_cover, "wb") as f:
-                        f.write(img_resp.content)
+                        f.write(bytes(content))
                     thumb_media_id = self._upload_cover(temp_cover)
                     logger.info("✅ 自定义封面上传成功，media_id: %s", thumb_media_id)
                     return thumb_media_id
@@ -375,7 +393,11 @@ class WechatPublisher:
         digest = (summary or "").strip()
         digest = re.sub(r'[\n\t\s]+', ' ', digest)[:MAX_DIGEST_LENGTH]
 
-        content = self._format_content(content_markdown)
+        # 如果内容已经是 HTML（以 < 开头），跳过 markdown 格式化
+        if content_markdown.strip().startswith('<'):
+            content = content_markdown
+        else:
+            content = self._format_content(content_markdown)
 
         # 将外部图片上传到微信 CDN，避免草稿箱无法显示
         def _upload_all_images(html_content):
@@ -483,26 +505,49 @@ class WechatPublisher:
         return {"media_id": media_id, "publish_id": publish_id, "draft_saved": True}
 
 
-def _get_publisher_for_account(db: Session, account_id: int) -> WechatPublisher:
-    """从数据库读取凭证，构造 WechatPublisher 实例"""
+def _get_publisher_for_account(db: Session, account_id: int, tenant_id: int,
+                                actor_id: int = 0) -> WechatPublisher:
+    """从数据库读取凭证，构造 WechatPublisher 实例（验证账号归属租户）"""
     account = db.query(WeChatAccount).filter(
-        WeChatAccount.id == account_id, WeChatAccount.deleted_at.is_(None)
+        WeChatAccount.id == account_id,
+        WeChatAccount.tenant_id == tenant_id,
+        WeChatAccount.deleted_at.is_(None),
     ).first()
     if not account:
-        raise ValueError(f"Account {account_id} not found")
+        raise ValueError(f"Account {account_id} not found for tenant {tenant_id}")
 
     credential = db.query(AccountCredential).filter(
-        AccountCredential.account_id == account_id
+        AccountCredential.account_id == account_id,
+        AccountCredential.tenant_id == tenant_id,
     ).first()
     if not credential:
         raise ValueError(f"Credential for account {account_id} not found")
 
-    logger.info("使用公众号: %s (app_id=%s...)", account.name, account.app_id[:6] if account.app_id else "")
-    return WechatPublisher(app_id=account.app_id, app_secret=credential.encrypted_secret)
+    # 审计日志：记录凭证解密访问
+    try:
+        from app.models.mysql_models import AuditLog
+        audit = AuditLog(
+            tenant_id=tenant_id,
+            actor_id=actor_id or None,
+            action="credential_access",
+            entity_type="wechat_account",
+            entity_id=str(account_id),
+        )
+        db.add(audit)
+        db.commit()
+    except Exception as audit_err:
+        logger.warning("Failed to write audit log for credential access: %s", audit_err)
+
+    logger.info("使用公众号: %s (app_id=%s..., actor=%s)",
+                account.name, account.app_id[:6] if account.app_id else "", actor_id)
+    key = derive_key(settings.credential_key)
+    app_secret = decrypt_secret(credential.encrypted_secret, key)
+    return WechatPublisher(app_id=account.app_id, app_secret=app_secret)
 
 
 def publish_article(db: Session, article: Article, account_id: int,
-                    mode: str = "draft") -> dict:
+                    mode: str = "draft", tenant_id: int = 0,
+                    actor_id: int = 0) -> dict:
     """发布文章到微信公众号
 
     Args:
@@ -510,11 +555,14 @@ def publish_article(db: Session, article: Article, account_id: int,
         article: 文章对象
         account_id: 公众号 ID
         mode: 发布模式 — "draft" 保存草稿箱, "direct" 直接发布
+        actor_id: 操作者用户 ID（用于审计日志）
 
     Returns:
         包含发布结果的 dict
     """
-    publisher = _get_publisher_for_account(db, account_id)
+    if tenant_id == 0:
+        tenant_id = article.tenant_id or 0
+    publisher = _get_publisher_for_account(db, account_id, tenant_id, actor_id=actor_id)
     content = article.full_content or article.content or ""
     summary = article.sub_title or article.topic or ""
     title = article.main_title or article.topic or "无标题"
@@ -537,6 +585,7 @@ def publish_article(db: Session, article: Article, account_id: int,
         )
 
 
-def save_article_as_draft(db: Session, article: Article, account_id: int) -> dict:
+def save_article_as_draft(db: Session, article: Article, account_id: int,
+                           tenant_id: int = 0, actor_id: int = 0) -> dict:
     """保留的兼容函数 — 等价于 publish_article(..., mode='draft')"""
-    return publish_article(db, article, account_id, mode="draft")
+    return publish_article(db, article, account_id, mode="draft", tenant_id=tenant_id, actor_id=actor_id)

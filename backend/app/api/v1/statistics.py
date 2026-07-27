@@ -56,16 +56,23 @@ def get_dashboard_stats(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Get dashboard statistics overview."""
-    total_accounts = db.query(func.count(WeChatAccount.id)).scalar() or 0
+    """Get dashboard statistics overview scoped to current tenant."""
+    tid = principal.tenant_id
+    total_accounts = db.query(func.count(WeChatAccount.id)).filter(
+        WeChatAccount.tenant_id == tid,
+    ).scalar() or 0
     active_jobs = db.query(func.count(ContentJob.id)).filter(
+        ContentJob.tenant_id == tid,
         ContentJob.status.in_(["pending", "queued", "processing"]),
     ).scalar() or 0
-    total_articles = db.query(func.count(Article.id)).scalar() or 0
+    total_articles = db.query(func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+    ).scalar() or 0
 
     # Articles grouped by status
     article_status_rows = (
         db.query(Article.status, func.count(Article.id))
+        .filter(Article.tenant_id == tid)
         .group_by(Article.status)
         .all()
     )
@@ -74,14 +81,17 @@ def get_dashboard_stats(
     # Jobs grouped by status
     job_status_rows = (
         db.query(ContentJob.status, func.count(ContentJob.id))
+        .filter(ContentJob.tenant_id == tid)
         .group_by(ContentJob.status)
         .all()
     )
     jobs_by_status = {row[0]: row[1] for row in job_status_rows}
 
-    # Recent activity (last 10 agent log entries)
+    # Recent activity (last 10 agent log entries scoped via Article tenant_id)
     recent_logs = (
         db.query(AgentLog)
+        .join(Article, AgentLog.task_id == Article.task_id)
+        .filter(Article.tenant_id == tid)
         .order_by(AgentLog.id.desc())
         .limit(10)
         .all()
@@ -117,8 +127,10 @@ def get_agent_logs(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """Get agent execution logs with pagination and filters."""
-    query = db.query(AgentLog)
+    """Get agent execution logs with pagination and filters, scoped to current tenant."""
+    query = db.query(AgentLog).join(
+        Article, AgentLog.task_id == Article.task_id
+    ).filter(Article.tenant_id == principal.tenant_id)
 
     if agent_name:
         query = query.filter(AgentLog.agent_name == agent_name)
@@ -136,3 +148,106 @@ def get_agent_logs(
     )
 
     return AgentLogListResponse(total=total, page=page, page_size=page_size, items=items)
+
+
+@router.get("/statistics/articles/quality-distribution")
+def get_quality_distribution(
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取文章质量分布统计"""
+    from sqlalchemy import func as sa_func
+
+    tid = principal.tenant_id
+    # 评分等级
+    excellent = db.query(sa_func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+        Article.latest_quality_score >= 85,
+    ).scalar() or 0
+    good = db.query(sa_func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+        Article.latest_quality_score.between(70, 84),
+    ).scalar() or 0
+    fair = db.query(sa_func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+        Article.latest_quality_score.between(50, 69),
+    ).scalar() or 0
+    poor = db.query(sa_func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+        Article.latest_quality_score < 50,
+    ).scalar() or 0
+    not_evaluated = db.query(sa_func.count(Article.id)).filter(
+        Article.tenant_id == tid,
+        Article.latest_quality_score.is_(None),
+    ).scalar() or 0
+
+    # 各维度平均分（限定当前租户）
+    from app.models.mysql_models import ArticleQualityEvaluation
+
+    avg_row = (
+        db.query(
+            sa_func.avg(ArticleQualityEvaluation.content_score),
+            sa_func.avg(ArticleQualityEvaluation.readability_score),
+            sa_func.avg(ArticleQualityEvaluation.structure_score),
+            sa_func.avg(ArticleQualityEvaluation.value_score),
+            sa_func.avg(ArticleQualityEvaluation.title_score),
+        )
+        .join(Article, ArticleQualityEvaluation.article_id == Article.id)
+        .filter(
+            ArticleQualityEvaluation.status == "success",
+            Article.tenant_id == tid,
+        )
+        .first()
+    )
+
+    return {
+        "excellent": excellent,
+        "good": good,
+        "fair": fair,
+        "poor": poor,
+        "not_evaluated": not_evaluated,
+        "total": excellent + good + fair + poor + not_evaluated,
+        "avg_dimensions": {
+            "content_score": round(avg_row[0] or 0, 1),
+            "readability_score": round(avg_row[1] or 0, 1),
+            "structure_score": round(avg_row[2] or 0, 1),
+            "value_score": round(avg_row[3] or 0, 1),
+            "title_score": round(avg_row[4] or 0, 1),
+        } if avg_row else None,
+    }
+
+
+@router.get("/statistics/articles/optimization-report")
+def get_optimization_report(
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """获取优化效果报告"""
+    from app.models.mysql_models import ArticleOptimization
+
+    tid = principal.tenant_id
+    base = db.query(ArticleOptimization).filter(
+        ArticleOptimization.tenant_id == tid,
+    )
+
+    total = base.count()
+    approved = base.filter(ArticleOptimization.status == "approved").count()
+    rejected = base.filter(ArticleOptimization.status == "rejected").count()
+    draft_ready = base.filter(ArticleOptimization.status == "draft_ready").count()
+
+    effective = base.filter(
+        ArticleOptimization.comparison_result == "effective"
+    ).count()
+    ineffective = base.filter(
+        ArticleOptimization.comparison_result == "ineffective"
+    ).count()
+
+    return {
+        "total_optimizations": total,
+        "draft_ready": draft_ready,
+        "approved": approved,
+        "rejected": rejected,
+        "effective": effective,
+        "ineffective": ineffective,
+        "pending_review": draft_ready,
+    }

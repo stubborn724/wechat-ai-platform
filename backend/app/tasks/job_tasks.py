@@ -6,7 +6,7 @@ import uuid
 
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
-from app.models.mysql_models import ContentJob, ContentVersion, Article
+from app.models.mysql_models import ContentJob, ContentVersion, Article, PublishAttempt
 from app.services.job_queue_service import process_job_batch, transition_job
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,11 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def process_content_job(self, job_id: int):
-    """Process a queued content job through the generation pipeline."""
+    """Process a queued content job through the generation pipeline.
+
+    Only handles 'article' type jobs. Image/video jobs are handled by
+    process_image_job / process_video_job in content_tasks.py.
+    """
     db = MysqlSessionLocal()
     try:
         job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
@@ -24,18 +28,32 @@ def process_content_job(self, job_id: int):
         if job.status != "queued":
             return {"error": f"Job {job_id} is not in queued state (status={job.status})"}
 
-        # Run the generation pipeline
+        # 非文章类型转派到对应处理任务
+        ct = job.content_type or "article"
+        if ct in ("image", "pure_image"):
+            from app.tasks.content_tasks import process_image_job
+            db.close()
+            return process_image_job.delay(job_id)
+        elif ct == "video":
+            from app.tasks.content_tasks import process_video_job
+            db.close()
+            return process_video_job.delay(job_id)
+
+        # 文章类型：运行原有生成流水线
         versions = process_job_batch(db, job)
 
-        # Auto-approve if configured
+        # Create Article records from ContentVersions
+        _save_versions_as_articles_and_drafts(db, job, versions)
+
+        # Determine post-generation flow
         if job.approval_mode == "auto":
+            # Auto mode: approve and publish directly
             transition_job(db, job_id, "approve")
             logger.info("Job %d auto-approved after generation", job_id)
-
-            # Create Article records from ContentVersions and save as WeChat drafts
-            _save_versions_as_articles_and_drafts(db, job, versions)
         else:
-            transition_job(db, job_id, "approve")
+            # Manual mode: wait for human review
+            job.status = "awaiting_review"
+            db.commit()
             logger.info("Job %d completed, awaiting review", job_id)
 
         return {
@@ -57,7 +75,7 @@ def process_content_job(self, job_id: int):
 
 @celery_app.task
 def poll_queued_jobs():
-    """Beat task: Look for queued jobs and dispatch them to the worker."""
+    """Beat task: Look for queued jobs and dispatch them to the proper worker by content_type."""
     db = MysqlSessionLocal()
     try:
         jobs = (
@@ -68,8 +86,16 @@ def poll_queued_jobs():
             .all()
         )
         for job in jobs:
-            process_content_job.delay(job.id)
-            logger.info("Dispatched job %d to worker", job.id)
+            ct = job.content_type or "article"
+            if ct in ("image", "pure_image"):
+                from app.tasks.content_tasks import process_image_job
+                process_image_job.delay(job.id)
+            elif ct == "video":
+                from app.tasks.content_tasks import process_video_job
+                process_video_job.delay(job.id)
+            else:
+                process_content_job.delay(job.id)
+            logger.info("Dispatched job %d (%s) to worker", job.id, ct)
         return {"dispatched": len(jobs)}
     finally:
         db.close()
@@ -77,9 +103,10 @@ def poll_queued_jobs():
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
 def sync_comments_for_published_articles(self):
-    """定时任务：对所有已发布且有 msg_data_id 的文章同步评论"""
+    """定时任务：按租户分组，对所有已发布且有 msg_data_id 的文章同步评论"""
     db = MysqlSessionLocal()
     try:
+        from collections import defaultdict
         from app.models.mysql_models import Article, WeChatComment, WeChatAccount
         from app.services.wechat_oauth_service import get_valid_token_sync
 
@@ -97,38 +124,52 @@ def sync_comments_for_published_articles(self):
         if not articles:
             return {"synced": 0, "articles": 0}
 
-        # 取第一个有凭据的公众号
-        account = (
-            db.query(WeChatAccount)
-            .filter(WeChatAccount.deleted_at.is_(None))
-            .first()
-        )
-        if not account:
-            logger.warning("No WeChat account found for comment sync")
-            return {"synced": 0, "articles": 0, "error": "no_account"}
-
-        token = get_valid_token_sync(db, account.id)
-        from app.services.wechat_comment_service import WeChatCommentService
-
-        svc = WeChatCommentService(token)
-        synced = 0
+        # 按租户分组文章
+        articles_by_tenant = defaultdict(list)
         for article in articles:
-            try:
-                new_count, _ = svc.sync_comments_to_db_sync(
-                    db, article.user_id or 1, oauth.id, article.msg_data_id,
-                )
-                if new_count > 0:
-                    db.query(WeChatComment).filter(
-                        WeChatComment.msg_id == article.msg_data_id,
-                        WeChatComment.article_id.is_(None),
-                    ).update({"article_id": article.id})
-                    db.commit()
-                    synced += new_count
-            except Exception as exc:
-                logger.warning("Sync comments for article %d failed: %s", article.id, exc)
+            tid = article.tenant_id or 0
+            articles_by_tenant[tid].append(article)
 
-        logger.info("Auto-sync comments: %d new comments from %d articles", synced, len(articles))
-        return {"synced": synced, "articles": len(articles)}
+        from app.services.wechat_comment_service import sync_comments_with_auto as _sync_comments
+
+        total_synced = 0
+        total_articles = 0
+
+        for tenant_id, tenant_articles in articles_by_tenant.items():
+            # 取该租户下的第一个活跃公众号
+            account = (
+                db.query(WeChatAccount)
+                .filter(
+                    WeChatAccount.tenant_id == tenant_id,
+                    WeChatAccount.deleted_at.is_(None),
+                )
+                .first()
+            )
+            if not account:
+                logger.warning("No WeChat account found for tenant %d, skipping %d articles",
+                               tenant_id, len(tenant_articles))
+                continue
+
+            for article in tenant_articles:
+                try:
+                    new_count, _ = _sync_comments(
+                        db, tenant_id, account.id, article.msg_data_id,
+                    )
+                    if new_count > 0:
+                        db.query(WeChatComment).filter(
+                            WeChatComment.msg_id == article.msg_data_id,
+                            WeChatComment.article_id.is_(None),
+                        ).update({"article_id": article.id})
+                        db.commit()
+                        total_synced += new_count
+                except Exception as exc:
+                    logger.warning("Sync comments for article %d (tenant %d) failed: %s",
+                                   article.id, tenant_id, exc)
+                total_articles += 1
+
+        logger.info("Auto-sync comments: %d new comments from %d articles (%d tenants)",
+                    total_synced, total_articles, len(articles_by_tenant))
+        return {"synced": total_synced, "articles": total_articles}
     except Exception as exc:
         logger.error("sync_comments_for_published_articles failed: %s", exc)
     finally:
@@ -163,29 +204,28 @@ def cleanup_old_assets():
 
 
 def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
-    """Create Article records from ContentVersions and save as WeChat drafts.
+    """Create Article records from ContentVersions and create PublishAttempts.
 
-    For auto-approved jobs, this converts generated ContentVersion data into
-    Article records and saves them to the WeChat draft box. Only saves as
-    draft — does NOT submit for full publish (服务号 publishing).
+    For each version and each configured account, creates a PublishAttempt record
+    that tracks the publish state per account independently.
     """
+    config = job.generation_config or {}
+    account_ids = config.get("account_ids", [job.account_id] if job.account_id else [])
+    publish_mode = config.get("publish_mode", "draft")
+
     for v in versions:
         if not v.body_markdown:
             logger.warning("ContentVersion %d has no body, skipping article creation", v.id)
             continue
 
-        # Get cover URL from version model_metadata if available
         cover_url = None
         if v.model_metadata and isinstance(v.model_metadata, dict):
             cover_url = v.model_metadata.get("cover_url")
 
-        # Final safety net: strip photography lines from body
         body = v.body_markdown or ""
-        # Step 1: Extract image keywords from [IMAGE:] markers and markdown alt text
         image_keywords = re.findall(r'keywords=([^,\]]+)', body)
         image_keywords.extend(re.findall(r'!\[([^\]]+)\]\([^)]+\)', body))
         body = re.sub(r'\[IMAGE:[^\]]*\]', '', body)
-        # Step 2: Remove lines matching image keywords or containing photography terms
         photo_kw = ['俯拍', '仰拍', '侧拍', '微距', '特写', '近景', '远景', '中景',
                     '暖光', '逆光', '侧光', '顶光', '底光', '打光', '布光',
                     '景深', '光圈', '快门', '45度']
@@ -195,11 +235,9 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
             if not s:
                 cleaned_lines.append(line)
                 continue
-            # Always preserve markdown image lines AND HTML img tags
             if re.match(r'^!\[.*\]\(.*\)$', s) or re.match(r'^<img\s+[^>]+/?>$', s, re.IGNORECASE):
                 cleaned_lines.append(line)
                 continue
-            # Remove if line matches any IMAGE keyword phrase
             if image_keywords:
                 skip = False
                 for kw in image_keywords:
@@ -208,7 +246,6 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
                         break
                 if skip:
                     continue
-            # Remove lines with 2+ photography terms
             if sum(1 for kw in photo_kw if kw in s) >= 2:
                 continue
             if re.search(r'(?:右下角|左下角|右上角|左上角).*(?:水印|文字|标志|logo)', s, re.IGNORECASE):
@@ -218,9 +255,10 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
 
         article = Article(
             task_id=f"job_{job.id}_v{v.id}_{uuid.uuid4().hex[:8]}",
+            tenant_id=job.tenant_id,
             user_id=job.created_by,
             topic=v.title or job.topic,
-            style=job.generation_config.get("style", "default") if job.generation_config else "default",
+            style=config.get("style", "default"),
             main_title=v.title,
             sub_title=(v.summary or "")[:200],
             content=body,
@@ -231,23 +269,71 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
         )
         db.add(article)
         db.flush()
-
-        # Link ContentVersion back to the Article
         v.article_id = article.id
 
-        # Save to WeChat draft box if an account is configured
-        if job.account_id:
-            try:
-                from app.services.wechat_publisher import save_article_as_draft
+        # Create PublishAttempt for each account
+        for aid in account_ids:
+            attempt = PublishAttempt(
+                tenant_id=job.tenant_id,
+                job_id=job.id,
+                account_id=aid,
+                idempotency_key=f"publish_{job.id}_{aid}_{v.id}",
+                mode=publish_mode,
+                status="pending",
+            )
+            db.add(attempt)
+            db.flush()
 
-                draft_result = save_article_as_draft(db, article, job.account_id)
-                media_id = draft_result.get("media_id", "")
-                logger.info("Article %d saved as WeChat draft, media_id=%s", article.id, media_id)
-                if media_id:
-                    article.publish_id = str(media_id)
-            except Exception as draft_err:
-                logger.warning("Failed to save article %d as WeChat draft: %s", article.id, draft_err)
-                article.error_message = str(draft_err)[:500]
+            try:
+                content_type = v.article_content_type or "image_text"
+
+                if content_type in ("video", "pure_image"):
+                    # Use content adapters for non-image_text types
+                    from app.services.content_adapters import get_publisher
+                    adapter = get_publisher(content_type)
+                    article_data = {
+                        "id": article.id,
+                        "title": v.title or article.topic,
+                        "summary": v.summary or "",
+                        "body_markdown": article.content or "",
+                        "image_urls": json.loads(article.images) if isinstance(article.images, str) else (article.images or []),
+                        "video_url": "",
+                        "publish_mode": publish_mode,
+                    }
+                    pub_result = adapter.publish(db, article_data, aid, tenant_id=job.tenant_id)
+                    media_id = pub_result.get("media_id", "")
+                    if media_id:
+                        article.publish_id = str(media_id)
+                        attempt.platform_media_id = str(media_id)
+                    attempt.status = "success"
+                elif publish_mode == "direct":
+                    from app.services.wechat_publisher import publish_article
+                    pub_result = publish_article(db, article, aid, mode="direct", tenant_id=job.tenant_id, actor_id=job.created_by or 0)
+                    logger.info("Article %d published directly to account %s, publish_id=%s",
+                                article.id, aid, pub_result.get("publish_id", ""))
+                    article.status = "publishing"
+                    article.phase = "PUBLISHING"
+                    if pub_result.get("publish_id"):
+                        article.publish_id = str(pub_result["publish_id"])
+                    elif pub_result.get("media_id"):
+                        article.publish_id = str(pub_result["media_id"])
+                    attempt.status = "publishing"
+                    attempt.platform_media_id = article.publish_id
+                else:
+                    from app.services.wechat_publisher import save_article_as_draft
+                    draft_result = save_article_as_draft(db, article, aid, tenant_id=job.tenant_id, actor_id=job.created_by or 0)
+                    media_id = draft_result.get("media_id", "")
+                    logger.info("Article %d saved as WeChat draft via account %s, media_id=%s",
+                                article.id, aid, media_id)
+                    if media_id:
+                        article.publish_id = str(media_id)
+                        attempt.platform_media_id = str(media_id)
+                    attempt.status = "success"
+            except Exception as pub_err:
+                logger.warning("Publish to account %s for article %d failed: %s", aid, article.id, pub_err)
+                attempt.status = "failed"
+                attempt.error_message = str(pub_err)[:500]
+                article.error_message = str(pub_err)[:500]
 
         db.commit()
 
@@ -278,27 +364,27 @@ def poll_publishing_articles(self):
         completed = 0
 
         for article in articles:
-            # 找到发布这篇文章所用的公众号
-            publish_info = article.publish_id or ""
-            # publish_id 格式可能是 "publish_id" 或 "media_id"
-            # 从 published_at 等字段找不到 account_id，需要从关联数据推断
-            # 退一步：尝试从 publish_id 匹配
-
-            # 遍历所有有凭据的公众号尝试获取 token
-            accounts = db.query(WeChatAccount).filter(
+            # 找到发布这篇文章所用的公众号（限定文章所属租户）
+            tid = article.tenant_id or 0
+            account = db.query(WeChatAccount).filter(
+                WeChatAccount.tenant_id == tid,
                 WeChatAccount.deleted_at.is_(None),
-            ).all()
+            ).first()
+
+            if not account:
+                logger.warning("No account for tenant %d in publish polling, skipping article %d",
+                               tid, article.id)
+                continue
 
             token = None
-            for acct in accounts:
-                try:
-                    token = get_valid_token_sync(db, acct.id)
-                    break
-                except Exception:
-                    continue
+            try:
+                token = get_valid_token_sync(db, account.id)
+            except Exception:
+                logger.warning("Failed to get token for account %d (tenant %d)", account.id, tid)
+                continue
 
             if not token:
-                logger.warning("No valid token for publish polling")
+                logger.warning("No valid token for publish polling, article %d", article.id)
                 continue
 
             try:
@@ -327,12 +413,8 @@ def poll_publishing_articles(self):
                     article.status = "published"
                     article.phase = "PUBLISHED"
 
-                    # 从 article 反查 tenant_id（WeChatAccount 有 tenant_id）
-                    from app.models.mysql_models import WeChatAccount as WxAcct
-                    acct = db.query(WxAcct).filter(
-                        WxAcct.deleted_at.is_(None),
-                    ).first()
-                    tenant_id = acct.tenant_id if acct else 1
+                    # 优先使用 article 自带的 tenant_id，退化到从 WeChatAccount 反查
+                    tenant_id = article.tenant_id or 1
 
                     db.commit()
 
@@ -374,10 +456,11 @@ def _sync_comments_after_publish(article_id: int, tenant_id: int, msg_data_id: s
                 return
 
             account = db_sync.query(WxAcct).filter(
+                WxAcct.tenant_id == tenant_id,
                 WxAcct.deleted_at.is_(None),
             ).first()
             if not account:
-                logger.warning("No account for post-publish comment sync")
+                logger.warning("No account for tenant %d in post-publish comment sync", tenant_id)
                 return
 
             from app.services.wechat_comment_service import sync_comments_with_auto as _sync_auto
@@ -407,3 +490,124 @@ def _sync_comments_after_publish(article_id: int, tenant_id: int, msg_data_id: s
         loop.run_until_complete(_do_sync())
     finally:
         loop.close()
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def handle_wechat_message(self, message_id: int):
+    """处理微信回调消息（关键词匹配+自动发送）"""
+    from app.services.wechat_message_handler import process_incoming_message
+
+    try:
+        process_incoming_message(message_id)
+    except Exception as exc:
+        logger.error("Handle message %d failed: %s", message_id, exc)
+        raise
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def execute_contact_delivery(self, delivery_id: int):
+    """Celery 任务：异步执行资料发送
+
+    注册: job_tasks.execute_contact_delivery
+    调用链: API POST /leads/{id}/deliveries → create_delivery()
+            → execute_contact_delivery.delay(delivery_id)
+
+    异常需向外抛出，不能返回 error 字典被标记为成功
+    """
+    import asyncio
+    from app.services.wechat_delivery_service import execute_delivery
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(execute_delivery(delivery_id))
+    except Exception as exc:
+        logger.error("Contact delivery %d failed: %s", delivery_id, exc)
+        raise  # Celery 必须收到异常才能标记为失败
+    finally:
+        loop.close()
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
+def sync_comments_and_create_leads(self, job_id: int, tenant_id: int, account_id: int, scope: str = "all", article_id: int = None):
+    """异步同步评论 + 自动创建线索（供评论线索工作台调用）"""
+    import asyncio
+    from app.services.wechat_lead_service import update_sync_job
+
+    db = MysqlSessionLocal()
+    try:
+        update_sync_job(db, job_id, "running")
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                _do_sync_and_create_leads(db, tenant_id, account_id, scope, article_id)
+            )
+        finally:
+            loop.close()
+
+        update_sync_job(db, job_id, "completed", result=result)
+        logger.info("Sync job %d completed: %s", job_id, result)
+        return result
+    except Exception as exc:
+        logger.error("Sync job %d failed: %s", job_id, exc)
+        update_sync_job(db, job_id, "failed", error_message=str(exc))
+        raise
+    finally:
+        db.close()
+
+
+async def _do_sync_and_create_leads(db, tenant_id: int, account_id: int, scope: str, article_id: int = None):
+    """执行同步并创建线索"""
+    from app.models.mysql_models import Article, WeChatAccount
+    from app.services.wechat_comment_service import _get_service
+
+    svc = await _get_service(db, account_id)
+
+    synced_articles = 0
+    total_new_comments = 0
+    total_new_leads = 0
+
+    if scope == "article" and article_id:
+        articles = db.query(Article).filter(
+            Article.id == article_id,
+            Article.msg_data_id.isnot(None),
+            Article.msg_data_id != "",
+        ).all()
+    else:
+        articles = db.query(Article).filter(
+            Article.msg_data_id.isnot(None),
+            Article.msg_data_id != "",
+        ).all()
+
+    for article in articles:
+        try:
+            new_ids, new_count, _ = await svc.sync_comments_to_db_v2(
+                db, tenant_id, account_id, article.msg_data_id,
+            )
+            if new_count > 0:
+                total_new_comments += new_count
+
+                # 关联 article_id
+                from app.models.mysql_models import WeChatComment
+                db.query(WeChatComment).filter(
+                    WeChatComment.msg_id == article.msg_data_id,
+                    WeChatComment.article_id.is_(None),
+                ).update({"article_id": article.id})
+                db.commit()
+
+                # 创建线索
+                from app.services.wechat_lead_service import create_leads_from_comments
+                created = create_leads_from_comments(db, tenant_id, account_id, new_ids)
+                total_new_leads += created
+
+            synced_articles += 1
+        except Exception as exc:
+            logger.warning("Sync article %d failed: %s", article.id, exc)
+            continue
+
+    return {
+        "synced_articles": synced_articles,
+        "new_comments": total_new_comments,
+        "new_leads": total_new_leads,
+    }

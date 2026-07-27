@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import type { FeedSource, FeedSourceArticle } from '@/api/types'
+import { sanitizeHtml } from '@/utils/sanitizer'
 
 const loading = ref(false)
 const sources = ref<FeedSource[]>([])
@@ -38,6 +39,30 @@ const showFetchResult = ref(false)
 // Article preview
 const previewArticle = ref<FeedSourceArticle | null>(null)
 const showPreview = ref(false)
+const currentImageIndex = ref(0)
+
+// Extract image URLs from markdown for gallery view
+const imageUrls = computed(() => {
+  const md = previewArticle.value?.body_markdown || ''
+  const urls: string[] = []
+  const regex = /!\[.*?\]\((.*?)\)/g
+  let m
+  while ((m = regex.exec(md)) !== null) {
+    urls.push(m[1])
+  }
+  return urls
+})
+const isImageOnly = computed(() => {
+  if (!previewArticle.value?.body_markdown) return false
+  const lines = previewArticle.value.body_markdown.trim().split('\n\n')
+  return lines.length > 0 && lines.every(l => /^!\[.*?\]\(.*?\)$/.test(l.trim()))
+})
+
+const thumbTrackRef = ref<HTMLElement | null>(null)
+function scrollThumbs(dir: number) {
+  if (!thumbTrackRef.value) return
+  thumbTrackRef.value.scrollBy({ left: dir * 160, behavior: 'smooth' })
+}
 
 const sourceTypeLabels: Record<string, string> = {
   official_account: '公众号',
@@ -173,20 +198,27 @@ async function saveManualArticle() {
 
 function renderMarkdown(md: string): string {
   if (!md) return ''
-  const boldItalic = md
+  let html = md
     .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
-  const images = boldItalic.replace(
+  // Convert markdown images first
+  html = html.replace(
     /!\[(.*?)\]\((.*?)\)/g,
-    '<figure class="preview-figure"><img src="$2" alt="$1" loading="lazy"/><figcaption>$1</figcaption></figure>'
+    '<figure class="preview-figure" style="margin:12px auto;text-align:center;background:#f8f8f8;padding:8px;border-radius:8px;max-width:640px;overflow:hidden;"><img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer" style="max-width:640px;width:100%;height:auto;border-radius:4px;display:block;margin:0 auto;"/><figcaption style="margin-top:6px;font-size:12px;color:#909399;">$1</figcaption></figure>'
   )
-  const headers = images
+  // Headers
+  html = html
     .replace(/^### (.+)$/gm, '<h3>$1</h3>')
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
     .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-  const links = headers.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-  const paragraphs = links.split(/\n\n+/).map(block => {
+  // Links (but not inside already-generated HTML tags)
+  html = html.replace(
+    /\[([^\[\]]+?)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener">$1</a>'
+  )
+  // Split into blocks by double newlines
+  const blocks = html.split(/\n\n+/).map(block => {
     const t = block.trim()
     if (!t) return ''
     if (t.startsWith('<h') || t.startsWith('<figure')) return t
@@ -196,7 +228,7 @@ function renderMarkdown(md: string): string {
     }
     return `<p>${t.replace(/\n/g, '<br/>')}</p>`
   }).join('\n')
-  return paragraphs
+  return sanitizeHtml(blocks)
 }
 
 onMounted(load)
@@ -344,12 +376,36 @@ onMounted(load)
     </el-dialog>
 
     <!-- Preview Dialog -->
-    <el-dialog v-model="showPreview" title="文章预览" width="720px" top="3vh">
+    <el-dialog v-model="showPreview" title="文章预览" width="720px" top="3vh" @opened="currentImageIndex = 0">
       <div v-if="previewArticle" class="preview-content">
         <h1 class="preview-title">{{ previewArticle.title }}</h1>
         <div v-if="previewArticle.summary" class="preview-summary">{{ previewArticle.summary }}</div>
-        <div v-if="previewArticle.word_count" class="preview-meta">{{ previewArticle.word_count }} 字</div>
-        <div class="rendered-content" v-html="renderMarkdown(previewArticle.body_markdown || '')"></div>
+        <div v-if="previewArticle.word_count && !isImageOnly" class="preview-meta">{{ previewArticle.word_count }} 字</div>
+
+        <!-- Gallery view for image-only articles -->
+        <div v-if="isImageOnly && imageUrls.length" class="image-gallery">
+          <div class="gallery-main">
+            <img :src="imageUrls[currentImageIndex]" alt="preview" referrerpolicy="no-referrer" />
+          </div>
+          <div class="gallery-thumbs">
+            <button class="thumb-scroll thumb-prev" @click="scrollThumbs(-1)">‹</button>
+            <div class="thumb-track" ref="thumbTrackRef">
+              <div
+                v-for="(url, idx) in imageUrls"
+                :key="idx"
+                class="thumb-item"
+                :class="{ active: idx === currentImageIndex }"
+                @click="currentImageIndex = idx"
+              >
+                <img :src="url" alt="" referrerpolicy="no-referrer" />
+              </div>
+            </div>
+            <button class="thumb-scroll thumb-next" @click="scrollThumbs(1)">›</button>
+          </div>
+        </div>
+
+        <!-- Normal markdown render for text articles -->
+        <div v-else class="rendered-content" v-html="renderMarkdown(previewArticle.body_markdown || '')"></div>
       </div>
     </el-dialog>
 
@@ -562,21 +618,121 @@ onMounted(load)
 }
 
 .preview-figure {
-  margin: 16px 0;
+  margin: 12px auto;
   text-align: center;
   background: #f8f8f8;
-  padding: 12px;
+  padding: 8px;
   border-radius: 8px;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .preview-figure img {
-  max-width: 100%;
+  max-width: 640px;
+  width: 100%;
+  height: auto;
   border-radius: 4px;
+  display: block;
+  margin: 0 auto;
 }
 
 .preview-figure figcaption {
   margin-top: 6px;
   font-size: 12px;
   color: #909399;
+}
+
+/* Gallery view for image-only articles */
+.image-gallery {
+  width: 100%;
+}
+
+.gallery-main {
+  width: 100%;
+  background: #f0f0f0;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
+.gallery-main img {
+  max-width: 100%;
+  max-height: 65vh;
+  width: auto;
+  height: auto;
+  display: block;
+  object-fit: contain;
+}
+
+.gallery-thumbs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 0;
+}
+
+.thumb-track {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scroll-behavior: smooth;
+  flex: 1;
+  padding: 4px 0;
+}
+
+.thumb-track::-webkit-scrollbar {
+  height: 4px;
+}
+.thumb-track::-webkit-scrollbar-thumb {
+  background: #ccc;
+  border-radius: 2px;
+}
+
+.thumb-item {
+  flex: 0 0 80px;
+  height: 60px;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color 0.2s;
+  opacity: 0.6;
+}
+
+.thumb-item.active {
+  border-color: #07c160;
+  opacity: 1;
+}
+
+.thumb-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.thumb-scroll {
+  flex: 0 0 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid #ddd;
+  background: #fff;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  transition: all 0.2s;
+}
+
+.thumb-scroll:hover {
+  background: #f5f5f5;
+  border-color: #bbb;
 }
 </style>

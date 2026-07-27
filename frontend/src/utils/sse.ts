@@ -30,6 +30,8 @@ export class SseConnection {
       this.disconnect()
     }
 
+    // HttpOnly cookie 自动随 EventSource 发送（同域请求）
+    // localStorage token 作为兜底（兼容旧版）
     const token = localStorage.getItem('access_token')
     const connectUrl = token ? `${this.url}?token=${token}` : this.url
 

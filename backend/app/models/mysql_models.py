@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint, func
+from sqlalchemy import Column, Integer, String, DateTime, Date, Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint, func, Float
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import relationship
 from app.database import MysqlBase
 
@@ -75,6 +76,9 @@ class WeChatAccount(MysqlBase):
     auth_mode = Column(String(64), nullable=False)
     status = Column(String(64), nullable=False, default="active")
     capabilities = Column(JSON, nullable=True)
+    callback_key = Column(String(64), nullable=True, unique=True, comment="回调URL中使用的不可枚举标识")
+    callback_token = Column(String(128), nullable=True, comment="微信回调验证token")
+    callback_aes_key = Column(String(256), nullable=True, comment="微信回调AESKey（安全模式）")
     last_health_at = Column(DateTime, nullable=True)
     last_health_error = Column(Text, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
@@ -83,6 +87,7 @@ class WeChatAccount(MysqlBase):
 
     __table_args__ = (
         Index("ix_wechat_accounts_tenant_app", "tenant_id", "app_id"),
+        Index("ix_wechat_accounts_callback_key", "callback_key"),
     )
 
 
@@ -100,6 +105,7 @@ class Article(MysqlBase):
     __tablename__ = "articles"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
     task_id = Column(String(128), unique=True, nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     topic = Column(Text, nullable=True)
@@ -113,13 +119,173 @@ class Article(MysqlBase):
     cover_image = Column(String(512), nullable=True)
     images = Column(JSON, nullable=True)
     footer_template = Column(Text, nullable=True)
-    msg_data_id = Column(String(128), nullable=True, comment="微信发布后返回的 msg_data_id，用于同步评论")
-    publish_id = Column(String(128), nullable=True, comment="微信发布任务 ID（publish_id），用于查询发布状态")
+    msg_data_id = Column(String(128), nullable=True, comment="微信发布后返回的 msg_data_id")
+    publish_id = Column(String(128), nullable=True, comment="微信发布任务 ID")
     status = Column(String(64), nullable=False, default="pending")
     phase = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
+
+    # 微信发布信息
+    wechat_account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True, index=True)
+    wechat_publish_time = Column(DateTime, nullable=True)
+
+    # 阅读指标缓存（最新值，历史存 ArticleMetrics）
+    latest_read_count = Column(Integer, default=0)
+    latest_like_count = Column(Integer, default=0)
+    latest_share_count = Column(Integer, default=0)
+    latest_comment_count = Column(Integer, default=0)
+    latest_fav_count = Column(Integer, default=0)
+    metrics_updated_at = Column(DateTime, nullable=True)
+
+    # 质量评分缓存（最新值，历史存 ArticleQualityEvaluation）
+    latest_quality_score = Column(Integer, nullable=True)
+    quality_evaluated_at = Column(DateTime, nullable=True)
+
+    # 优化版本关系
+    source_article_id = Column(Integer, ForeignKey("articles.id"), nullable=True, index=True)
+    optimization_generation = Column(Integer, default=0)
+    optimization_status = Column(String(32), nullable=True)
+    manual_optimization_disabled = Column(Boolean, default=False)
+
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_articles_tenant_status", "tenant_id", "status"),
+    )
+
+
+class ArticleMetrics(MysqlBase):
+    """阅读指标时序表 — 每日快照"""
+    __tablename__ = "article_metrics"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=False, index=True)
+    wechat_account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
+    metric_date = Column(Date, nullable=False)
+    fetched_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    read_count = Column(Integer, default=0)
+    like_count = Column(Integer, default=0)
+    share_count = Column(Integer, default=0)
+    comment_count = Column(Integer, default=0)
+    add_to_fav_count = Column(Integer, default=0)
+    exposure_count = Column(Integer, nullable=True)
+    read_user_count = Column(Integer, nullable=True)
+
+    raw_payload = Column(JSON, nullable=True)
+    sync_status = Column(String(32), default="pending")
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("article_id", "metric_date", name="uq_article_metrics_date"),
+        Index("ix_article_metrics_date", "metric_date"),
+    )
+
+
+class ArticleQualityEvaluation(MysqlBase):
+    """AI 质量评分记录表"""
+    __tablename__ = "article_quality_evaluations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=False, index=True)
+
+    content_score = Column(Integer, nullable=True)
+    readability_score = Column(Integer, nullable=True)
+    structure_score = Column(Integer, nullable=True)
+    value_score = Column(Integer, nullable=True)
+    title_score = Column(Integer, nullable=True)
+    title_consistency_score = Column(Integer, nullable=True)
+    credibility_score = Column(Integer, nullable=True)
+    overall_score = Column(Integer, nullable=True)
+
+    issues = Column(JSON, nullable=True)
+    suggestions = Column(JSON, nullable=True)
+    rewrite_recommended = Column(Boolean, default=False)
+    rewrite_scope = Column(String(64), nullable=True)
+    factual_risk = Column(String(32), nullable=True)
+    brand_risk = Column(String(32), nullable=True)
+    confidence = Column(Float, nullable=True)
+
+    model_name = Column(String(128), nullable=False)
+    model_version = Column(String(64), nullable=True)
+    prompt_version = Column(String(64), nullable=True)
+    input_content_hash = Column(String(64), nullable=True, index=True)
+    raw_response = Column(JSON, nullable=True)
+
+    status = Column(String(32), nullable=False, default="pending")
+    error_message = Column(Text, nullable=True)
+    evaluated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_quality_eval_article", "article_id", "status"),
+    )
+
+
+class ArticleOptimization(MysqlBase):
+    """文章优化记录表"""
+    __tablename__ = "article_optimizations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    source_article_id = Column(Integer, ForeignKey("articles.id"), nullable=False, index=True)
+    optimized_article_id = Column(Integer, ForeignKey("articles.id"), nullable=True)
+
+    trigger_type = Column(String(32), nullable=False, default="auto")
+    trigger_evaluation_id = Column(Integer, nullable=True)
+    optimization_type = Column(String(64), nullable=False)
+    optimization_generation = Column(Integer, default=1)
+    optimization_instruction = Column(Text, nullable=True)
+
+    model_name = Column(String(128), nullable=True)
+    model_version = Column(String(64), nullable=True)
+    prompt_version = Column(String(64), nullable=True)
+    change_summary = Column(Text, nullable=True)
+
+    status = Column(String(32), nullable=False, default="created")
+    reviewer_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    review_comment = Column(Text, nullable=True)
+
+    published_at = Column(DateTime, nullable=True)
+    comparison_result = Column(String(32), nullable=True)
+    comparison_summary = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_article_optimizations_status", "status"),
+    )
+
+
+class TaskExecutionLog(MysqlBase):
+    """自动任务执行日志"""
+    __tablename__ = "task_execution_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_name = Column(String(128), nullable=False, index=True)
+    task_id = Column(String(128), nullable=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=True)
+
+    status = Column(String(32), nullable=False, default="running")
+    started_at = Column(DateTime, nullable=False, server_default=func.now())
+    finished_at = Column(DateTime, nullable=True)
+    retry_count = Column(Integer, default=0)
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    extra_data = Column(JSON, nullable=True, comment="任务附加数据（原 metadata，因 SQLAlchemy 保留字改名）")
+
+    __table_args__ = (
+        Index("ix_task_log_name_status", "task_name", "status"),
+    )
 
 
 class AgentLog(MysqlBase):
@@ -304,9 +470,9 @@ class FeedSourceArticle(MysqlBase):
     feed_source_id = Column(Integer, ForeignKey("feed_sources.id"), nullable=False)
     title = Column(String(255), nullable=True)
     article_url = Column(String(512), nullable=True)
-    body_markdown = Column(Text, nullable=True)
-    body_html = Column(Text, nullable=True)
-    summary = Column(Text, nullable=True)
+    body_markdown = Column(MEDIUMTEXT, nullable=True)
+    body_html = Column(MEDIUMTEXT, nullable=True)
+    summary = Column(MEDIUMTEXT, nullable=True)
     cover_image_url = Column(String(512), nullable=True)
     published_at = Column(DateTime, nullable=True)
     word_count = Column(Integer, nullable=True)
@@ -397,6 +563,41 @@ class AssetUsage(MysqlBase):
 
 
 # ============================================================
+# 内容素材 — 图片/视频的生成素材存这里，不塞 Article 表
+# ============================================================
+
+
+class ContentAsset(MysqlBase):
+    """内容素材：纯图片/视频任务产生的各类中间和最终素材"""
+    __tablename__ = "content_assets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    job_id = Column(Integer, ForeignKey("content_jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    content_type = Column(String(32), nullable=False, default="image", comment="image / video")
+    asset_type = Column(String(64), nullable=False, comment="background_image / final_image / storyboard_image / audio / subtitle / video / cover / script")
+    storage_key = Column(String(512), nullable=False, comment="MinIO 对象存储 key")
+    file_format = Column(String(16), nullable=True, comment="jpg / png / mp3 / mp4 / srt")
+    file_size = Column(Integer, nullable=True, comment="字节数")
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    duration_sec = Column(Integer, nullable=True, comment="音频/视频时长（秒）")
+    sort_order = Column(Integer, nullable=False, default=0, comment="分镜序号等排序")
+    version = Column(Integer, nullable=False, default=1, comment="版本号")
+    phase = Column(String(64), nullable=False, default="pending", comment="生成阶段: pending/generating/completed/failed")
+    error_message = Column(Text, nullable=True)
+    generation_config = Column(JSON, nullable=True, comment="生成参数快照")
+    parent_asset_id = Column(Integer, ForeignKey("content_assets.id", ondelete="SET NULL"), nullable=True, comment="父版本 ID，用于版本链")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_content_assets_job_type", "job_id", "asset_type"),
+    )
+
+
+# ============================================================
 # 阶段二：多源仿写
 # ============================================================
 
@@ -438,6 +639,7 @@ class ImitationTask(MysqlBase):
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     pool_id = Column(Integer, ForeignKey("imitation_pools.id", ondelete="SET NULL"), nullable=True)
     name = Column(String(255), nullable=False, comment="任务名称")
+    title = Column(String(255), nullable=True, comment="用户指定的标题（不为空则直接使用，不仿写标题）")
     # 任务策略
     strategy = Column(String(64), nullable=False, default="random",
                       comment="仿写策略: random=随机选源, round_robin=轮流, exhaust=全部仿写完")
@@ -524,6 +726,7 @@ class WeChatComment(MysqlBase):
         Index("ix_wechat_comments_account", "account_id"),
         Index("ix_wechat_comments_article", "article_id"),
         Index("ix_wechat_comments_status", "status"),
+        UniqueConstraint("account_id", "comment_id", name="uq_comment_per_account"),
     )
 
 
@@ -610,6 +813,8 @@ class ScheduledTask(MysqlBase):
 
     # 投喂源配置（直接引用投喂源，替代仿写池）
     feed_source_ids = Column(JSON, nullable=True)
+    feed_source_id = Column(Integer, ForeignKey("feed_sources.id"), nullable=True, comment="具体选中的投喂源（用于选文章）")
+    feed_article_ids = Column(JSON, nullable=True, comment="选中投喂源中的具体文章 ID 列表")
 
     # 知识库
     knowledge_base_ids = Column(JSON, nullable=True)
@@ -631,6 +836,14 @@ class ScheduledTask(MysqlBase):
     publish_mode = Column(String(32), default="draft", comment="draft=存草稿箱, direct=直接发布")
     image_source = Column(String(64), default="pexels", comment="图片来源: pexels/local/DASHSCOPE")
     footer_template = Column(Text, nullable=True)
+    content_type = Column(String(32), default="article", comment="article/image/video")
+    # 配图方式列表（JSON 数组）
+    enabled_image_methods = Column(JSON, nullable=True, comment="配图方式列表")
+    enable_watermark = Column(Boolean, default=False, comment="是否启用图片水印")
+
+    # 仿写（用于 writing_mode=imitation）
+    pool_id = Column(Integer, ForeignKey("imitation_pools.id"), nullable=True)
+    strategy = Column(String(32), nullable=True, comment="random / round_robin / exhaust")
 
     # 统计
     total_generated = Column(Integer, default=0)
@@ -638,6 +851,21 @@ class ScheduledTask(MysqlBase):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_scheduled_tasks_tenant", "tenant_id"),
+    )
+
+
+class ScheduledTaskSlot(MysqlBase):
+    """定时任务的文章槽配置 — 替代 ScheduledTask.article_slots JSON"""
+    __tablename__ = "scheduled_task_slots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    content_type = Column(String(32), nullable=False, default="image_text", comment="image_text / video / pure_image")
+    publish_domain = Column(String(32), nullable=False, default="public", comment="public / private")
 
 
 class TenantWatermarkConfig(MysqlBase):
@@ -734,3 +962,330 @@ class WeChatCommentAutoConfig(MysqlBase):
 
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CommentLead(MysqlBase):
+    """评论线索 — 评论到私域转化的核心实体"""
+    __tablename__ = "comment_leads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    comment_id = Column(Integer, ForeignKey("wechat_comments.id"), nullable=False)
+    openid = Column(String(128), nullable=False, comment="评论用户 OpenID")
+
+    # 意图分析（只存 comment_leads，不写 wechat_comments）
+    intent_type = Column(String(32), nullable=True, comment="purchase/price/cooperation/after_sale/interaction/spam")
+    intent_score = Column(Integer, nullable=True, comment="置信度 0-100")
+    intent_analyzed_at = Column(DateTime, nullable=True)
+
+    # 公开回复
+    reply_type = Column(String(16), nullable=True, comment="normal/guide")
+    reply_content = Column(Text, nullable=True, comment="公开回复内容")
+    replied_at = Column(DateTime, nullable=True)
+
+    # 私信资格缓存
+    eligibility_cache = Column(JSON, nullable=True, comment="{eligible, reason_code, reason_text, ...}")
+
+    # 三态资格（P1.3）
+    eligibility_status = Column(String(16), nullable=True, comment="eligible/ineligible/unknown")
+    eligibility_reason_code = Column(String(64), nullable=True)
+    eligibility_reason_text = Column(String(255), nullable=True)
+    eligibility_recommended_action = Column(String(64), nullable=True)
+    eligibility_checked_at = Column(DateTime, nullable=True)
+    eligibility_expires_at = Column(DateTime, nullable=True)
+    eligibility_source = Column(String(32), nullable=True, comment="interaction_cache/wechat_api/fallback")
+
+    # P2 引导关键词
+    guide_keyword = Column(String(128), nullable=True, comment="引导回复关键词（原文）")
+    guide_keyword_normalized = Column(String(128), nullable=True, comment="引导关键词（标准化）")
+    guide_sent_at = Column(DateTime, nullable=True, comment="引导回复发送时间")
+    auto_send_on_message = Column(Boolean, default=False, nullable=False, comment="用户发送消息后自动发送资料")
+    auto_send_package_id = Column(Integer, nullable=True, comment="自动发送的资料包ID")
+
+    # 跟进状态
+    status = Column(String(32), nullable=False, default="pending_reply",
+                    comment="pending_reply/awaiting_user/eligible/contact_sent/converted/closed/failed/manual_review")
+
+    # 分配
+    assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True)
+    remark = Column(Text, nullable=True)
+
+    # 关联资料包
+    contact_package_id = Column(Integer, nullable=True)
+
+    last_action_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "comment_id", name="uq_lead_comment_per_account"),
+        Index("ix_lead_tenant_status", "tenant_id", "status"),
+        Index("ix_lead_account_openid", "account_id", "openid"),
+        Index("ix_lead_assigned", "assigned_to"),
+    )
+
+
+class SyncJob(MysqlBase):
+    """异步同步任务状态"""
+    __tablename__ = "sync_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, nullable=False, comment="同步的公众号 ID")
+    job_type = Column(String(32), nullable=False, default="sync_comments", comment="任务类型")
+    scope = Column(String(32), nullable=False, default="all", comment="all/article")
+    article_id = Column(Integer, nullable=True, comment="单篇文章 ID（scope=article）")
+    status = Column(String(16), nullable=False, default="pending", comment="pending/running/completed/failed")
+    result = Column(JSON, nullable=True, comment="完成结果 {new_leads, synced_articles, ...}")
+    error_message = Column(Text, nullable=True)
+    celery_task_id = Column(String(128), nullable=True, comment="Celery 任务 ID")
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_sync_jobs_tenant_status", "tenant_id", "status"),
+    )
+
+
+class ConversationMessage(MysqlBase):
+    """微信回调消息记录 — 用户向公众号发送的消息"""
+    __tablename__ = "conversation_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    openid = Column(String(128), nullable=False, comment="用户 OpenID")
+    direction = Column(String(8), nullable=False, default="inbound", comment="inbound/outbound")
+
+    # 消息类型
+    message_type = Column(String(32), nullable=False, default="text", comment="text/image/voice/video/event")
+    content = Column(Text, nullable=True, comment="消息内容（文本消息）")
+
+    # 微信消息标识
+    msg_id = Column(String(128), nullable=True, comment="微信 MsgId（文本消息有）")
+    event_fingerprint = Column(String(64), nullable=True, comment="事件去重指纹（无 MsgId 时使用）")
+    event_type = Column(String(64), nullable=True, comment="事件类型（event 消息）")
+    event_key = Column(String(128), nullable=True, comment="事件KEY")
+
+    # 时间
+    create_time = Column(DateTime, nullable=True, comment="微信侧消息时间")
+    received_at = Column(DateTime, nullable=False, server_default=func.now(), comment="系统接收时间")
+
+    # 处理状态
+    processing_status = Column(String(32), nullable=False, default="received",
+                                comment="received/queued/processing/processed/ignored/failed/manual_review_required")
+    processing_error = Column(Text, nullable=True)
+    matched_lead_id = Column(Integer, nullable=True, comment="匹配到的线索ID")
+    delivery_id = Column(Integer, nullable=True, comment="创建的发送任务ID")
+
+    raw_xml = Column(JSON, nullable=True, comment="原始 XML 解析后的 JSON")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_conv_msg_account_openid", "account_id", "openid"),
+        Index("ix_conv_msg_status", "processing_status"),
+        Index("ix_conv_msg_matched_lead", "matched_lead_id"),
+        UniqueConstraint("account_id", "msg_id", name="uq_conv_msg_id"),
+        UniqueConstraint("account_id", "event_fingerprint", name="uq_conv_event_fp"),
+    )
+
+
+# ============================================================
+# P2 用户互动状态
+# ============================================================
+
+
+class WeChatUserInteraction(MysqlBase):
+    """用户互动状态 — 跟踪关注、会话窗口、最后互动时间"""
+    __tablename__ = "wechat_user_interactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    openid = Column(String(128), nullable=False, comment="用户 OpenID")
+
+    # 关注状态
+    is_following = Column(Boolean, default=False, nullable=False)
+    follow_time = Column(DateTime, nullable=True)
+    unfollow_time = Column(DateTime, nullable=True)
+
+    # 最后互动时间
+    last_inbound_at = Column(DateTime, nullable=True, comment="最后用户消息时间")
+    last_text_at = Column(DateTime, nullable=True, comment="最后文本消息时间")
+    last_event_at = Column(DateTime, nullable=True, comment="最后事件时间")
+
+    # 会话窗口
+    session_status = Column(String(16), nullable=False, default="none",
+                            comment="none/active/expired")
+    session_started_at = Column(DateTime, nullable=True)
+    session_expires_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "openid", name="uq_interaction_account_openid"),
+        Index("ix_interaction_tenant", "tenant_id"),
+    )
+
+
+# ============================================================
+# P1.1 联系资料包
+# ============================================================
+
+
+class ContactPackage(MysqlBase):
+    """联系资料包 — 统一配置联系文案、微信号、电话和二维码"""
+    __tablename__ = "contact_packages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    name = Column(String(128), nullable=False, comment="资料包名称")
+
+    description = Column(String(255), nullable=True)
+
+    # 联系方式
+    contact_name = Column(String(64), nullable=True)
+    wechat_id = Column(String(64), nullable=True)
+    phone = Column(String(32), nullable=True)
+    text_content = Column(Text, nullable=True, comment="发送给用户的欢迎语/联系文案")
+
+    # 二维码
+    qr_asset_id = Column(Integer, nullable=True, comment="本地素材 ID（FK → assets.id）")
+
+    # 状态
+    is_default = Column(Boolean, default=False, nullable=False)
+    is_enabled = Column(Boolean, default=False, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+    # 统计
+    usage_count = Column(Integer, default=0, nullable=False)
+
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "account_id", "name", name="uq_pkg_tenant_account_name"),
+        Index("ix_pkg_tenant_account", "tenant_id", "account_id"),
+    )
+
+
+# ============================================================
+# P1.2 微信素材管理
+# ============================================================
+
+
+class WechatMediaAsset(MysqlBase):
+    """微信素材标识 — 管理本地资产与微信 media_id 的映射"""
+    __tablename__ = "wechat_media_assets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    asset_id = Column(Integer, nullable=False, comment="本地资产 ID（FK → assets.id）")
+
+    media_type = Column(String(32), nullable=False, default="image")
+    media_scope = Column(String(16), nullable=False, default="temporary", comment="temporary/permanent")
+    media_id = Column(String(128), nullable=True, comment="微信素材 media_id")
+    status = Column(String(16), nullable=False, default="missing",
+                    comment="missing/pending/uploading/ready/expired/failed")
+    is_mock = Column(Boolean, default=False, nullable=False, comment="是否为 mock 模式")
+
+    uploaded_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    last_error_message = Column(Text, nullable=True)
+    response_snapshot = Column(JSON, nullable=True, comment="微信原始返回")
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "account_id", "asset_id", "media_type",
+                         name="uq_media_asset_per_account"),
+        Index("ix_media_account_status", "account_id", "status"),
+    )
+
+
+# ============================================================
+# P1.4 资料发送任务
+# ============================================================
+
+
+class ContactDelivery(MysqlBase):
+    """资料发送任务 — 分步骤跟踪发送结果"""
+    __tablename__ = "contact_deliveries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    lead_id = Column(Integer, ForeignKey("comment_leads.id"), nullable=True)
+    openid = Column(String(128), nullable=False)
+    package_id = Column(Integer, nullable=True)
+
+    # 幂等
+    idempotency_key = Column(String(128), nullable=False)
+    delivery_mode = Column(String(16), nullable=False, default="live", comment="live/mock")
+
+    # 状态
+    status = Column(String(32), nullable=False, default="pending",
+                    comment="pending/checking_eligibility/preparing_media/sending_text/sending_qr/success/partial_failed/failed/ineligible/cancelled")
+
+    # 快照
+    package_snapshot = Column(JSON, nullable=True)
+    eligibility_snapshot = Column(JSON, nullable=True)
+
+    # 文本步骤
+    text_status = Column(String(16), nullable=True, default=None,
+                         comment="pending/processing/success/failed/skipped")
+    text_attempts = Column(Integer, default=0, nullable=False)
+    text_error_code = Column(String(64), nullable=True)
+    text_error_message = Column(Text, nullable=True)
+    text_sent_at = Column(DateTime, nullable=True)
+
+    # 二维码步骤
+    qr_status = Column(String(16), nullable=True, default=None,
+                        comment="pending/processing/success/failed/skipped")
+    qr_attempts = Column(Integer, default=0, nullable=False)
+    qr_error_code = Column(String(64), nullable=True)
+    qr_error_message = Column(Text, nullable=True)
+    qr_sent_at = Column(DateTime, nullable=True)
+
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_delivery_idempotency"),
+        Index("ix_delivery_lead", "lead_id"),
+        Index("ix_delivery_status", "status"),
+    )
+
+
+class ContactDeliveryAttempt(MysqlBase):
+    """发送尝试记录 — 每次尝试的独立记录"""
+    __tablename__ = "contact_delivery_attempts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    delivery_id = Column(Integer, ForeignKey("contact_deliveries.id", ondelete="CASCADE"), nullable=False)
+    step = Column(String(16), nullable=False, comment="text/qr")
+    attempt_no = Column(Integer, nullable=False)
+
+    status = Column(String(16), nullable=False, default="processing",
+                    comment="processing/success/failed")
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    response_snapshot = Column(JSON, nullable=True)
+
+    started_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    created_by = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_attempt_delivery", "delivery_id"),
+    )

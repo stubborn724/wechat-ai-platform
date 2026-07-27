@@ -90,7 +90,7 @@ class WeChatCommentService:
         return await self._post("/cgi-bin/comment/markelect", {
             "msg_data_id": msg_data_id,
             "index": index,
-            "comment_id": int(comment_id),
+            "user_comment_id": int(comment_id),
         })
 
     async def unmark_favorite(self, msg_data_id: str, comment_id: str, index: int = 0) -> dict:
@@ -98,7 +98,7 @@ class WeChatCommentService:
         return await self._post("/cgi-bin/comment/unmarkelect", {
             "msg_data_id": msg_data_id,
             "index": index,
-            "comment_id": int(comment_id),
+            "user_comment_id": int(comment_id),
         })
 
     # ------------------------------------------------------------------
@@ -292,7 +292,9 @@ class WeChatCommentService:
 
 async def _get_service(db: Session, account_id: int) -> "WeChatCommentService":
     """从账号获取 access_token（使用 AppID + AppSecret）"""
+    from app.config import settings
     from app.models.mysql_models import AccountCredential, WeChatAccount
+    from app.services.encryption_service import derive_key, decrypt_secret
     import httpx
 
     # 从 AppID + AppSecret 直接获取 access_token
@@ -306,7 +308,8 @@ async def _get_service(db: Session, account_id: int) -> "WeChatCommentService":
         ).first()
         if not cred:
             raise RuntimeError(f"Account {account_id} has no credential configured")
-        app_secret = cred.encrypted_secret
+        key = derive_key(settings.credential_key)
+        app_secret = decrypt_secret(cred.encrypted_secret, key)
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
                 "https://api.weixin.qq.com/cgi-bin/token",

@@ -61,25 +61,72 @@ STREAM_CHUNK_TIMEOUT = 30.0
 
 
 def _parse_json_response(text: str) -> dict:
-    """Extract the first JSON object from ``text``.
+    """Extract JSON from ``text``.
 
-    Handles both raw JSON and markdown-fenced blocks (`` ```json ... ``` ``).
+    Handles markdown-fenced blocks, both object ``{...}`` and array ``[...]``
+    top-level values, and pure JSON strings.
     """
-    # Try to extract a fenced JSON block first
+    # Strip markdown code fences
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if match:
         text = match.group(1).strip()
 
-    # If still not pure JSON, look for the first { ... } spanning the text
-    if not text.startswith("{"):
-        brace_start = text.find("{")
-        if brace_start != -1:
-            text = text[brace_start:]
-        brace_end = text.rfind("}")
-        if brace_end != -1:
-            text = text[: brace_end + 1]
+    # Try parsing as-is first (fast path)
+    text = text.strip()
+    try:
+        result = json.loads(text)
+        # Normalise array → object with "sections" key
+        if isinstance(result, list):
+            return {"sections": result}
+        return result
+    except json.JSONDecodeError:
+        pass
 
-    return json.loads(text)
+    # Fallback: find the outermost { ... } or [ ... ]
+    if text.startswith("{"):
+        brace_start, brace_end = 0, text.rfind("}")
+    elif text.startswith("["):
+        # Array: find matching brackets
+        brace_start = 0
+        depth = 0
+        brace_end = -1
+        for i, ch in enumerate(text):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    brace_end = i + 1
+                    break
+        if brace_end == -1:
+            raise json.JSONDecodeError("Unmatched brackets", text, 0)
+    else:
+        brace_start = text.find("{")
+        if brace_start == -1:
+            brace_start = text.find("[")
+        if brace_start == -1:
+            raise json.JSONDecodeError("No JSON found", text, 0)
+        if text[brace_start] == "{":
+            brace_end = text.rfind("}") + 1
+        else:
+            depth = 0
+            brace_end = -1
+            for i in range(brace_start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = i + 1
+                        break
+            if brace_end == -1:
+                raise json.JSONDecodeError("Unmatched brackets", text, 0)
+
+    text = text[brace_start:brace_end]
+    result = json.loads(text)
+    if isinstance(result, list):
+        return {"sections": result}
+    return result
 
 
 def _build_outline_text(state: ArticleState) -> str:
@@ -155,6 +202,7 @@ async def _call_llm_with_streaming(
 
 
 async def agent1_generate_title_options(state: ArticleState) -> ArticleState:
+    print(f"  ▶ agent1: 生成标题方案...")
     """Call the LLM to generate 6 title options for the given topic/style."""
     if state.title_options:
         # Already have titles — skip
@@ -199,12 +247,18 @@ async def agent2_generate_outline(
     state: ArticleState,
     stream_handler: Optional[Callable[[str], None]] = None,
 ) -> ArticleState:
+    print(f"  ▶ agent2: 生成大纲...")
     """Stream an article outline from the LLM based on the selected title."""
     if not state.title:
         state.error = "No title selected before outline generation"
         return state
 
     style_section = get_style_prompt(state.style or "")
+    section_count = (
+        str(len(state.layout_template.sections))
+        if state.layout_template and state.layout_template.sections
+        else "4-6"
+    )
     prompt = AGENT2_OUTLINE_PROMPT.format(
         topic=state.topic,
         main_title=state.title.main_title,
@@ -212,6 +266,7 @@ async def agent2_generate_outline(
         style=state.style or "default",
         user_description=state.user_description or "无",
         style_section=style_section,
+        section_count=section_count,
     )
 
     if state.user_description:
@@ -225,12 +280,24 @@ async def agent2_generate_outline(
     if state.reference_articles:
         prompt += _build_reference_articles_section(state.reference_articles)
 
+    # Inject layout template constraints (structure imitation)
+    if state.layout_template:
+        prompt += _build_layout_section(state)
+
     def _noop_handler(text: str) -> None:
         pass
 
+    system_msg = "你是一个专业的内容策划专家。"
+    if state.layout_template:
+        system_msg += (
+            " 你有一份「版式结构约束」需要严格遵循。"
+            "大纲的章节数量、顺序必须与约束完全一致。"
+            "章节标题需围绕用户主题重新创作，不得照搬参考文章标题。"
+        )
+
     handler = stream_handler or _noop_handler
     raw = await _call_llm_with_streaming(
-        "你是一个专业的内容策划专家。",
+        system_msg,
         prompt,
         handler,
     )
@@ -250,11 +317,26 @@ async def agent3_generate_content(
     state: ArticleState,
     stream_handler: Optional[Callable[[str], None]] = None,
 ) -> ArticleState:
-    """Stream the full article content from the LLM."""
+    print(f"  ▶ agent3: 生成正文（最多等 120 秒）...")
+    """Generate article content.
+
+    Two modes:
+    1. Layout template present → structured JSON output (LLM fills blocks)
+    2. No template → free-form Markdown output (original behavior)
+    """
     if not state.title or not state.outline:
         state.error = "Title and outline are required before content generation"
         return state
 
+    # ========================================================================
+    # Mode 1: Layout template → structured block filling
+    # ========================================================================
+    if state.layout_template and state.layout_template.sections:
+        return await _generate_structured_content(state, stream_handler)
+
+    # ========================================================================
+    # Mode 2: No template → free-form Markdown (original behavior)
+    # ========================================================================
     style_section = get_style_prompt(state.style or "")
     outline_text = _build_outline_text(state)
 
@@ -266,59 +348,194 @@ async def agent3_generate_content(
         style_section=style_section,
     )
 
-    # Inject knowledge base context if available
     system_msg = (
         "你是一个专业的微信公众号文章写手。全文必须使用纯中文写作。\n"
         "图片很重要！在文中适当位置插入图片标记：`[IMAGE:position=N,keywords=中文描述,type=T]`，"
         "每篇文章必须包含4～8张配图标记。keywords写图片展示的内容即可。\n"
         "正文中不得出现摄影术语（如俯拍、特写、暖光、45度等），不得虚构品牌价格联系方式。"
     )
-    if state.kb_context:
-        prompt += (
-            f"\n\n## 参考资料（请基于以下参考资料来撰写文章内容，确保信息准确）\n"
-            f"{state.kb_context}\n"
-        )
-        system_msg = (
-            "你是一个专业的微信公众号文章写手。"
-            "你有参考资料可供使用，请确保文章内容与参考资料中的事实一致，"
-            "并在适当位置引用参考信息。"
-        )
 
-    # Inject style profile for imitation mode
+    if state.kb_context:
+        prompt += f"\n\n## 参考资料（请基于以下参考资料来撰写文章内容，确保信息准确）\n{state.kb_context}\n"
+        system_msg = "你是一个专业的微信公众号文章写手。你有参考资料可供使用，请确保文章内容与参考资料中的事实一致，并在适当位置引用参考信息。"
+
     if state.style_profile:
         prompt += _build_style_profile_section(state.style_profile)
 
-    # Inject reference articles for imitation (full content)
     if state.reference_articles:
         prompt += _build_reference_articles_section(state.reference_articles)
-        # Override system message: when imitating, follow reference format
-        system_msg = (
-            "你是一个专业的仿写专家。你正在仿写一篇公众号文章。\n"
-            "在文中适当位置插入图片标记：`[IMAGE:position=N,keywords=中文描述,type=T]`\n"
-            "图片很重要，每篇文章至少包含4张配图，请确保插入了足够数量的[IMAGE:]标记。\n"
-            "keywords 写图片展示的内容即可（如「客厅全景」「教师办公场景」「产品细节」），不要写拍摄角度或光线。\n"
-            "正文中不得出现任何摄影术语（俯拍、仰拍、特写、微距、暖光、逆光、45度等）。\n"
-            "【重要】标题必须用 **加粗** 包裹\n"
-            "【重要】禁止使用 > 引用块格式\n"
-            "【重要】禁止重复输出同一个标题或总结句\n"
-            "【重要】全文必须使用纯中文写作\n"
-        )
 
-    def _noop_handler(text: str) -> None:
+    def _noop(text: str) -> None:
         pass
 
-    handler = stream_handler or _noop_handler
-    content = await _call_llm_with_streaming(
-        system_msg,
-        prompt,
-        handler,
-    )
-
-    state.content = content
+    handler = stream_handler or _noop
+    state.content = await _call_llm_with_streaming(system_msg, prompt, handler)
     return state
 
 
+async def _generate_structured_content(
+    state: ArticleState,
+    stream_handler: Optional[Callable[[str], None]] = None,
+) -> ArticleState:
+    """Layout template mode: LLM fills in content for each pre-defined block.
+
+    The template structure is fixed — the LLM only fills ``content`` and
+    ``requirement`` fields. Block types, counts, and order are locked.
+    """
+    from app.constants.prompt import AGENT3_STRUCTURED_PROMPT
+
+    outline_text = _build_outline_text(state)
+
+    # Build the JSON template for the LLM to fill
+    t = state.layout_template
+    sections_json = []
+    for sec_idx, sec in enumerate(t.sections):
+        sec_data = {
+            "section_role": sec.section_role,
+            "blocks": [],
+        }
+        for b in sec.blocks:
+            block_data = {
+                "type": b.type,
+            }
+            if b.type in ("heading", "paragraph", "quote"):
+                block_data["role"] = b.role or ""
+                if b.length_chars_target:
+                    block_data["length_chars_target"] = b.length_chars_target
+                block_data["content"] = ""  # LLM fills this
+            elif b.type == "image":
+                block_data["count"] = b.count
+                block_data["requirement"] = ""  # LLM fills: what the image should show
+                block_data["alt"] = ""
+            elif b.type == "divider":
+                block_data["content"] = ""
+            else:
+                block_data["content"] = ""
+            sec_data["blocks"].append(block_data)
+        sections_json.append(sec_data)
+
+    prompt = AGENT3_STRUCTURED_PROMPT.format(
+        topic=state.topic,
+        main_title=state.title.main_title,
+        sub_title=state.title.sub_title,
+        outline=outline_text,
+        sections_json=json.dumps(sections_json, ensure_ascii=False, indent=2),
+    )
+
+    # Inject reference articles for context
+    if state.style_profile:
+        prompt += _build_style_profile_section(state.style_profile)
+    if state.reference_articles:
+        prompt += _build_reference_articles_section(state.reference_articles)
+
+    system_msg = (
+        "你是一个专业的内容填充专家。你的任务是将模板中的每个 block 填写完整。\n"
+        "不要修改模板结构，不要新增或删除 block。\n"
+        "输出严格的 JSON 格式，不要包含其他文字。\n"
+        "全文必须使用纯中文。"
+    )
+
+    def _noop(text: str) -> None:
+        pass
+
+    handler = stream_handler or _noop
+    raw = await _call_llm_with_streaming(system_msg, prompt, handler, temperature=0.7)
+
+    try:
+        data = _parse_json_response(raw)
+        filled_sections = data.get("sections", data if isinstance(data, list) else [data])
+
+        # Validate: check section count matches template
+        if len(filled_sections) != len(t.sections):
+            print(f"  ⚠️ Section count mismatch: LLM returned {len(filled_sections)}, expected {len(t.sections)}")
+            # Pad or truncate
+            while len(filled_sections) < len(t.sections):
+                filled_sections.append({"section_role": "unknown", "blocks": []})
+            filled_sections = filled_sections[:len(t.sections)]
+
+        # Validate each section's block count
+        for sec_idx, sec in enumerate(filled_sections):
+            expected_blocks = len(t.sections[sec_idx].blocks)
+            actual_blocks = len(sec.get("blocks", []))
+            if actual_blocks != expected_blocks:
+                print(f"  ⚠️ Block count mismatch in section {sec_idx}: got {actual_blocks}, expected {expected_blocks}")
+                # Rebuild blocks from template, preserving any filled content
+                filled = sec.get("blocks", [])
+                corrected = []
+                for bi, tb in enumerate(t.sections[sec_idx].blocks):
+                    if bi < len(filled):
+                        corrected.append(filled[bi])
+                    else:
+                        corrected.append({"type": tb.type, "content": ""})
+                sec["blocks"] = corrected
+
+        # Store structured content
+        state.content_blocks = filled_sections
+
+        # Also render a flat markdown version with [IMAGE:] placeholders
+        # for backward compatibility with the image pipeline
+        state.content = _render_structured_blocks(filled_sections)
+
+        print(f"  ✅ 结构化正文完成: {len(filled_sections)} 章节, "
+              f"{sum(len(s.get('blocks', [])) for s in filled_sections)} 个内容块")
+
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        state.error = f"Failed to parse structured content: {exc}"
+        # Fallback: treat raw as content
+        state.content = raw
+
+    return state
+
+
+def _render_structured_blocks(sections: list) -> str:
+    """Convert structured content blocks to Markdown with [IMAGE:] placeholders.
+
+    This is the backward-compatible renderer — the image pipeline still
+    depends on [IMAGE:] markers to know where to place images.
+    """
+    lines = []
+    image_pos = [0]  # mutable counter for image positions
+
+    for sec in sections:
+        for b in sec.get("blocks", []):
+            t = b["type"]
+            if t == "heading":
+                level = b.get("level", 2)
+                content = b.get("content", "").strip()
+                if content:
+                    lines.append(f"{'#' * level} {content}")
+            elif t == "paragraph":
+                content = b.get("content", "").strip()
+                if content:
+                    lines.append(content)
+                    lines.append("")
+            elif t == "image":
+                image_pos[0] += 1
+                req = b.get("requirement", b.get("content", "image"))
+                alt = b.get("alt", req)
+                count = b.get("count", 1)
+                for _ in range(count):
+                    lines.append(f"[IMAGE:position={image_pos[0]},keywords={alt},type=inline]")
+                    lines.append("")
+            elif t == "quote":
+                content = b.get("content", "").strip()
+                if content:
+                    lines.append(f">{content}")
+                    lines.append("")
+            elif t == "divider":
+                lines.append("---")
+                lines.append("")
+            elif t == "list":
+                items = b.get("items", [])
+                for item in items:
+                    lines.append(f"- {item}")
+                lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 async def agent4_analyze_image_requirements(state: ArticleState) -> ArticleState:
+    print(f"  ▶ agent4: 分析配图需求...")
     """Analyse the generated content and determine where images are needed.
 
     Returns the state with ``image_requirements`` populated.
@@ -359,6 +576,7 @@ async def agent5_generate_images(
     state: ArticleState,
     stream_handler: Optional[Callable[[str], None]] = None,
 ) -> ArticleState:
+    print(f"  ▶ agent5: 获取配图（共 {len(state.image_requirements)} 张需求）...")
     """Execute image searches for each requirement in parallel.
 
     This agent dispatches calls to the appropriate image service for each
@@ -458,8 +676,11 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
             kw_match = re.search(r"keywords=([^,\]]+)", raw)
             alt = kw_match.group(1).strip() if kw_match else "image"
 
+            is_gallery = 'type=gallery' in raw
             url = images_by_position.get(pos, "")
             if url:
+                if is_gallery:
+                    return f'<img class="gallery-img" data-pos="{pos}" src="{url}" alt="{alt}" />'
                 return (
                     f'{alt}\n\n'
                     f'<img src="{url}" alt="{alt}" '
@@ -480,6 +701,9 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
 
     # Post-processing: normalize 3+ spaces at line starts
     content = re.sub(r'^ {3,}', '', content, flags=re.MULTILINE)
+
+    # Post-processing: group consecutive gallery images into carousel
+    content = _wrap_gallery_images(content)
 
     # 去掉 AI 生成内容开头的标题（已由前端独立展示）
     content = _strip_leading_title(content, state)
@@ -592,43 +816,127 @@ def _build_style_profile_section(profile: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_layout_section(state: ArticleState) -> str:
+    """Build a layout template section for prompt injection.
+
+    When ``state.layout_template`` is present, this generates constraints
+    for Agent 2 (outline) and Agent 3 (content) to follow the reference
+    article's structure exactly.
+    """
+    if not state.layout_template:
+        return ""
+
+    t = state.layout_template
+    lines = [
+        "\n\n## 版式结构约束（必须严格遵循）",
+        f"这篇文章的结构来自参考文章的版式分析。",
+        f"全文共 {len(t.sections)} 个章节，{t.total_paragraph_count} 个段落，{t.total_image_count} 张配图。",
+        f"结尾风格：{t.ending_style}",
+        "",
+        "### 章节顺序与内容块模板（严格按照以下顺序和块类型生成，不得增减章节或调整顺序）：",
+    ]
+
+    for i, sec in enumerate(t.sections):
+        lines.append(f"\n---\n章节 {i+1}：{sec.section_role}")
+        for j, b in enumerate(sec.blocks):
+            blocks_desc = f"  [{j+1}] 类型：{b.type}"
+            if b.role:
+                blocks_desc += f"，功能：{b.role}"
+            if b.level:
+                blocks_desc += f"，标题层级：h{b.level}"
+            if b.style_pattern:
+                blocks_desc += f"，标题句式：\"{b.style_pattern}\""
+            if b.length_chars_target and b.length_chars_target > 10:
+                blocks_desc += f"，目标字数：约{b.length_chars_target}字"
+            if b.type == "image" and b.count > 0:
+                blocks_desc += f"，数量：{b.count}张"
+
+            lines.append(blocks_desc)
+
+    lines.append(f"\n### 结尾要求")
+    lines.append(f"结尾风格必须为「{t.ending_style}」，不得使用其他风格。")
+
+    if t.layout_features:
+        lines.append(f"\n### 整体版式特征")
+        for feat in t.layout_features:
+            lines.append(f"- {feat}")
+
+    lines.append("")
+    lines.append("【重要】章节标题必须围绕用户主题重新创作，不得照搬参考文章的标题措辞。")
+    lines.append("【重要】图片位置已由模板确定，在正文中生成 [IMAGE:] 占位符时必须匹配模板指定的图片数量和位置。")
+
+    return "\n".join(lines)
+
+
 def _build_reference_articles_section(articles: list) -> str:
     """Build a reference articles section for prompt injection.
 
-    Only passes short excerpts (style sample only) to avoid the LLM
-    reproducing product/image descriptions from the source articles.
+    Detects article format type (pure-image gallery vs text) and
+    injects appropriate format instructions for the AI to replicate.
     """
     if not articles:
         return ""
 
-    lines = ["\n\n## 参考文章风格摘要（仅展示句式结构和段落节奏，不要复制具体内容）"]
-    for i, article_text in enumerate(articles, start=1):
-        # Strip [IMAGE:] markers and common photography lines first
-        cleaned = re.sub(r'\[IMAGE:[^\]]*\]', '', article_text)
-        cleaned = re.sub(
-            r'^.*?(?:45度|俯拍|仰拍|微距|特写|暖光|逆光|打光|布光).*?(?:场景|效果|展示|组合|特写).*?\n',
-            '', cleaned, flags=re.MULTILINE,
-        )
-        cleaned = cleaned.strip()
-        # Only keep first 300 chars — enough for style, not enough for content
-        excerpt = cleaned[:300]
-        if len(cleaned) > 300:
-            excerpt += "\n\n...（风格摘要）"
-        if excerpt and len(excerpt) > 50:
-            lines.append(f"\n### 风格示例 {i}\n{excerpt}")
+    lines = ["\n\n## 参考文章格式与风格说明"]
+    has_image_format = False
+    has_text_format = False
 
+    for i, article_text in enumerate(articles, start=1):
+        lines.append(f"\n### 参考文章 {i}")
+
+        # Detect pure-image gallery format (all lines are ![](url) markdown images)
+        stripped = article_text.strip()
+        blocks = [b for b in stripped.split('\n\n') if b.strip()]
+        image_blocks = [b for b in blocks if b.startswith('![](http')]
+        is_image_gallery = len(blocks) > 0 and len(image_blocks) == len(blocks)
+
+        if is_image_gallery:
+            has_image_format = True
+            image_count = len(blocks)
+            lines.append(f"""格式类型：纯图片画廊
+图片数量：{image_count} 张
+展示方式：主图展示区 + 底部缩略图横向滑动列表
+交互方式：点击缩略图可切换主图，当前选中缩略图带高亮描边
+缩略图导航：超过可视范围可左右滑动或点击箭头查看更多""")
+        else:
+            has_text_format = True
+            # 保留 [IMAGE:] 标记以便 AI 看到图片排版
+            cleaned = re.sub(
+                r'^.*?(?:45度|俯拍|仰拍|微距|特写|暖光|逆光|打光|布光).*?(?:场景|效果|展示|组合|特写).*?\n',
+                '', article_text, flags=re.MULTILINE,
+            )
+            cleaned = cleaned.strip()
+            excerpt = cleaned[:3000]
+            if len(cleaned) > 3000:
+                excerpt += "\n\n...（格式摘要）"
+            if excerpt and len(excerpt) > 50:
+                lines.append(f"格式类型：图文混排版\n完整参考格式：\n{excerpt}")
+
+    # Output format rules
     lines.append("""
 
 ## ⚠️ 输出格式规则
 
-### 核心要求：
+### 所有文章通用规则：
 1. **标题加粗**：所有小标题/段落总结语/独立成行的主题句，用 `**加粗**` 包裹
-2. **完整段落**：每一段必须是多句话连贯而成的完整段落
-3. **段落间距**：段与段之间空一行
-4. **图片标记（必须）**：每篇文章必须插入4～8张配图标记 `[IMAGE:position=N,keywords=图片内容描述,type=T]`
-   - keywords 只写图片内容（如「客厅全景」「教师办公」「产品细节」），不得包含任何摄影术语
-5. **禁止使用**：禁止使用 `>` 引用块、`---` 分隔线、`***`
+2. **段落间距**：段与段之间空一行""")
 
+    if has_image_format:
+        lines.append("""
+### 纯图片画廊格式规则（仅当参考文章为纯图片格式时适用）：
+1. **不生成任何正文文字**，只生成图片标记
+2. 每张图片使用格式：`[IMAGE:position=N,keywords=图片内容描述,type=gallery]`
+3. 生成 6～10 张图片标记，用于展示画廊效果
+4. keywords 描述图片应展示的内容（如「产品正面全景」「细节特写」等）""")
+
+    if has_text_format:
+        lines.append("""
+### 图文混排格式规则（仅当参考文章为图文格式时适用）：
+1. **完整段落**：每一段必须是多句话连贯而成的完整段落
+2. **图片标记**：每篇文章必须插入4～8张配图标记 `[IMAGE:position=N,keywords=图片内容描述,type=T]`
+   - keywords 只写图片内容（如「客厅全景」「教师办公」「产品细节」），不得包含任何摄影术语""")
+
+    lines.append("""
 ### 【绝对禁止】以下内容不得出现在正文中：
 - 拍摄角度、光线、构图等任何图片描述文字
 - 具体产品名、品牌名、价格、联系方式
@@ -637,7 +945,199 @@ def _build_reference_articles_section(articles: list) -> str:
 
 ### 重要：
 - 你的文章内容必须围绕用户给定的**主题**来写
-- 只模仿句子的**长短节奏**和**段落结构**，不复制具体写什么
-""")
+- 严格遵守参考文章的**格式类型**（纯图片画廊 或 图文混排），不要混合使用""")
 
     return "\n".join(lines)
+
+
+def _wrap_gallery_images(content: str) -> str:
+    """Group consecutive ``<img class="gallery-img">`` into a carousel.
+    All styles and interactions are inline — no external CSS needed."""
+    import re as _re
+    pattern = r'(<img class="gallery-img"[^>]*/>\s*)+'
+    def _wrap(m: _re.Match) -> str:
+        imgs = m.group(0)
+        items = _re.findall(r'<img[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*/>', imgs)
+        if not items:
+            return imgs
+        thumbs = ""
+        for i, (url, alt) in enumerate(items):
+            border = '#07c160' if i == 0 else 'transparent'
+            op = '1' if i == 0 else '0.6'
+            thumbs += (
+                f'<div style="flex:0 0 80px;height:60px;border-radius:6px;overflow:hidden;'
+                f'cursor:pointer;border:2px solid {border};opacity:{op};transition:all .2s;" '
+                f'onclick="let p=this.parentElement;'
+                f'p.querySelectorAll(\'>div\').forEach(d=>{{d.style.border=\'2px solid transparent\';d.style.opacity=\'0.6\'}});'
+                f'this.style.border=\'2px solid #07c160\';this.style.opacity=\'1\';'
+                f'p.parentElement.querySelector(\'.gallery-main img\').src=\'{url}\';">'
+                f'<img src="{url}" alt="{alt}" loading="lazy" '
+                f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
+                f'</div>'
+            )
+        fu, fa = items[0]
+        return (
+            f'<div class="image-gallery" style="margin:16px 0;">'
+            f'<div class="gallery-main" style="width:100%;background:#f0f0f0;border-radius:8px;'
+            f'overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:300px;">'
+            f'<img src="{fu}" alt="{fa}" '
+            f'style="max-width:100%;max-height:65vh;width:auto;height:auto;object-fit:contain;" />'
+            f'</div>'
+            f'<div style="display:flex;gap:8px;margin-top:12px;overflow-x:auto;padding:4px 0;">'
+            f'{thumbs}</div></div>'
+        )
+    return _re.sub(pattern, _wrap, content, flags=_re.DOTALL)
+
+
+# ---------------------------------------------------------------------------
+# Structured content: extract image slots & render final output
+# ---------------------------------------------------------------------------
+
+
+def extract_image_slots_from_blocks(sections: list) -> tuple:
+    """Extract ImageRequirement-like slots from structured content blocks.
+
+    Skips image blocks whose requirement/alt text suggests a QR code
+    or purely decorative element (no meaningful content to generate).
+
+    Returns (image_slots, updated_sections).
+    """
+    from app.schemas.article import ImageRequirement
+
+    # Keywords that indicate an image is a QR code / contact card / pure decoration
+    _QR_KEYWORDS = ["二维码", "qrcode", "qr code", "微信", "公众号", "水印",
+                     "电话", "手机", "联系", "扫码", "关注", "小程序"]
+
+    slots = []
+    pos_counter = [0]
+
+    for sec in sections:
+        for b in sec.get("blocks", []):
+            if b["type"] == "image":
+                count = b.get("count", 1)
+                req = b.get("requirement", b.get("content", "image"))
+                alt = b.get("alt", req)
+                combined = (req + " " + alt).lower()
+
+                # Skip QR codes and contact info
+                if any(kw in combined for kw in _QR_KEYWORDS):
+                    # Mark as skipped so the renderer won't insert a placeholder
+                    b["skipped"] = True
+                    print(f"  🚫 跳过二维码图片: {req[:60]}")
+                    continue
+
+                for _ in range(count):
+                    pos_counter[0] += 1
+                    slot_id = f"slot_{pos_counter[0]}"
+                    slots.append({
+                        "slot_id": slot_id,
+                        "position": pos_counter[0],
+                        "requirement": req,
+                        "alt": alt,
+                    })
+                    b["slot_id"] = slot_id  # tag for later rendering
+
+    return slots, sections
+
+
+def _inline_md_to_html(text: str) -> str:
+    """Convert inline markdown formatting to HTML tags.
+
+    - ``**bold**`` / ``__bold__`` → ``<strong>bold</strong>``
+    - ``*italic*`` / ``_italic_`` → ``<em>italic</em>``
+    """
+    import re as _re
+    text = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = _re.sub(r'__(.+?)__', r'<strong>\1</strong>', text)
+    text = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', text)
+    text = _re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'<em>\1</em>', text)
+    return text
+
+
+def render_final_content(
+    sections: list,
+    image_urls: dict,
+    footer_template: str = "",
+) -> str:
+    """Render structured content blocks to final HTML with images placed.
+
+    Args:
+        sections: Content blocks with LLM-filled content.
+        image_urls: Dict mapping slot_id → image_url.
+        footer_template: Optional footer text.
+
+    Returns:
+        Final HTML string ready for storage/display.
+    """
+    parts = []
+
+    for sec in sections:
+        for b in sec.get("blocks", []):
+            t = b["type"]
+
+            # Skip blocks explicitly marked (e.g. QR codes)
+            if b.get("skipped"):
+                continue
+
+            if t == "heading":
+                level = b.get("level", 2)
+                content = _inline_md_to_html(b.get("content", "").strip())
+                if content:
+                    size_map = {1: "22px", 2: "18px", 3: "16px"}
+                    font_size = size_map.get(level, "16px")
+                    parts.append(
+                        f'<h{level} style="font-size:{font_size};font-weight:600;'
+                        f'margin:28px 0 16px;line-height:1.5;">{content}</h{level}>'
+                    )
+
+            elif t == "paragraph":
+                content = _inline_md_to_html(b.get("content", "").strip())
+                if content:
+                    parts.append(
+                        f'<p style="font-size:15px;line-height:1.8;color:#333;'
+                        f'margin-bottom:18px;">{content}</p>'
+                    )
+
+            elif t == "image":
+                slot_id = b.get("slot_id", "")
+                if not slot_id:
+                    continue
+                url = image_urls.get(slot_id, "")
+                alt = b.get("alt", b.get("requirement", "image"))
+                if url:
+                    parts.append(
+                        f'<img src="{url}" alt="{alt}" '
+                        f'style="width:100%;max-width:640px;border-radius:8px;'
+                        f'display:block;margin:18px auto;" />'
+                    )
+
+            elif t == "quote":
+                content = _inline_md_to_html(b.get("content", "").strip())
+                if content:
+                    parts.append(
+                        f'<blockquote style="background:#f7f7f7;border-left:4px solid #07c160;'
+                        f'margin:16px 0;padding:12px 16px;color:#555;'
+                        f'font-size:14px;line-height:1.7;">{content}</blockquote>'
+                    )
+
+            elif t == "divider":
+                parts.append('<hr style="border:none;border-top:1px solid #e8e8e8;margin:24px 0;" />')
+
+            elif t == "list":
+                items = b.get("items", [])
+                if items:
+                    list_html = "\n".join(
+                        f'<li style="margin-bottom:6px;font-size:15px;line-height:1.7;">{_inline_md_to_html(item)}</li>'
+                        for item in items
+                    )
+                    parts.append(f'<ul style="padding-left:20px;margin:12px 0;">{list_html}</ul>')
+
+    content = "\n".join(parts)
+
+    # Append footer
+    if footer_template:
+        footer = footer_template.strip()
+        if footer:
+            content += f"\n\n{footer}"
+
+    return content

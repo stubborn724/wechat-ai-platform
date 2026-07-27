@@ -1,5 +1,6 @@
 """Content review routes"""
 
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -9,7 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
-from app.models.mysql_models import ContentJob, Review
+from app.models.mysql_models import ContentJob, ContentVersion, Review
+from app.services.job_queue_service import transition_job
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -49,6 +53,7 @@ class PendingReviewResponse(BaseModel):
     job_topic: str
     job_status: str
     content_version_id: Optional[int] = None
+    latest_version: Optional[dict] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -64,8 +69,8 @@ def list_reviews(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List reviews with pagination and optional decision filter."""
-    query = db.query(Review)
+    """List reviews for the current tenant with pagination and optional decision filter."""
+    query = db.query(Review).filter(Review.tenant_id == principal.tenant_id)
 
     if decision:
         query = query.filter(Review.decision == decision)
@@ -89,12 +94,15 @@ def submit_review(
             detail="Decision must be 'approved' or 'rejected'",
         )
 
-    job = db.query(ContentJob).filter(ContentJob.id == req.job_id).first()
+    job = db.query(ContentJob).filter(
+        ContentJob.id == req.job_id,
+        ContentJob.tenant_id == principal.tenant_id,
+    ).first()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content job not found")
 
     review = Review(
-        tenant_id=1,  # TODO: resolve from principal
+        tenant_id=principal.tenant_id,
         job_id=req.job_id,
         content_version_id=req.content_version_id,
         reviewer_id=principal.user_id,
@@ -103,6 +111,16 @@ def submit_review(
     )
     db.add(review)
     db.commit()
+
+    # Drive the ContentJob state machine based on review decision
+    try:
+        if req.decision == "approved":
+            transition_job(db, req.job_id, "approve")
+        elif req.decision == "rejected":
+            transition_job(db, req.job_id, "reject")
+    except ValueError as e:
+        logger.warning("Review decision could not transition job %d: %s", req.job_id, e)
+
     db.refresh(review)
     return review
 
@@ -117,21 +135,52 @@ def get_pending_reviews(
     pending_jobs = (
         db.query(ContentJob)
         .filter(
-            ContentJob.status == "pending_review",
+            ContentJob.status == "awaiting_review",
+            ContentJob.tenant_id == principal.tenant_id,
             ContentJob.approval_mode == "manual",
         )
         .order_by(ContentJob.updated_at.asc())
         .all()
     )
 
+    # Also match the old "pending_review" status for backward compatibility
+    old_pending = (
+        db.query(ContentJob)
+        .filter(
+            ContentJob.status == "pending_review",
+            ContentJob.tenant_id == principal.tenant_id,
+            ContentJob.approval_mode == "manual",
+        )
+        .order_by(ContentJob.updated_at.asc())
+        .all()
+    )
+    pending_jobs = pending_jobs + old_pending
+
     results = []
     for job in pending_jobs:
+        latest = (
+            db.query(ContentVersion)
+            .filter(
+                ContentVersion.job_id == job.id,
+                ContentVersion.tenant_id == principal.tenant_id,
+            )
+            .order_by(ContentVersion.version_number.desc())
+            .first()
+        )
         results.append(
             PendingReviewResponse(
                 id=job.id,
                 job_id=job.id,
                 job_topic=job.topic,
                 job_status=job.status,
+                content_version_id=latest.id if latest else None,
+                latest_version={
+                    "id": latest.id,
+                    "title": latest.title,
+                    "body_markdown": latest.body_markdown,
+                    "summary": latest.summary,
+                    "version_number": latest.version_number,
+                } if latest else None,
                 created_at=job.created_at,
             )
         )

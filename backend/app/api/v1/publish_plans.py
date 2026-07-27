@@ -63,8 +63,8 @@ def list_publish_plans(
     db: Session = Depends(get_mysql_db),
     principal: CurrentPrincipal = Depends(require_auth),
 ):
-    """List publish plans, optionally filtered by account."""
-    query = db.query(PublishPlan)
+    """List publish plans for the current tenant, optionally filtered by account."""
+    query = db.query(PublishPlan).filter(PublishPlan.tenant_id == principal.tenant_id)
 
     if account_id is not None:
         query = query.filter(PublishPlan.account_id == account_id)
@@ -109,7 +109,10 @@ def update_publish_plan(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Update a publish plan."""
-    plan = db.query(PublishPlan).filter(PublishPlan.id == plan_id).first()
+    plan = db.query(PublishPlan).filter(
+        PublishPlan.id == plan_id,
+        PublishPlan.tenant_id == principal.tenant_id,
+    ).first()
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Publish plan not found")
 
@@ -129,7 +132,10 @@ def delete_publish_plan(
     principal: CurrentPrincipal = Depends(require_auth),
 ):
     """Delete a publish plan."""
-    plan = db.query(PublishPlan).filter(PublishPlan.id == plan_id).first()
+    plan = db.query(PublishPlan).filter(
+        PublishPlan.id == plan_id,
+        PublishPlan.tenant_id == principal.tenant_id,
+    ).first()
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Publish plan not found")
 

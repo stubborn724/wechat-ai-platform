@@ -4,11 +4,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import type { Account, FeedSource } from '@/api/types'
 
-interface ArticleSlot {
-  content_type: string
-  publish_domain: string
-}
-
 interface ScheduledTask {
   id: number
   tenant_id: number
@@ -17,6 +12,8 @@ interface ScheduledTask {
   writing_mode: string
   topic: string | null
   feed_source_ids: number[] | null
+  feed_source_id: number | null
+  feed_article_ids: number[] | null
   style: string | null
   knowledge_base_ids: number[] | null
   day_of_week: number
@@ -25,7 +22,6 @@ interface ScheduledTask {
   articles_per_day: number
   public_count: number
   private_count: number
-  approval_mode: string
   account_ids: number[] | null
   publish_mode: string
   image_source: string
@@ -54,19 +50,20 @@ const form = reactive({
   writing_mode: 'free',
   topic: '',
   feed_source_ids: [] as number[],
+  feed_source_id: null as number | null,
+  feed_article_ids: [] as number[],
   style: '',
   knowledge_base_ids: [] as number[],
   day_of_week: -1,
-  publish_times: [] as string[],
-  article_slots: [] as ArticleSlot[],
+  publish_times: ['08:00'] as string[],
   articles_per_day: 1,
-  public_count: 1,
-  private_count: 0,
-  approval_mode: 'auto',
   account_ids: [] as number[],
   publish_mode: 'draft',
   image_source: 'pexels',
   footer_template: '',
+  content_type: 'article',
+  enabled_image_methods: ['PEXELS', 'DASHSCOPE'],
+  enable_watermark: false,
 })
 
 const dayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
@@ -75,15 +72,41 @@ const dayOptions = [
   ...dayLabels.map((label, i) => ({ value: i, label })),
 ]
 
-const contentTypeOptions = [
-  { value: 'image_text', label: '图文' },
-  { value: 'video', label: '视频' },
-  { value: 'pure_image', label: '纯图片' },
+const imageMethodOptions = [
+  { value: 'PEXELS', label: 'Pexels 图库' },
+  { value: 'DASHSCOPE', label: 'AI 生图（通义万相）' },
 ]
-const domainOptions = [
-  { value: 'public', label: '公域' },
-  { value: 'private', label: '私域' },
-]
+
+// Feed source article picker
+const feedSourceArticles = ref<any[]>([])
+const showFeedArticlePicker = ref(false)
+const loadingFeedArticles = ref(false)
+
+async function handleFeedSourceChange() {
+  form.feed_article_ids = []
+  feedSourceArticles.value = []
+  if (!form.feed_source_id) return
+  loadingFeedArticles.value = true
+  try {
+    const res = await client.get(`/feed-sources/${form.feed_source_id}/articles`, {
+      params: { page: 1, page_size: 50 },
+    })
+    feedSourceArticles.value = res.data.items || res.data || []
+  } catch {
+    ElMessage.warning('加载投喂源文章失败')
+  } finally {
+    loadingFeedArticles.value = false
+  }
+}
+
+function toggleFeedArticle(id: number) {
+  const idx = form.feed_article_ids.indexOf(id)
+  if (idx >= 0) {
+    form.feed_article_ids.splice(idx, 1)
+  } else {
+    form.feed_article_ids.push(id)
+  }
+}
 
 const writingModeLabel: Record<string, string> = {
   free: '自由写作',
@@ -128,22 +151,23 @@ async function load() {
 
 function resetForm() {
   form.name = ''
+  form.content_type = 'article'
   form.writing_mode = 'free'
   form.topic = ''
   form.feed_source_ids = []
+  form.feed_source_id = null
+  form.feed_article_ids = []
   form.style = ''
   form.knowledge_base_ids = []
   form.day_of_week = -1
-  form.publish_times = []
-  form.article_slots = []
+  form.publish_times = ['08:00']
   form.articles_per_day = 1
-  form.public_count = 1
-  form.private_count = 0
-  form.approval_mode = 'auto'
   form.account_ids = []
   form.publish_mode = 'draft'
   form.image_source = 'pexels'
   form.footer_template = ''
+  form.enabled_image_methods = ['PEXELS', 'DASHSCOPE']
+  form.enable_watermark = false
   footerQrUrl.value = ''
   editing.value = false
   currentId.value = null
@@ -155,32 +179,29 @@ function openEdit(task: ScheduledTask) {
   editing.value = true
   currentId.value = task.id
   form.name = task.name
+  form.content_type = (task as any).content_type || 'article'
   form.writing_mode = task.writing_mode
   form.topic = task.topic || ''
   form.feed_source_ids = task.feed_source_ids || []
+  form.feed_source_id = (task as any).feed_source_id || null
+  form.feed_article_ids = (task as any).feed_article_ids || []
   form.style = task.style || ''
   form.knowledge_base_ids = task.knowledge_base_ids || []
   form.day_of_week = task.day_of_week
-  form.publish_times = [...task.publish_times]
-  form.article_slots = task.article_slots ? task.article_slots.map(s => ({ ...s })) : []
+  form.publish_times = task.publish_times?.length ? [...task.publish_times] : ['08:00']
   form.articles_per_day = task.articles_per_day
-  form.public_count = task.public_count
-  form.private_count = task.private_count
-  form.approval_mode = task.approval_mode
   form.account_ids = task.account_ids || []
   form.publish_mode = task.publish_mode || 'draft'
   form.image_source = task.image_source || 'pexels'
   form.footer_template = task.footer_template || ''
+  form.enabled_image_methods = (task as any).enabled_image_methods || ['PEXELS', 'DASHSCOPE']
+  form.enable_watermark = (task as any).enable_watermark || false
   // 从 footer_template 中提取二维码 URL 用于预览
   const qrMatch = form.footer_template.match(/!\[二维码\]\(([^)]+)\)/)
   footerQrUrl.value = qrMatch ? qrMatch[1] : ''
   showForm.value = true
 }
 
-function addSlot() {
-  form.article_slots.push({ content_type: 'image_text', publish_domain: 'public' })
-}
-function removeSlot(i: number) { form.article_slots.splice(i, 1) }
 function addTime() { form.publish_times.push('08:00') }
 function removeTime(i: number) { form.publish_times.splice(i, 1) }
 
@@ -213,22 +234,22 @@ async function save() {
   try {
     const payload: Record<string, any> = {
       name: form.name,
-      writing_mode: form.writing_mode,
+      content_type: form.content_type,
       topic: form.topic || null,
-      feed_source_ids: form.writing_mode === 'feed' && form.feed_source_ids.length > 0 ? form.feed_source_ids : null,
+      feed_source_ids: form.feed_source_ids.length > 0 ? form.feed_source_ids : null,
+      feed_source_id: form.feed_source_id || null,
+      feed_article_ids: form.feed_article_ids.length > 0 ? form.feed_article_ids : null,
       style: form.style || null,
       knowledge_base_ids: form.knowledge_base_ids.length > 0 ? form.knowledge_base_ids : null,
       day_of_week: form.day_of_week,
       publish_times: form.publish_times,
-      article_slots: form.article_slots.length > 0 ? form.article_slots : null,
       articles_per_day: form.articles_per_day,
-      public_count: form.public_count,
-      private_count: form.private_count,
-      approval_mode: form.approval_mode,
       account_ids: form.account_ids.length > 0 ? form.account_ids : null,
       publish_mode: form.publish_mode,
       image_source: form.image_source,
       footer_template: form.footer_template || null,
+      enabled_image_methods: form.enabled_image_methods,
+      enable_watermark: form.enable_watermark,
     }
 
     if (editing.value && currentId.value) {
@@ -324,14 +345,10 @@ onMounted(load)
           </div>
           <div class="info-row">
             <span class="label">篇数/天</span>
-            <span>{{ task.articles_per_day }} 篇 (公域 {{ task.public_count }} / 私域 {{ task.private_count }})</span>
+            <span>{{ task.articles_per_day }} 篇</span>
           </div>
           <div class="info-row">
             <span class="label">发布方式</span>
-            <span>{{ task.approval_mode === 'auto' ? '自动发布' : '人工审核' }}</span>
-          </div>
-          <div class="info-row">
-            <span class="label">发布到</span>
             <span>{{ task.publish_mode === 'direct' ? '直接发布' : '存草稿箱' }}</span>
           </div>
           <div class="info-row">
@@ -361,58 +378,138 @@ onMounted(load)
           <el-input v-model="form.name" placeholder="例如：每日科技资讯" />
         </el-form-item>
 
-        <el-form-item label="写作模式">
-          <el-radio-group v-model="form.writing_mode">
-            <el-radio value="free">自由写作</el-radio>
-            <el-radio value="feed">投喂源仿写</el-radio>
-            <el-radio value="kb">知识库</el-radio>
-          </el-radio-group>
+        <el-form-item label="文章主题" required>
+          <el-input v-model="form.topic" type="textarea" :rows="3" placeholder="请输入文章主题，例如：人工智能如何改变教育行业" />
         </el-form-item>
 
-        <!-- Topic (for all modes) -->
-        <el-form-item label="写作主题" required>
-          <el-input v-model="form.topic" type="textarea" :rows="3" placeholder="例如：2026年米兰展最新流行趋势分析" />
+        <el-row :gutter="20">
+          <el-col :span="8">
+            <el-form-item label="内容类型">
+              <el-radio-group v-model="form.content_type">
+                <el-radio value="article">图文</el-radio>
+                <el-radio value="image">纯图片</el-radio>
+                <el-radio value="video">视频</el-radio>
+              </el-radio-group>
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="写作风格">
+              <el-select v-model="form.style" clearable placeholder="选择风格（可选）" class="full-width">
+                <el-option v-for="opt in styleOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="封面图片来源">
+              <el-radio-group v-model="form.image_source">
+                <el-radio value="pexels">Pexels 图库</el-radio>
+                <el-radio value="local">素材库</el-radio>
+                <el-radio value="DASHSCOPE">AI 生图</el-radio>
+              </el-radio-group>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-form-item label="正文配图方式">
+          <el-checkbox-group v-model="form.enabled_image_methods">
+            <el-checkbox v-for="opt in imageMethodOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </el-checkbox>
+          </el-checkbox-group>
+          <span class="form-hint">正文中插入的图片来源。封面已单独设置，不受此项影响</span>
         </el-form-item>
 
-        <!-- Style selector (like article creation) -->
-        <el-form-item label="写作风格">
-          <el-select v-model="form.style" clearable placeholder="选择风格（可选）" style="width:100%">
-            <el-option v-for="opt in styleOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
+        <el-form-item label="知识库参考（可选，勾选后 AI 会自动检索相关内容）">
+          <el-select v-model="form.knowledge_base_ids" multiple clearable collapse-tags collapse-tags-tooltip placeholder="选择知识库（可选）" style="width:100%">
+            <el-option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id" :label="kb.name" />
           </el-select>
         </el-form-item>
 
-        <!-- Feed mode: feed source selector (replaces imitation pool) -->
-        <template v-if="form.writing_mode === 'feed'">
-          <el-form-item label="投喂源" required>
-            <el-select v-model="form.feed_source_ids" style="width:100%" multiple filterable>
-              <el-option v-for="src in feedSources" :key="src.id" :value="src.id" :label="src.name" />
+        <el-form-item label="仿写来源（可选，选择后 AI 会按该来源的风格仿写）">
+          <div class="feed-source-wrapper">
+            <el-select
+              v-model="form.feed_source_id"
+              clearable
+              placeholder="选择投喂源进行仿写（可选）"
+              style="width:100%"
+              @change="handleFeedSourceChange"
+            >
+              <el-option v-for="src in feedSources" :key="src.id" :value="src.id" :label="src.name">
+                <span>{{ src.name }}</span>
+                <span v-if="src.style_profile" style="float:right;font-size:12px;color:#67c23a">✅ 已分析</span>
+              </el-option>
             </el-select>
-          </el-form-item>
-        </template>
-
-        <!-- KB mode: knowledge base selector -->
-        <el-form-item v-if="form.writing_mode === 'kb'" label="知识库" required>
-          <el-select v-model="form.knowledge_base_ids" style="width:100%" multiple filterable>
-            <el-option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id" :label="kb.name" />
-          </el-select>
+            <div v-if="form.feed_source_id && feedSourceArticles.length > 0" class="feed-articles-banner">
+              <el-button size="small" type="primary" plain @click="showFeedArticlePicker = true">
+                📄 选择参考文章
+              </el-button>
+              <span class="selected-count" v-if="form.feed_article_ids.length > 0">
+                已选 {{ form.feed_article_ids.length }} 篇
+              </span>
+              <span v-else class="selected-count muted">仅使用风格分析</span>
+            </div>
+            <div v-else-if="loadingFeedArticles" class="feed-articles-banner">
+              <el-skeleton :rows="1" animated />
+            </div>
+            <span class="form-hint">需要先在「投喂源」中添加来源并执行「分析」才能获取风格特征；选择具体文章可让 AI 直接仿写原文风格</span>
+          </div>
         </el-form-item>
 
-        <!-- KB supplement (for free & feed modes) -->
-        <el-form-item v-if="form.writing_mode !== 'kb'" label="补充知识库（可选）">
-          <el-select v-model="form.knowledge_base_ids" style="width:100%" multiple filterable clearable placeholder="选择知识库补充内容">
-            <el-option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id" :label="kb.name" />
-          </el-select>
+        <el-form-item label="文章底部固定内容（可选）">
+          <div style="width:100%">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <input ref="qrFileInput" type="file" accept="image/*" style="display:none" @change="uploadFooterQr" />
+              <el-button size="small" @click="(qrFileInput as any)?.click()" :loading="uploadingQr">📷 上传二维码</el-button>
+              <span v-if="footerQrUrl" style="color:#67c23a;font-size:13px">✅ 已上传</span>
+              <span class="form-hint" style="margin-left:8px">上传后自动添加到页脚</span>
+            </div>
+            <el-input v-model="form.footer_template" type="textarea" :rows="2" placeholder="其他固定内容（如联系方式），二维码会自动加在前面" />
+            <div v-if="footerQrUrl" style="margin-top:8px;display:flex;align-items:center;gap:8px">
+              <img :src="footerQrUrl" style="width:48px;height:48px;border-radius:4px;object-fit:cover" />
+              <span style="font-size:12px;color:#909399">二维码将显示在页脚</span>
+            </div>
+          </div>
         </el-form-item>
 
         <el-row :gutter="16">
-          <el-col :span="12">
+          <el-col :span="16">
+            <el-form-item label="发布到公众号（可选，可多选）">
+              <el-select v-model="form.account_ids" multiple collapse-tags collapse-tags-tooltip placeholder="选择要发布的公众号（不选则仅生成内容）" style="width:100%">
+                <el-option v-for="acct in accounts" :key="acct.id" :value="acct.id" :label="acct.name" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="发布方式">
+              <el-radio-group v-model="form.publish_mode" :disabled="form.account_ids.length === 0">
+                <el-radio value="draft">存草稿箱</el-radio>
+                <el-radio value="direct">直接发布</el-radio>
+              </el-radio-group>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <span v-if="form.account_ids.length > 0" class="form-hint" style="display:block;margin-top:-12px;margin-bottom:18px">
+          {{ form.publish_mode === 'direct' ? '⚠️ 直接发布将立即推送给订阅用户，请确认内容无误' : '保存到微信草稿箱，可手动检查后再发布' }}
+        </span>
+
+        <el-divider />
+        <el-form-item label="水印">
+          <div class="watermark-toggle-row">
+            <el-switch v-model="form.enable_watermark" active-text="添加水印" inactive-text="无水印" />
+            <span class="form-hint">在「水印设置」中配置样式</span>
+          </div>
+        </el-form-item>
+
+        <el-divider />
+        <el-row :gutter="16">
+          <el-col :span="8">
             <el-form-item label="适用日期">
               <el-select v-model="form.day_of_week" style="width:100%">
                 <el-option v-for="d in dayOptions" :key="d.value" :value="d.value" :label="d.label" />
               </el-select>
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :span="8">
             <el-form-item label="每天篇数">
               <el-input-number v-model="form.articles_per_day" :min="1" :max="50" style="width:100%" />
             </el-form-item>
@@ -428,105 +525,37 @@ onMounted(load)
             <el-button size="small" @click="addTime">+ 添加时间</el-button>
           </div>
         </el-form-item>
-
-        <el-form-item label="文章槽（内容类型 + 发布域）">
-          <div class="slots-container">
-            <div v-for="(slot, i) in form.article_slots" :key="i" class="slot-row">
-              <span class="slot-index">#{{ i + 1 }}</span>
-              <el-select v-model="slot.content_type" style="width:120px">
-                <el-option v-for="opt in contentTypeOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
-              </el-select>
-              <el-select v-model="slot.publish_domain" style="width:100px">
-                <el-option v-for="opt in domainOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
-              </el-select>
-              <el-button size="small" type="danger" plain @click="removeSlot(i)">删除</el-button>
-            </div>
-            <el-button size="small" @click="addSlot">+ 添加文章槽</el-button>
-          </div>
-        </el-form-item>
-
-        <el-row :gutter="16">
-          <el-col :span="12">
-            <el-form-item label="公域篇数">
-              <el-input-number v-model="form.public_count" :min="0" :max="50" style="width:100%" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="私域篇数">
-              <el-input-number v-model="form.private_count" :min="0" :max="50" style="width:100%" />
-            </el-form-item>
-          </el-col>
-        </el-row>
-
-        <el-form-item label="发布方式">
-          <el-radio-group v-model="form.approval_mode">
-            <el-radio value="auto">自动存微信草稿箱</el-radio>
-            <el-radio value="manual">人工审核后发布</el-radio>
-          </el-radio-group>
-        </el-form-item>
-
-        <el-form-item label="目标公众号">
-          <el-select v-model="form.account_ids" multiple collapse-tags collapse-tags-tooltip style="width:100%" filterable clearable placeholder="选择公众号（可多选）">
-            <el-option v-for="acct in accounts" :key="acct.id" :value="acct.id" :label="acct.name" />
-          </el-select>
-        </el-form-item>
-
-        <el-form-item label="发布方式">
-          <el-radio-group v-model="form.publish_mode" :disabled="form.account_ids.length === 0">
-            <el-radio value="draft">存草稿箱</el-radio>
-            <el-radio value="direct">直接发布</el-radio>
-          </el-radio-group>
-          <span v-if="form.account_ids.length > 0 && form.publish_mode === 'direct'" class="form-hint" style="display:block;margin-top:4px">
-            ⚠️ 直接发布将立即推送给订阅用户
-          </span>
-          <span v-else class="form-hint" style="display:block;margin-top:4px">保存到微信草稿箱，可手动检查后再发布</span>
-        </el-form-item>
-
-        <el-form-item label="图片来源">
-          <el-radio-group v-model="form.image_source">
-            <el-radio value="pexels">Pexels 图库</el-radio>
-            <el-radio value="local">本地素材</el-radio>
-            <el-radio value="DASHSCOPE">AI 生图（通义万相）</el-radio>
-          </el-radio-group>
-          <span v-if="form.image_source === 'DASHSCOPE'" class="form-hint" style="display:block;margin-top:4px">
-            AI 根据文章内容生成配图，不会包含文字
-          </span>
-        </el-form-item>
-
-        <el-form-item label="文章底部固定内容（可选）">
-          <div style="width: 100%">
-            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-              <input
-                ref="qrFileInput"
-                type="file"
-                accept="image/*"
-                style="display:none"
-                @change="uploadFooterQr"
-              />
-              <el-button size="small" @click="(qrFileInput as any)?.click()" :loading="uploadingQr">
-                📷 上传二维码
-              </el-button>
-              <span v-if="footerQrUrl" style="color: #67c23a; font-size: 13px;">✅ 已上传</span>
-              <span class="form-hint">上传后自动添加到页脚</span>
-            </div>
-            <el-input
-              v-model="form.footer_template"
-              type="textarea"
-              :rows="2"
-              placeholder="其他固定内容（如联系方式），二维码会自动加在前面"
-            />
-            <div v-if="footerQrUrl" style="margin-top: 8px; display: flex; align-items: center; gap: 8px;">
-              <img :src="footerQrUrl" style="width: 48px; height: 48px; border-radius: 4px; object-fit: cover;" />
-              <span style="font-size: 12px; color: #909399;">二维码将显示在页脚</span>
-            </div>
-          </div>
-        </el-form-item>
       </el-form>
 
       <template #footer>
         <el-button @click="showForm = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="save">{{ editing ? '更新' : '创建' }}</el-button>
       </template>
+      <!-- Feed article picker dialog -->
+      <el-dialog v-model="showFeedArticlePicker" title="选择参考文章" width="480px" append-to-body>
+        <p style="color:#909399;font-size:13px;margin-bottom:12px">
+          选择要仿写的参考文章（已选 {{ form.feed_article_ids.length }} 篇）。
+          AI 将严格模仿选中文章的写作风格、语气和句式结构。
+        </p>
+        <div v-if="feedSourceArticles.length === 0" style="padding:24px;text-align:center;color:#909399">
+          暂无文章，请先在投喂源中「抓取」文章
+        </div>
+        <div v-else class="feed-article-list">
+          <div v-for="article in feedSourceArticles" :key="article.id"
+               class="feed-article-item"
+               :class="{ selected: form.feed_article_ids.includes(article.id) }"
+               @click="toggleFeedArticle(article.id)">
+            <el-checkbox :checked="form.feed_article_ids.includes(article.id)" @click.stop="toggleFeedArticle(article.id)" />
+            <div class="article-info">
+              <strong>{{ article.title || '无标题' }}</strong>
+              <p>{{ (article.summary || article.body_markdown || '').slice(0, 120) }}</p>
+            </div>
+          </div>
+        </div>
+        <template #footer>
+          <el-button @click="showFeedArticlePicker = false">确定</el-button>
+        </template>
+      </el-dialog>
     </el-dialog>
   </div>
 </template>
@@ -552,4 +581,15 @@ onMounted(load)
 .slots-container, .time-container { width: 100%; }
 .slot-row, .time-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .slot-index { min-width: 24px; font-size: 13px; color: #909399; }
+.feed-source-wrapper { width: 100%; }
+.feed-articles-banner { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.selected-count { font-size: 13px; color: #409eff; font-weight: 500; }
+.selected-count.muted { color: #909399; font-weight: 400; }
+.feed-article-list { display: grid; gap: 8px; max-height: 440px; overflow-y: auto; }
+.feed-article-item { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid #e4e7ed; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+.feed-article-item:hover { border-color: #409eff; background: #f5f9ff; }
+.feed-article-item.selected { border-color: #409eff; background: #ecf5ff; }
+.feed-article-item .article-info { flex: 1; min-width: 0; }
+.feed-article-item .article-info strong { display: block; font-size: 14px; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; }
+.feed-article-item .article-info p { font-size: 12px; color: #909399; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
