@@ -6,6 +6,7 @@ import random
 from datetime import date, datetime, timezone
 from typing import List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.agent.nodes.structure_analysis_node import analyze_articles_batch
@@ -217,9 +218,14 @@ def create_imitation_task(
     approval_mode: str = "auto",
     knowledge_base_ids: Optional[list] = None,
     footer_template: Optional[str] = None,
+    imitation_mode: str = "content",
     created_by: Optional[int] = None,
 ) -> ImitationTask:
-    """创建仿写任务"""
+    """创建仿写任务并持久化其内容/HTML版式生成模式。
+
+    API 层已经限制模式取值；服务层仍保留 ``content`` 默认值，确保旧调用方和
+    尚未升级的内部任务不会因为新增参数而改变行为。
+    """
     task = ImitationTask(
         tenant_id=tenant_id,
         pool_id=pool_id,
@@ -235,6 +241,7 @@ def create_imitation_task(
         approval_mode=approval_mode,
         knowledge_base_ids=knowledge_base_ids,
         footer_template=footer_template,
+        imitation_mode=imitation_mode,
         created_by=created_by,
     )
     db.add(task)
@@ -300,21 +307,25 @@ def select_sources_for_task(db: Session, task: ImitationTask, count: int) -> Lis
             source_info["source_name"] = fs.name if fs else s.wechat_name or "unknown"
 
             # 获取最新的文章用于仿写
-            articles = (
-                db.query(FeedSourceArticle)
-                .filter(
-                    FeedSourceArticle.feed_source_id == s.feed_source_id,
-                    FeedSourceArticle.body_markdown.isnot(None),
-                )
-                .order_by(FeedSourceArticle.id.desc())
-                .limit(3)
-                .all()
+            article_query = db.query(FeedSourceArticle).filter(
+                FeedSourceArticle.feed_source_id == s.feed_source_id,
             )
+            if getattr(task, "imitation_mode", "content") == "html_layout":
+                # HTML 模式只选择真正抓取到 DOM 的文章。这里提前过滤可以减少无效
+                # 生成，但执行阶段仍会二次校验，以覆盖历史脏数据和手工调用。
+                article_query = article_query.filter(
+                    FeedSourceArticle.body_html.isnot(None),
+                    func.length(func.trim(FeedSourceArticle.body_html)) > 0,
+                )
+            else:
+                article_query = article_query.filter(FeedSourceArticle.body_markdown.isnot(None))
+            articles = article_query.order_by(FeedSourceArticle.id.desc()).limit(3).all()
             source_info["articles"] = [
                 {
                     "id": a.id,
                     "title": a.title,
                     "body_markdown": a.body_markdown,
+                    "body_html": a.body_html,
                     "summary": a.summary,
                 }
                 for a in articles
@@ -356,7 +367,19 @@ async def execute_imitation_generation(
     topic = task.name
     # 取第一篇文章作为仿写参考
     ref_articles = source_info.get("articles", [])
-    ref_content = ref_articles[0].get("body_markdown", "") if ref_articles else ""
+    reference_article = ref_articles[0] if ref_articles else {}
+    ref_content = reference_article.get("body_markdown", "") or ""
+    imitation_mode = getattr(task, "imitation_mode", "content")
+    reference_html = (reference_article.get("body_html", "") or "").strip()
+    if imitation_mode == "html_layout" and not reference_html:
+        # 版式是用户明确选择的结果契约。缺失原始 HTML 时不能静默降级，否则生成
+        # 虽然成功，用户得到的却是普通 Markdown 文章，排查成本远高于显式失败。
+        return {
+            "success": False,
+            "error": "HTML版式仿写需要投喂文章包含原始HTML，请重新抓取该文章",
+            "title": topic,
+            "body_markdown": "",
+        }
 
     # 1. 结构分析
     structure_analysis = None
@@ -412,6 +435,9 @@ async def execute_imitation_generation(
         style="default",
         footer_template=task.footer_template,
         kb_context=kb_context or None,
+        # article_agent_service 已经根据该字段路由到通用 DOM 蓝图与槽位回填流程。
+        # content 模式必须保持 None，确保旧任务继续使用原正文生成路径。
+        reference_html=reference_html if imitation_mode == "html_layout" else None,
     )
 
     # 注入仿写引导（转义花括号防止 .format() 崩溃）
@@ -431,7 +457,12 @@ async def execute_imitation_generation(
         state = await agent2_generate_outline(state)
 
         # Step 3: 正文
+        # 每个 Agent 阶段独立拥有错误状态。HTML 模式不依赖大纲，即使大纲解析失败
+        # 仍可继续填槽，因此进入正文前清理旧错误，只判断正文阶段的新结果。
+        state.error = None
         state = await agent3_generate_content(state)
+        if state.error or not (state.content or "").strip():
+            raise RuntimeError(state.error or "正文生成未返回有效内容")
 
         # Step 4: 配图
         state = await agent4_analyze_image_requirements(state)

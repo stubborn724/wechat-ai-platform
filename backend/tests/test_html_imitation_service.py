@@ -138,6 +138,124 @@ def test_analyze_html_for_imitation_keeps_structure_and_exposes_ordered_slots():
     assert 'data-ai-image-slot="image-1"' in blueprint.html_template
 
 
+def test_decorative_span_layout_keeps_inline_styles_and_static_separators():
+    """角标与章节标题常用 span/strong，回填时必须保留各自的行内视觉样式。"""
+
+    reference_html = """
+    <section style="border:1px solid #b8a98f;padding:24px">
+      <section style="text-align:right">
+        <span style="display:inline-block;border-radius:50%;background:#1b1b1b;color:#fff">豪宅</span>
+      </section>
+      <section style="text-align:center">
+        <strong style="font-size:28px;color:#222">艺术家私宅</strong>
+      </section>
+      <section style="text-align:center"><span style="color:#b8a98f">—</span></section>
+      <section style="text-align:center">
+        <span style="font-size:14px">住宅不只容纳生活</span>
+      </section>
+      <section style="margin-top:36px">
+        <span style="background:#111;color:#fff;padding:3px 8px">不争而自在</span>
+        <strong style="display:block;font-size:26px">一间属于自己的房间</strong>
+        <span style="color:#c8b79b">▪</span>
+        <p><span style="font-size:15px;color:#555">这里承载安静而完整的日常。</span></p>
+      </section>
+    </section>
+    """
+
+    blueprint = analyze_html_for_imitation(reference_html)
+
+    assert [slot.original_text for slot in blueprint.text_slots] == [
+        "豪宅",
+        "艺术家私宅",
+        "住宅不只容纳生活",
+        "不争而自在",
+        "一间属于自己的房间",
+        "这里承载安静而完整的日常。",
+    ]
+    assert "—" in blueprint.html_template
+    assert "▪" in blueprint.html_template
+
+    result = render_html_imitation(
+        blueprint,
+        text_by_slot={
+            "text-1": "私宅",
+            "text-2": "设计师之家",
+            "text-3": "空间回应真实的生活",
+            "text-4": "松弛而有序",
+            "text-5": "一间可以慢下来的房间",
+            "text-6": "光线、材质与日常动作在这里自然相遇。",
+        },
+        image_by_slot={},
+    )
+
+    assert 'style="display:inline-block;border-radius:50%;background:#1b1b1b;color:#fff"' in result.html
+    assert 'style="background:#111;color:#fff;padding:3px 8px"' in result.html
+    assert 'style="display:block;font-size:26px"' in result.html
+    assert 'style="font-size:15px;color:#555"' in result.html
+    assert "私宅" in result.html
+    assert "一间可以慢下来的房间" in result.html
+    assert "艺术家私宅" not in result.html
+
+
+def test_nested_inline_layout_keeps_deepest_text_style_after_rendering():
+    """嵌套 span/strong 应把槽位下放到最深文字节点，避免回填清除内层样式。"""
+
+    reference_html = """
+    <section>
+      <p style="text-align:center">
+        <span style="display:inline-block;padding:4px 10px">
+          <strong style="font-size:28px;color:#222">嵌套标题</strong>
+        </span>
+      </p>
+    </section>
+    """
+
+    blueprint = analyze_html_for_imitation(reference_html)
+    result = render_html_imitation(
+        blueprint,
+        text_by_slot={"text-1": "新的嵌套标题"},
+        image_by_slot={},
+    )
+
+    assert blueprint.text_slots[0].tag_name == "strong"
+    assert 'style="display:inline-block;padding:4px 10px"' in result.html
+    assert 'style="font-size:28px;color:#222"' in result.html
+    assert "新的嵌套标题" in result.html
+
+
+def test_mixed_inline_layout_preserves_child_style_without_ghost_slots():
+    """混合正文应分别回填直接文字和强调节点，不能清空子节点或创建幽灵槽位。"""
+
+    reference_html = """
+    <section>
+      <p style="line-height:1.8">普通文字 <strong style="color:red">重点</strong> 结尾</p>
+    </section>
+    """
+
+    blueprint = analyze_html_for_imitation(reference_html)
+    assert [slot.original_text for slot in blueprint.text_slots] == [
+        "普通文字",
+        "重点",
+        "结尾",
+    ]
+
+    result = render_html_imitation(
+        blueprint,
+        text_by_slot={
+            "text-1": "新的开头",
+            "text-2": "新的重点",
+            "text-3": "新的结尾",
+        },
+        image_by_slot={},
+    )
+
+    assert 'style="color:red"' in result.html
+    assert "新的开头" in result.html
+    assert "新的重点" in result.html
+    assert "新的结尾" in result.html
+    assert "普通文字" not in result.html
+
+
 def test_blueprint_prompt_payload_can_omit_unused_reference_image_urls_for_erp_mode():
     """ERP 图生图不参考投喂图时，提示词只保留槽位顺序，不能携带长签名 URL。"""
     blueprint = analyze_html_for_imitation(REFERENCE_HTML)

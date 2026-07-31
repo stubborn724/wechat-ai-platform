@@ -7,9 +7,12 @@ interface Pool {
   id: number; name: string; description: string | null; source_count: number
 }
 
+type ImitationMode = 'content' | 'html_layout'
+
 interface ImitationTask {
   id: number; name: string; pool_id: number | null; strategy: string
   articles_per_day: number; status: string; total_generated: number
+  imitation_mode: ImitationMode
   created_at: string; updated_at: string
 }
 
@@ -32,6 +35,7 @@ const saving = ref(false)
 
 const form = reactive({
   name: '', pool_id: null as number | null, strategy: 'random',
+  imitation_mode: 'content' as ImitationMode,
   articles_per_day: 1, content_types: ['article'],
   publish_times: [] as string[],
   account_id: null as number | null, approval_mode: 'auto',
@@ -40,6 +44,10 @@ const form = reactive({
 
 const strategyLabels: Record<string, string> = {
   random: '随机选源', round_robin: '轮流选源', exhaust: '全部仿写完',
+}
+
+const imitationModeLabels: Record<ImitationMode, string> = {
+  content: '内容结构', html_layout: 'HTML 版式',
 }
 
 const statusLabels: Record<string, string> = {
@@ -65,6 +73,7 @@ async function load() {
 
 function openForm() {
   form.name = ''; form.pool_id = null; form.strategy = 'random'
+  form.imitation_mode = 'content'
   form.articles_per_day = 1; form.content_types = ['article']
   form.publish_times = []; form.account_id = null; form.approval_mode = 'auto'
   form.knowledge_base_ids = []; form.footer_template = ''
@@ -150,6 +159,9 @@ onMounted(load)
       <el-table-column label="策略" width="120">
         <template #default="{ row }">{{ strategyLabels[row.strategy] || row.strategy }}</template>
       </el-table-column>
+      <el-table-column label="仿写模式" width="120">
+        <template #default="{ row }">{{ imitationModeLabels[row.imitation_mode] }}</template>
+      </el-table-column>
       <el-table-column label="每天篇数" width="100" align="center">
         <template #default="{ row }">{{ row.articles_per_day }} 篇</template>
       </el-table-column>
@@ -182,7 +194,7 @@ onMounted(load)
     </el-table>
 
     <!-- Create Dialog -->
-    <el-dialog v-model="showForm" title="创建仿写任务" width="600px">
+    <el-dialog v-model="showForm" title="创建仿写任务" width="min(600px, 94vw)">
       <el-form label-position="top">
         <el-form-item label="任务名称" required>
           <el-input v-model="form.name" placeholder="例如：每日科技仿写" />
@@ -191,6 +203,12 @@ onMounted(load)
           <el-select v-model="form.pool_id" style="width: 100%" placeholder="选择仿写池">
             <el-option v-for="p in pools" :key="p.id" :value="p.id" :label="`${p.name} (${p.source_count}个来源)`" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="仿写模式">
+          <el-radio-group v-model="form.imitation_mode" class="mode-segment">
+            <el-radio-button value="content">内容结构仿写</el-radio-button>
+            <el-radio-button value="html_layout">HTML 版式仿写</el-radio-button>
+          </el-radio-group>
         </el-form-item>
         <el-row :gutter="16">
           <el-col :span="12">
@@ -260,4 +278,7 @@ onMounted(load)
 .loading-section { padding: 40px 0; }
 .empty-state { padding: 60px 0; }
 .empty-hint { color: #909399; font-size: 13px; margin-bottom: 16px; }
+.mode-segment { width: 100%; }
+.mode-segment :deep(.el-radio-button) { flex: 1; }
+.mode-segment :deep(.el-radio-button__inner) { width: 100%; }
 </style>

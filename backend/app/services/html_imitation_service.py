@@ -23,7 +23,13 @@ from app.services.reference_contact_filter_service import (
 )
 
 
-_TEXT_TAG_NAMES = ("h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "figcaption")
+_BLOCK_TEXT_TAG_NAMES = (
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "figcaption",
+)
+# 公众号编辑器常把角标、黑底标签和大标题放在带行内样式的 span/strong 中。
+# 这些节点必须单独成为槽位，否则清空外层 p/section 会连同字号、颜色一起删除。
+_INLINE_TEXT_TAG_NAMES = ("span", "strong", "em", "b", "i")
+_TEXT_TAG_NAMES = _BLOCK_TEXT_TAG_NAMES + _INLINE_TEXT_TAG_NAMES
 _UNSAFE_TAG_NAMES = ("script", "iframe", "object", "embed", "form", "input", "button")
 
 
@@ -134,7 +140,8 @@ def select_html_image_slots(
 def analyze_html_for_imitation(html: str) -> HtmlImitationBlueprint:
     """将投喂文章 HTML 转成可仿写蓝图。
 
-    只选取最外层的文本块，避免 ``p > strong`` 这类嵌套节点被重复生成。图片不会
+    对纯嵌套结构把槽位下放到最深的文字样式节点，避免 ``p > span > strong``
+    回填时清除内层样式；混合正文仍只生成一个槽位，防止同一句被拆散。图片不会
     被删除或移动，仅被打上稳定槽位 ID，后续生成图会替换该节点的 ``src`` 属性。
     """
     if not html or not html.strip():
@@ -149,14 +156,23 @@ def analyze_html_for_imitation(html: str) -> HtmlImitationBlueprint:
     image_slots: list[HtmlImageSlot] = []
 
     for tag in soup.find_all(_TEXT_TAG_NAMES):
-        if _has_text_block_ancestor(tag):
+        if _has_assigned_text_slot_ancestor(tag):
+            continue
+        if _contains_text_slot_marker(tag):
+            # 带子节点的容器已按 DOM 顺序把各叶文本转成标记；预先生成的 ResultSet
+            # 仍会遍历到这些子标签，因此必须跳过，避免创建模板中不存在的幽灵槽位。
             continue
         if tag.find("img"):
             # 图文混排容器中的图片不能被清空；只让其内部独立文本块参与后续分析。
             continue
 
         original_text = tag.get_text(" ", strip=True)
-        if not original_text:
+        if not original_text or _is_static_decorative_text(original_text):
+            continue
+        if tag.find(True) is not None:
+            # 混合结构按叶文本的真实 DOM 顺序建槽。这样 ``正文 > strong > 结尾``
+            # 可以分别生成三段内容，同时完整保留 strong、span、br 等原始节点。
+            _assign_leaf_text_slots(tag, text_slots)
             continue
 
         slot_id = f"text-{len(text_slots) + 1}"
@@ -221,6 +237,19 @@ def render_html_imitation(
         tag.clear()
         tag.append(NavigableString(content))
         del tag["data-ai-text-slot"]
+
+    # 混合行内结构使用文本标记而不是给父标签加属性，回填时只替换对应文本叶子。
+    # 父子 DOM、class 和 style 均不参与重建，因此不会因新文案而丢失视觉格式。
+    for text_slot in blueprint.text_slots:
+        marker = _text_marker(text_slot.slot_id)
+        text_node = soup.find(string=lambda value: marker in str(value))
+        if text_node is None:
+            # 普通整块槽位已经在上一个循环中按属性完成回填，其内部标记已被清除。
+            continue
+        content = _normalise_generated_text(text_by_slot.get(text_slot.slot_id, ""))
+        if text_slot.tag_name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            content = _normalise_heading_text(content)
+        text_node.replace_with(NavigableString(str(text_node).replace(marker, content)))
 
     image_requirements: list[ImageRequirement] = []
     for image_slot in blueprint.image_slots:
@@ -287,12 +316,66 @@ def replace_html_image_slots(html: str, image_urls_by_slot: Mapping[str, str]) -
     return str(soup)
 
 
-def _has_text_block_ancestor(tag: Tag) -> bool:
-    """判断节点是否已经被某个外层可生成文本块覆盖。"""
+def _has_assigned_text_slot_ancestor(tag: Tag) -> bool:
+    """判断解析过程中是否已有外层节点拥有槽位。
+
+    不能仅按标签名判断：外层 ``p`` 可能为了保留 ``strong`` 的行内样式而主动下放
+    槽位，此时 ``strong`` 仍应参与解析。槽位属性才是外层已经接管正文的准确信号。
+    """
+
     return any(
-        isinstance(parent, Tag) and parent.name in _TEXT_TAG_NAMES
+        isinstance(parent, Tag) and parent.has_attr("data-ai-text-slot")
         for parent in tag.parents
     )
+
+
+def _contains_text_slot_marker(tag: Tag) -> bool:
+    """判断节点是否已被外层混合结构转换为叶文本槽位。"""
+
+    return "__AI_TEXT_SLOT_" in tag.get_text()
+
+
+def _assign_leaf_text_slots(tag: Tag, text_slots: list[HtmlTextSlot]) -> None:
+    """按 DOM 顺序把容器内有语义的文本叶子转换为槽位标记。
+
+    仅替换 ``NavigableString``，不清空或重建任何标签。节点原有的前后空白继续保留，
+    纯标点分隔符保持静态；这样既不会复制参考正文，也不会改变公众号特殊版式。
+    """
+
+    for text_node in list(tag.descendants):
+        if not isinstance(text_node, NavigableString):
+            continue
+        raw_text = str(text_node)
+        original_text = raw_text.strip()
+        if not original_text or _is_static_decorative_text(original_text):
+            continue
+
+        slot_id = f"text-{len(text_slots) + 1}"
+        parent = text_node.parent
+        parent_name = parent.name.lower() if isinstance(parent, Tag) and parent.name else tag.name
+        leading_space = raw_text[:len(raw_text) - len(raw_text.lstrip())]
+        trailing_space = raw_text[len(raw_text.rstrip()):]
+        text_node.replace_with(
+            NavigableString(f"{leading_space}{_text_marker(slot_id)}{trailing_space}")
+        )
+        text_slots.append(
+            HtmlTextSlot(
+                slot_id=slot_id,
+                tag_name=parent_name or "span",
+                original_text=original_text,
+                target_length=len(original_text),
+            )
+        )
+
+
+def _is_static_decorative_text(value: str) -> bool:
+    """识别破折号、方块等无正文语义的视觉分隔符。
+
+    分隔符属于版式模板而不是生成内容，应原样保留。只要包含任意字母、数字或中文
+    等字母数字字符，就视为真实文字并交给 Agent，避免误伤“01”等章节编号。
+    """
+
+    return not any(character.isalnum() for character in value)
 
 
 def _normalise_generated_text(value: str) -> str:

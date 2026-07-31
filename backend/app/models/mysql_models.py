@@ -640,6 +640,15 @@ class ImitationTask(MysqlBase):
     pool_id = Column(Integer, ForeignKey("imitation_pools.id", ondelete="SET NULL"), nullable=True)
     name = Column(String(255), nullable=False, comment="任务名称")
     title = Column(String(255), nullable=True, comment="用户指定的标题（不为空则直接使用，不仿写标题）")
+    # 默认继续执行历史内容仿写。只有用户显式选择 html_layout 时，生成服务才会
+    # 把参考文章的原始 DOM 交给槽位流水线，避免升级后悄悄改变已有任务的版式。
+    imitation_mode = Column(
+        String(32),
+        nullable=False,
+        default="content",
+        server_default="content",
+        comment="仿写模式: content=内容结构, html_layout=保留HTML版式",
+    )
     # 任务策略
     strategy = Column(String(64), nullable=False, default="random",
                       comment="仿写策略: random=随机选源, round_robin=轮流, exhaust=全部仿写完")

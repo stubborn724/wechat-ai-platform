@@ -1,7 +1,7 @@
 """仿写任务 API — 仿写池管理 + 仿写任务调度 + 结构分析触发"""
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -68,6 +68,8 @@ class TaskCreate(BaseModel):
     approval_mode: str = "auto"
     knowledge_base_ids: Optional[List[int]] = None
     footer_template: Optional[str] = None
+    # 模式在 API 层收敛为两个稳定值，避免未知字符串进入任务执行后静默回退。
+    imitation_mode: Literal["content", "html_layout"] = "content"
 
 
 class TaskResponse(BaseModel):
@@ -78,6 +80,7 @@ class TaskResponse(BaseModel):
     articles_per_day: int
     status: str
     total_generated: int
+    imitation_mode: Literal["content", "html_layout"] = "content"
     created_at: datetime
     updated_at: datetime
 
@@ -277,6 +280,7 @@ def create_task(
         approval_mode=req.approval_mode,
         knowledge_base_ids=req.knowledge_base_ids,
         footer_template=req.footer_template,
+        imitation_mode=req.imitation_mode,
         created_by=principal.user_id,
     )
     return TaskResponse.model_validate(task)
