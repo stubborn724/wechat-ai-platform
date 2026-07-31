@@ -201,6 +201,38 @@ def create_slot_articles(db: Session, job: ContentJob) -> List[ContentJobArticle
     return slots
 
 
+def remove_unavailable_image_slots(raw_content: str, *, job_id: int, slot_index: int) -> str:
+    """移除图片生成失败后未被填充的图片槽位。
+
+    定时和批量任务的正文由内容 Agent 先写入 ``[IMAGE:...]`` 槽位，再交给
+    图片生成服务替换。历史实现会在替换失败后注入 Picsum 随机图片，导致用户把
+    第三方随机图误认为 AI 仿写结果，且后续归档会掩盖其真实来源。
+
+    这里明确把“没有生成结果”表示为“没有图片”：保留正文，删除所有未填充槽位，
+    并规范空行。调用方仍可继续产出待审核内容，运维则可通过任务和文章槽位定位
+    万相或上游 Agent 的实际失败原因。
+    """
+    if not raw_content:
+        logger.error(
+            "任务图片生成失败，正文为空且没有可清理的图片槽位 job=%s slot=%s",
+            job_id,
+            slot_index,
+        )
+        return raw_content
+
+    image_slot_count = len(re.findall(r"\[IMAGE:[^\]]*\]", raw_content))
+    cleaned_content = re.sub(r"\[IMAGE:[^\]]*\]", "", raw_content)
+    cleaned_content = re.sub(r"\n{3,}", "\n\n", cleaned_content).strip()
+    logger.error(
+        "任务图片生成失败，已移除未填充图片槽位 job=%s slot=%s image_slots=%s；"
+        "随机图库回退已阻止，请检查万相诊断日志",
+        job_id,
+        slot_index,
+        image_slot_count,
+    )
+    return cleaned_content
+
+
 def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
     """Execute the full generation pipeline for a content job.
 
@@ -231,6 +263,7 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
         state = ArticleState(
             task_id=f"job_{job.id}_{slot_index}",
             user_id=job.created_by or 0,
+            tenant_id=job.tenant_id,
             topic=topic,
             style=config.get("style", "default"),
             footer_template=job.footer_template,
@@ -269,6 +302,8 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
                         .all()
                     )
                     if articles:
+                        # 版式不能混合多篇文章，固定使用排序第一篇的原始 HTML。
+                        state.reference_html = articles[0].body_html or None
                         ref_texts = []
                         for article in articles:
                             body = article.body_markdown or ""
@@ -342,40 +377,26 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
         raw_content = state.content or ""
         image_keywords_from_content = re.findall(r'keywords=([^,\]]+)', raw_content)
 
-        # Step 4: Images (with fallback placeholders)
+        # Step 4: Images. 失败时保留正文并清理图片槽位，绝不能用随机图伪装成功。
         try:
             state = await agent4_analyze_image_requirements(state)
             state = await agent5_generate_images(state)
         except Exception as img_exc:
-            logger.warning("Image generation failed for job %d slot %d: %s", job.id, slot_index, img_exc)
-        # Merge images — if none available, replace [IMAGE:] with placeholders
+            logger.exception(
+                "任务图片生成异常 job=%s slot=%s error_type=%s error=%s",
+                job.id,
+                slot_index,
+                type(img_exc).__name__,
+                str(img_exc)[:500],
+            )
+
+        # 没有生成图片时，正文仍可进入审核，但必须显式移除未填充槽位。
         if not state.images:
-            import secrets
-            has_image_markers = bool(re.search(r'\[IMAGE:', raw_content))
-            if has_image_markers:
-                # Replace existing [IMAGE:] markers with placeholder images
-                def _ph(m: re.Match) -> str:
-                    pos = re.search(r'position=(\d+)', m.group(1))
-                    idx = int(pos.group(1)) if pos else 1
-                    return f'<img src="https://picsum.photos/seed/{secrets.token_hex(4)}{idx}/800/400" style="width:100%;border-radius:8px;margin:16px 0;" />'
-                state.full_content = re.sub(r'\[IMAGE:(.*?)\]', _ph, raw_content)
-            else:
-                # No [IMAGE:] markers at all — inject placeholders at section breaks
-                logger.info("No [IMAGE:] markers found in job %d slot %d — injecting placeholders", job.id, slot_index)
-                lines = raw_content.split("\n")
-                result_lines = []
-                img_count = 0
-                for i, line in enumerate(lines):
-                    result_lines.append(line)
-                    # Inject after headings or every ~5 paragraphs
-                    is_heading = line.strip().startswith('##') or line.strip().startswith('**')
-                    if is_heading and img_count < 6 and i > 0:
-                        img_count += 1
-                        result_lines.append(
-                            f'\n<img src="https://picsum.photos/seed/{secrets.token_hex(4)}{img_count}/800/400" '
-                            f'style="width:100%;border-radius:8px;margin:16px 0;" />\n'
-                        )
-                state.full_content = "\n".join(result_lines)
+            state.full_content = remove_unavailable_image_slots(
+                raw_content,
+                job_id=job.id,
+                slot_index=slot_index,
+            )
             # Append footer if configured
             if job.footer_template:
                 footer = job.footer_template.strip()
@@ -406,19 +427,27 @@ def process_job_batch(db: Session, job: ContentJob) -> List[ContentVersion]:
                     logger.warning("Watermark failed for job %d slot %d: %s", job.id, slot_index, wm_exc)
 
             state = merge_images_into_content(state)
+            from app.services.article_publication_polish_service import append_ai_image_disclaimer
+
+            state.full_content = append_ai_image_disclaimer(state.full_content or state.content or "")
 
         # Step 5: Generate AI cover image (and watermark it)
         cover_url = next(
             (img.url for img in state.images if getattr(img, "position", None) == 1),
             None,
         )
-        if not cover_url and settings.dashscope_api_key:
+        from app.services.image_generation_service import is_image_generation_configured
+
+        if not cover_url and is_image_generation_configured():
             try:
-                from app.services.wanxiang_service import WanxiangImageService
+                from app.services.image_generation_service import image_generation_service
                 main_title_text = first.main_title
                 cover_prompt = f"公众号文章封面图：{main_title_text}。扁平化设计，简洁大气，适合社交媒体传播。"
-                ws = WanxiangImageService()
-                ai_cover = await ws.generate_image(cover_prompt, size="1024*1024")
+                ai_cover = await image_generation_service.generate_image(
+                    cover_prompt,
+                    size="1024*1024",
+                    tenant_id=job.tenant_id,
+                )
                 if ai_cover:
                     cover_url = ai_cover
             except Exception as cover_err:

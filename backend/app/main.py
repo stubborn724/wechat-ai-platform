@@ -167,6 +167,7 @@ def create_app() -> FastAPI:
         auth,
         content_assets,
         content_jobs,
+        erp_products,
         feed_sources,
         health,
         imitation,
@@ -187,6 +188,7 @@ def create_app() -> FastAPI:
     app.include_router(content_jobs.router, prefix="/api/v1", tags=["content-jobs"])
     app.include_router(reviews.router, prefix="/api/v1", tags=["reviews"])
     app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
+    app.include_router(erp_products.router, prefix="/api/v1", tags=["erp-products"])
     app.include_router(feed_sources.router, prefix="/api/v1", tags=["feed-sources"])
     app.include_router(knowledge_bases.router, prefix="/api/v1", tags=["knowledge-bases"])
     app.include_router(publish_plans.router, prefix="/api/v1", tags=["publish-plans"])

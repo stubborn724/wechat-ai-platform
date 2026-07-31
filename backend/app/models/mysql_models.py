@@ -834,12 +834,14 @@ class ScheduledTask(MysqlBase):
     account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
     account_ids = Column(JSON, nullable=True, comment="多选公众号 ID 列表，优先级高于 account_id")
     publish_mode = Column(String(32), default="draft", comment="draft=存草稿箱, direct=直接发布")
-    image_source = Column(String(64), default="pexels", comment="图片来源: pexels/local/DASHSCOPE")
+    image_source = Column(String(64), default="dashscope", comment="图片来源: dashscope/local")
     footer_template = Column(Text, nullable=True)
     content_type = Column(String(32), default="article", comment="article/image/video")
     # 配图方式列表（JSON 数组）
     enabled_image_methods = Column(JSON, nullable=True, comment="配图方式列表")
     enable_watermark = Column(Boolean, default=False, comment="是否启用图片水印")
+    # ERP 分类配图策略。使用 JSON 是为了让旧任务保持兼容，并允许后续扩展筛选条件。
+    erp_image_config = Column(JSON, nullable=True, comment="ERP 分类随机配图与防重配置")
 
     # 仿写（用于 writing_mode=imitation）
     pool_id = Column(Integer, ForeignKey("imitation_pools.id"), nullable=True)
@@ -866,6 +868,54 @@ class ScheduledTaskSlot(MysqlBase):
     sort_order = Column(Integer, nullable=False, default=0)
     content_type = Column(String(32), nullable=False, default="image_text", comment="image_text / video / pure_image")
     publish_domain = Column(String(32), nullable=False, default="public", comment="public / private")
+
+
+class ScheduledTaskRun(MysqlBase):
+    """定时任务单个时间点的执行记录。
+
+    任务的 ``last_run_at`` 只能表达最近一次运行，无法区分同日多个发布时间。
+    该表以任务、日期和计划时间唯一化，使多实例轮询下也不会重复创建同一时段任务。
+    """
+
+    __tablename__ = "scheduled_task_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    scheduled_date = Column(Date, nullable=False)
+    scheduled_time = Column(String(5), nullable=False)
+    status = Column(String(32), nullable=False, default="queued", comment="queued/running/completed/failed")
+    article_id = Column(Integer, ForeignKey("articles.id", ondelete="SET NULL"), nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "scheduled_date", "scheduled_time", name="uq_scheduled_task_run_slot"),
+        Index("ix_scheduled_task_runs_task_date", "task_id", "scheduled_date"),
+    )
+
+
+class ScheduledTaskErpImageUsage(MysqlBase):
+    """ERP 分类图片使用历史。
+
+    以 ERP 原始图片 URL 作为防重键，避免同一图片被重复导入或因产品名称变化逃过
+    防重规则；本地素材 ID 仅用于追溯已归档文件。
+    """
+
+    __tablename__ = "scheduled_task_erp_image_usages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id = Column(Integer, ForeignKey("scheduled_task_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    erp_image_url = Column(String(2048), nullable=False)
+    product_name = Column(String(255), nullable=False)
+    used_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_scheduled_task_erp_image_window", "task_id", "used_at"),
+    )
 
 
 class TenantWatermarkConfig(MysqlBase):

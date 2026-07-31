@@ -43,6 +43,10 @@ const currentImageIndex = ref(0)
 
 // Extract image URLs from markdown for gallery view
 const imageUrls = computed(() => {
+  const sourceHtml = previewArticle.value?.body_html || ''
+  if (sourceHtml) {
+    return Array.from(sourceHtml.matchAll(/<img[^>]+src=["']([^"']+)["']/gi), match => match[1])
+  }
   const md = previewArticle.value?.body_markdown || ''
   const urls: string[] = []
   const regex = /!\[.*?\]\((.*?)\)/g
@@ -231,6 +235,12 @@ function renderMarkdown(md: string): string {
   return sanitizeHtml(blocks)
 }
 
+function renderFeedArticle(article: FeedSourceArticle): string {
+  // 抓取源保存了原始 HTML 时优先展示它，便于用户判断后续仿写会继承的真实版式。
+  if (article.body_html?.trim()) return sanitizeHtml(article.body_html)
+  return renderMarkdown(article.body_markdown || '')
+}
+
 onMounted(load)
 </script>
 
@@ -405,7 +415,7 @@ onMounted(load)
         </div>
 
         <!-- Normal markdown render for text articles -->
-        <div v-else class="rendered-content" v-html="renderMarkdown(previewArticle.body_markdown || '')"></div>
+        <div v-else class="rendered-content" v-html="renderFeedArticle(previewArticle)"></div>
       </div>
     </el-dialog>
 

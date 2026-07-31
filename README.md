@@ -8,7 +8,7 @@
 - **标题生成**：AI 根据主题生成多个标题方案
 - **大纲生成**：结构化文章大纲，支持 AI 辅助修改
 - **正文生成**：流式生成完整文章，支持 Markdown + 配图
-- **图片生成**：自动分析配图需求，从 Pexels/本地素材库获取图片
+- **图片生成**：自动分析配图需求，通过 AI 生图/本地素材库获取图片
 - **图文合并**：自动将图片嵌入文章对应位置
 
 ### 仿写引擎
@@ -54,7 +54,7 @@
 - **框架**：Python FastAPI
 - **AI 管线**：LangGraph + LangChain
 - **LLM**：阿里云 DashScope（通义千问）
-- **图片生成**：通义万相 / Pexels API
+- **图片生成**：通义万相
 - **数据库**：MySQL（业务）+ PostgreSQL / pgvector（向量检索）
 - **缓存**：Redis
 - **对象存储**：MinIO
@@ -95,7 +95,6 @@ cp .env.example .env
 | 变量 | 说明 | 必填 |
 |------|------|------|
 | `DASHSCOPE_API_KEY` | 阿里云 DashScope API Key（通义千问） | 是（AI 生成文章需要） |
-| `PEXELS_API_KEY` | Pexels 图片搜索 API Key | 否（不填则用通义万相生图） |
 | `MYSQL_PORT` | MySQL 端口，Docker 映射的是 3307 | 否（默认 3306） |
 
 其他数据库配置（MySQL / Postgres / Redis / MinIO）使用默认值即可，与 docker-compose.yml 一致。
@@ -149,11 +148,28 @@ docker compose up -d celery-worker celery-beat
 2. 填入微信公众号的 **AppID** 和 **AppSecret**
 3. 保存后即可在文章管理和评论管理中选择该公众号
 
-### IP 白名单
-运行后端服务的服务器 IP 需要添加到微信公众平台的 IP 白名单中：
-1. 登录 `mp.weixin.qq.com`
-2. 开发 → 基本配置 → IP 白名单
-3. 添加服务器的公网 IP
+### 微信 API 调用通道
+
+面向普通用户时推荐使用固定 IP 中转站模式。用户只需要在系统里填写公众号
+**AppID** 和 **AppSecret**，后端会调用中转站，由中转站服务器访问微信官方
+API，因此普通用户不需要拥有微信后台管理员权限，也不需要自行配置 IP 白名单。
+
+```env
+WECHAT_API_CHANNEL=relay
+WECHAT_RELAY_BASE_URL=http://8.166.141.59:21111
+WECHAT_RELAY_APP_ID=relay_client
+WECHAT_RELAY_SECRET=replace-with-relay-secret
+```
+
+`WECHAT_RELAY_SECRET` 是中转站 HMAC 密钥，必须由中转站维护方单独发放，不能
+和微信公众号 `AppSecret` 混用，也不要写入日志。
+
+如果是自管部署并且你能管理公众号后台，也可以使用 `WECHAT_API_CHANNEL=direct`。
+direct 模式会由本机后端直连 `api.weixin.qq.com`，此时仍然需要在
+`mp.weixin.qq.com` 的“开发 → 基本配置 → IP 白名单”中配置后端服务器出口 IP。
+
+当前中转站文档已覆盖文章草稿/发布接口；文章同步、评论、客服消息、阅读数据等
+能力在 `relay` 模式下不会再直连微信官方 API，需要中转站继续提供对应接口后启用。
 
 ### 接口权限
 | 功能 | 所需公众号类型 |

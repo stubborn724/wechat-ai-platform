@@ -1,57 +1,28 @@
 import client from './client'
-import type { Article, TitleOption } from './types'
+import type { Article } from './types'
 
 export interface CreateArticleRequest {
   topic: string
   style?: string
-  image_source?: 'local' | 'pexels'
+  /** 封面图片来源；ERP 图片导入本地后按 local 提交。 */
+  image_source?: 'local' | 'DASHSCOPE'
   enabled_image_methods?: string[]
   user_description?: string
-  mode?: string
+  mode?: 'auto'
   article_count?: number
   account_ids?: number[]
   publish_mode?: string
   knowledge_base_ids?: number[]
   source_feed_id?: number
   feed_article_ids?: number[]
+  /** 正文预选图片，和封面字段严格分离。 */
   selected_image_urls?: string[]
-}
-
-export interface ConfirmTitleRequest {
-  main_title: string
-  sub_title: string
-  user_description?: string
-}
-
-export interface ConfirmOutlineRequest {
-  outline: any
-  watermark_enabled?: boolean
-}
-
-export interface AiModifyOutlineRequest {
-  main_title: string
-  sub_title: string
-  current_outline: any
-  modify_suggestion: string
+  /** 用户明确选定的文章封面，本地与 ERP 入口共用此字段。 */
+  selected_cover_image_url?: string
 }
 
 export async function createArticle(data: CreateArticleRequest): Promise<Article> {
   const res = await client.post('/articles/create', data)
-  return res.data.data || res.data
-}
-
-export async function confirmTitle(taskId: string, data: ConfirmTitleRequest): Promise<Article> {
-  const res = await client.post(`/articles/${taskId}/confirm-title`, data)
-  return res.data.data || res.data
-}
-
-export async function confirmOutline(taskId: string, data: ConfirmOutlineRequest): Promise<Article> {
-  const res = await client.post(`/articles/${taskId}/confirm-outline`, data)
-  return res.data.data || res.data
-}
-
-export async function aiModifyOutline(taskId: string, data: AiModifyOutlineRequest): Promise<any> {
-  const res = await client.post(`/articles/${taskId}/ai-modify-outline`, data)
   return res.data.data || res.data
 }
 

@@ -148,6 +148,11 @@ def save_content(
     import re as _re
     content = _strip_photography_lines(content)
     full_content = _strip_photography_lines(full_content)
+    # 最终落库前统一追加 AI 图片说明。创建文章、重试保存和历史兼容入口都会经过
+    # 此服务，使用幂等渲染器可避免任意调用链重复添加同一句说明。
+    from app.services.article_publication_polish_service import append_ai_image_disclaimer
+
+    full_content = append_ai_image_disclaimer(full_content)
     return update_article_phase(
         db,
         task_id,
@@ -171,6 +176,13 @@ def _strip_photography_lines(text: str) -> str:
     if not text:
         return text
     import re as _re
+
+    # HTML 仿写正文常被序列化为单行，其中既有正文也有图片节点。把整份 HTML
+    # 当作一条“摄影描述文本”处理，会因为命中多个摄影词而误删整个文章。
+    # HTML 的图片说明已由上游 Agent 处理；这里仅清理 Markdown/纯文本兼容内容，
+    # 从而保留原始 DOM 版式和可发布正文。
+    if _re.search(r"<[^>]+>", text):
+        return text
 
     # Step 1: Extract all image keywords from [IMAGE:keywords=XXX] markers AND markdown alt text
     image_keywords = _re.findall(r'keywords=([^,\]]+)', text)

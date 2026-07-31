@@ -23,6 +23,15 @@ class ArticleSlot(BaseModel):
     publish_domain: str = "public"    # public / private
 
 
+class ScheduledErpImageConfig(BaseModel):
+    """定时任务的 ERP 配图策略，分类为空时从来源全部产品中随机选择。"""
+
+    source_key: str
+    commodity_category: Optional[str] = None
+    repeat_after_days: int = 3
+    image_count: int = 8
+
+
 class ScheduledTaskCreate(BaseModel):
     name: str
     topic: Optional[str] = None
@@ -40,11 +49,12 @@ class ScheduledTaskCreate(BaseModel):
     approval_mode: str = "auto"
     account_ids: Optional[List[int]] = None
     publish_mode: str = "draft"  # "draft" 存草稿箱, "direct" 直接发布
-    image_source: str = "pexels"  # 图片来源: pexels/local/DASHSCOPE
+    image_source: str = "dashscope"  # 图片来源: dashscope/local
     footer_template: Optional[str] = None
     content_type: str = "article"  # article / image / video
     enabled_image_methods: Optional[List[str]] = None  # 配图方式
     enable_watermark: bool = False
+    erp_image_config: Optional[ScheduledErpImageConfig] = None
 
 
 class ScheduledTaskUpdate(BaseModel):
@@ -70,6 +80,7 @@ class ScheduledTaskUpdate(BaseModel):
     content_type: Optional[str] = None
     enabled_image_methods: Optional[List[str]] = None
     enable_watermark: Optional[bool] = None
+    erp_image_config: Optional[ScheduledErpImageConfig] = None
 
 
 class SlotResponse(BaseModel):
@@ -103,11 +114,12 @@ class ScheduledTaskResponse(BaseModel):
     approval_mode: str
     account_ids: Optional[list] = None
     publish_mode: str = "draft"
-    image_source: str = "pexels"
+    image_source: str = "dashscope"
     footer_template: Optional[str] = None
     content_type: str = "article"
     enabled_image_methods: Optional[list] = None
     enable_watermark: bool = False
+    erp_image_config: Optional[dict] = None
     total_generated: int
     last_run_at: Optional[datetime] = None
     created_by: Optional[int] = None
@@ -200,6 +212,7 @@ def create_scheduled_task(
         content_type=req.content_type,
         enabled_image_methods=req.enabled_image_methods,
         enable_watermark=req.enable_watermark,
+        erp_image_config=req.erp_image_config.model_dump() if req.erp_image_config else None,
         created_by=principal.user_id,
     )
     db.add(task)
@@ -253,6 +266,8 @@ def update_scheduled_task(
                 ))
 
     for field, value in update_data.items():
+        if field == "erp_image_config" and value is not None:
+            value = value.model_dump() if hasattr(value, "model_dump") else value
         setattr(task, field, value)
 
     # auto-derive writing_mode from the presence of feed/kb sources

@@ -64,6 +64,9 @@ class WeChatArticleSyncService:
     # ------------------------------------------------------------------
 
     async def _post(self, path: str, data: dict) -> dict:
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("微信文章同步")
+
         url = f"{_BASE}{path}?access_token={self.access_token}"
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=data)
@@ -84,6 +87,9 @@ class WeChatArticleSyncService:
 
 async def _get_token(db: Session, account_id: int, tenant_id: int = 0) -> str:
     """获取公众号 access_token（可选验证租户归属）"""
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("微信文章同步")
+
     account_query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
@@ -122,6 +128,9 @@ async def _get_token(db: Session, account_id: int, tenant_id: int = 0) -> str:
 
 def _make_svc(db: Session, account_id: int, tenant_id: int = 0) -> "WeChatArticleSyncService":
     """同步版获取 service（不依赖 asyncio 上下文）"""
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("微信文章同步")
+
     account_query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),

@@ -14,6 +14,10 @@ const loadingDocs = ref(false)
 const showUpload = ref(false)
 const uploadFile = ref<File | null>(null)
 const uploading = ref(false)
+const showDocumentPreview = ref(false)
+const previewingDocument = ref<KbDocument | null>(null)
+const previewChunks = ref<Array<{ chunk_index: number; content: string }>>([])
+const loadingPreview = ref(false)
 
 const searchQuery = ref('')
 const searchResults = ref<any[]>([])
@@ -137,6 +141,25 @@ async function deleteDocument(doc: KbDocument) {
   }
 }
 
+/** 从已向量化切片读取文档正文，避免前端直接访问对象存储文件。 */
+async function previewDocument(doc: KbDocument) {
+  if (!selectedKb.value) return
+  previewingDocument.value = doc
+  previewChunks.value = []
+  showDocumentPreview.value = true
+  loadingPreview.value = true
+  try {
+    const res = await client.get<{ chunks: Array<{ chunk_index: number; content: string }> }>(
+      `/knowledge-bases/${selectedKb.value.id}/documents/${doc.id}/content`,
+    )
+    previewChunks.value = res.data.chunks || []
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '加载文档内容失败')
+  } finally {
+    loadingPreview.value = false
+  }
+}
+
 async function search() {
   if (!searchQuery.value.trim()) return
   searching.value = true
@@ -238,6 +261,7 @@ onMounted(load)
         </el-table-column>
         <el-table-column label="操作" width="80" fixed="right">
           <template #default="{ row }">
+            <el-button link type="primary" size="small" @click="previewDocument(row)">预览</el-button>
             <el-button link type="danger" size="small" @click="deleteDocument(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -315,6 +339,17 @@ onMounted(load)
           上传并解析
         </el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="showDocumentPreview" :title="previewingDocument ? `预览：${previewingDocument.filename}` : '文档预览'" width="760px" top="8vh">
+      <div v-if="loadingPreview" class="loading-section"><el-skeleton :rows="8" animated /></div>
+      <el-empty v-else-if="previewChunks.length === 0" description="该文档没有可预览的文本切片" />
+      <div v-else class="document-preview">
+        <section v-for="chunk in previewChunks" :key="chunk.chunk_index" class="document-chunk">
+          <span class="chunk-label">切片 {{ chunk.chunk_index + 1 }}</span>
+          <pre>{{ chunk.content }}</pre>
+        </section>
+      </div>
     </el-dialog>
   </div>
 </template>
@@ -501,4 +536,9 @@ onMounted(load)
   color: #409eff;
   font-style: normal;
 }
+
+.document-preview { display: grid; gap: 14px; max-height: 65vh; overflow-y: auto; }
+.document-chunk { border: 1px solid #e4e7ed; border-radius: 6px; padding: 14px; background: #fafcfb; }
+.chunk-label { display: inline-block; margin-bottom: 8px; color: #909399; font-size: 12px; }
+.document-chunk pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-family: inherit; font-size: 14px; line-height: 1.75; color: #303133; }
 </style>

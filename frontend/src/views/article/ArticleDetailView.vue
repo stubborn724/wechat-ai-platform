@@ -22,6 +22,9 @@ const taskId = computed(() => route.params.taskId as string)
 
 function renderMarkdown(text: string | undefined | null): string {
   if (!text) return ''
+  // HTML 仿写结果已经是公众号可发布的完整 HTML，不能再次经过 Markdown 解析，
+  // 否则 DOM 结构可能被重组。两种内容最终都必须经过同一层安全清洗。
+  if (/^\s*</.test(text)) return sanitizeHtml(text)
   const html = marked.parse(text, { async: false }) as string
   return sanitizeHtml(html)
 }
@@ -121,7 +124,7 @@ async function loadMetrics() {
       { label: '评论', value: m.comment_count ?? 0 },
       { label: '收藏', value: m.fav_count ?? 0 },
     ]
-    metricsUpdatedAt = m.updated_at || ''
+    metricsUpdatedAt.value = m.updated_at || ''
     const q = qualityRes.data
     if (q.status !== 'not_evaluated') {
       qualityScore.value = q.overall_score

@@ -59,6 +59,21 @@ class DocumentListResponse(BaseModel):
     items: List[DocumentResponse]
 
 
+class DocumentContentChunk(BaseModel):
+    """知识库文档的一个已向量化文本切片。"""
+
+    chunk_index: int
+    content: str
+
+
+class DocumentContentResponse(BaseModel):
+    """前端预览使用的文档正文响应。"""
+
+    document_id: int
+    filename: str
+    chunks: List[DocumentContentChunk]
+
+
 class SearchResult(BaseModel):
     id: int
     content: str
@@ -180,6 +195,26 @@ def get_document(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Document not found")
     return doc
+
+
+@router.get("/knowledge-bases/{kb_id}/documents/{doc_id}/content", response_model=DocumentContentResponse)
+def get_document_content(
+    kb_id: int,
+    doc_id: int,
+    db: Session = Depends(get_pg_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """读取已入库文档的切片内容，供前端预览，不暴露存储层原始文件。"""
+    from app.services.knowledge_base_service import get_document, list_document_chunks
+
+    document = get_document(db, doc_id, tenant_id=principal.tenant_id)
+    if not document or document.knowledge_base_id != kb_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    return DocumentContentResponse(
+        document_id=document.id,
+        filename=document.filename,
+        chunks=list_document_chunks(db, document.id),
+    )
 
 
 @router.delete("/knowledge-bases/{kb_id}/documents/{doc_id}",

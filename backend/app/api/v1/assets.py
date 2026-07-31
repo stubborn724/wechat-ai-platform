@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, func
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,24 @@ class AssetListResponse(BaseModel):
     page: int
     page_size: int
     items: List[AssetResponse]
+
+
+class BulkDeleteAssetsRequest(BaseModel):
+    """素材库批量删除请求。
+
+    上限限制在 100 项，避免一次请求同时删除过多对象存储文件导致接口超时，
+    也避免错误选择时产生难以恢复的大范围数据损失。
+    """
+
+    asset_ids: List[int] = Field(min_length=1, max_length=100)
+
+
+class BulkDeleteAssetsResponse(BaseModel):
+    """批量删除结果，明确区分成功、缺失及存储失败的素材。"""
+
+    deleted_count: int
+    not_found_ids: List[int]
+    failed_ids: List[int]
 
 
 class WatermarkConfigRequest(BaseModel):
@@ -257,6 +275,60 @@ def get_asset_file(
     return RedirectResponse(url=file_url)
 
 
+def _delete_asset_files(asset: Asset) -> None:
+    """删除素材关联的对象存储文件，供单条与批量删除共用。
+
+    数据库记录只应在存储文件成功处理后删除，否则会留下无法通过素材库恢复的孤儿文件。
+    """
+    if asset.storage_key:
+        storage_service.delete(asset.storage_key)
+    if asset.thumbnail_key:
+        storage_service.delete(asset.thumbnail_key)
+
+
+@router.post("/assets/bulk-delete", response_model=BulkDeleteAssetsResponse)
+def bulk_delete_assets(
+    req: BulkDeleteAssetsRequest,
+    db: Session = Depends(get_mysql_db),
+    principal: CurrentPrincipal = Depends(require_auth),
+):
+    """批量删除当前租户的素材及其对象存储文件。
+
+    每个素材独立处理：个别对象存储异常不会阻断其他已选素材的清理，响应中返回失败项，
+    让页面可以保留失败项供用户再次尝试。
+    """
+    asset_ids = list(dict.fromkeys(req.asset_ids))
+    found_assets = db.query(Asset).filter(
+        Asset.tenant_id == principal.tenant_id,
+        Asset.id.in_(asset_ids),
+    ).all()
+    asset_by_id = {asset.id: asset for asset in found_assets}
+    not_found_ids = [asset_id for asset_id in asset_ids if asset_id not in asset_by_id]
+    failed_ids: List[int] = []
+    deleted_count = 0
+
+    for asset_id in asset_ids:
+        asset = asset_by_id.get(asset_id)
+        if asset is None:
+            continue
+        try:
+            _delete_asset_files(asset)
+            db.delete(asset)
+            deleted_count += 1
+        except Exception as exc:
+            failed_ids.append(asset_id)
+            logger.warning("批量删除素材失败: id=%d key=%s error=%s", asset.id, asset.storage_key, exc)
+
+    if deleted_count:
+        db.commit()
+
+    return BulkDeleteAssetsResponse(
+        deleted_count=deleted_count,
+        not_found_ids=not_found_ids,
+        failed_ids=failed_ids,
+    )
+
+
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_asset(
     asset_id: int,
@@ -268,13 +340,7 @@ def delete_asset(
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
-    # Delete from MinIO
-    if asset.storage_key:
-        storage_service.delete(asset.storage_key)
-
-    # Delete thumbnail if exists
-    if asset.thumbnail_key:
-        storage_service.delete(asset.thumbnail_key)
+    _delete_asset_files(asset)
 
     # Delete database record
     db.delete(asset)

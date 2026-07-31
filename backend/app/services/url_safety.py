@@ -40,6 +40,18 @@ _TRUSTED_HOSTS = {
     "0.0.0.0",
 }
 
+# 通义万相与已接入 ERP 的图片交付域名在部分网络会被解析到 RFC 2544
+# 基准测试网段。此处仅允许精确 HTTPS 主机名，不能据此放开整个
+# 198.18.0.0/15 网段，也不能把未审计的 OSS 子域名一并放行。
+_TRUSTED_EXTERNAL_IMAGE_HOSTS = {
+    "dashscope-5859.oss-cn-wulanchabu-acdr-1.aliyuncs.com",
+    "xiumancloud.oss-cn-beijing.aliyuncs.com",
+    # OpenAI 兼容图片主站返回的短期签名图片域名。该域名在当前网络解析到
+    # RFC 2544 基准网段，属于明确审核过的 HTTPS 静态图片交付地址；仅精确
+    # 放行该主机，不能扩大到整个 198.18.0.0/15 网段。
+    "videos.tpkcur.xyz",
+}
+
 # 从配置动态添加 MinIO 等信任主机
 def _init_trusted_hosts():
     try:
@@ -98,6 +110,19 @@ def _check_cloud_metadata(host: str) -> None:
             raise ValueError(f"URL points to cloud metadata service: {host}")
 
 
+def _is_trusted_external_image_url(parsed) -> bool:
+    """判断 URL 是否为经过审计的外部图片交付地址。
+
+    这条例外只适用于 HTTPS 默认端口和静态域名集合，用于兼容可信图片
+    CDN 的特殊 DNS 映射；调用方仍不能借此请求任意内网地址或自定义端口。
+    """
+    return (
+        parsed.scheme == "https"
+        and parsed.port in (None, 443)
+        and (parsed.hostname or "").lower() in _TRUSTED_EXTERNAL_IMAGE_HOSTS
+    )
+
+
 def validate_url(url: str, _is_redirect: bool = False) -> None:
     """校验 URL 是否安全，若不安全则抛出 ValueError
 
@@ -129,6 +154,10 @@ def validate_url(url: str, _is_redirect: bool = False) -> None:
             raise ValueError(f"URL port {parsed.port} is not allowed (forbidden service port)")
 
     host = parsed.hostname or ""
+
+    # 精确放行可信图片域名在当前网络中的基准网段 DNS 映射。
+    if _is_trusted_external_image_url(parsed):
+        return
 
     # 信任的主机跳过 SSRF 检查（如本地 MinIO、CORS 源等基础设施）
     if host in _TRUSTED_HOSTS:

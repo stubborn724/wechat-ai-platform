@@ -183,8 +183,18 @@ async def _check_via_wechat_api(db: Session, account_id: int, openid: str) -> El
     from app.models.mysql_models import AccountCredential, WeChatAccount
     from app.config import settings as cfg
     from app.services.encryption_service import derive_key, decrypt_secret
+    from app.services.wechat_gateway_policy import is_wechat_relay_enabled
 
     now = datetime.now(timezone.utc)
+    if is_wechat_relay_enabled():
+        return EligibilityResult(
+            status="unknown",
+            reason_code="RELAY_ENDPOINT_MISSING",
+            reason_text="当前启用微信中转站模式，用户资格校验需要中转站提供 user/info 能力",
+            recommended_action="PUBLIC_REPLY_ONLY",
+            checked_at=now,
+            source="relay_policy",
+        )
 
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,

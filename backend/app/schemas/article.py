@@ -29,7 +29,7 @@ class ImageRequirement(BaseModel):
     position: int
     type: str  # cover, section, inline
     section_title: str = ""
-    image_source: str  # PEXELS, NANO_BANANA, etc
+    image_source: str  # DASHSCOPE, NANO_BANANA, etc
     keywords: str = ""
     prompt: str = ""
     placeholder_id: str = ""
@@ -104,6 +104,8 @@ class ArticleLayoutMeta(BaseModel):
 class ArticleState(BaseModel):
     task_id: str
     user_id: int = 0
+    # 生成型图片需要按租户归档到 MinIO；默认 0 只用于旧任务兼容，新入口必须传入。
+    tenant_id: int = 0
     topic: str
     style: Optional[str] = None
     title: Optional[SelectedTitle] = None
@@ -123,6 +125,11 @@ class ArticleState(BaseModel):
     source_feed_id: Optional[int] = None
     feed_article_ids: Optional[List[int]] = None
     reference_articles: Optional[List[str]] = None  # full article content for imitation
+    # HTML 仿写优先使用原始网页结构；Markdown 仅保留给旧流程兼容。
+    reference_html: Optional[str] = None
+    # ERP 产品图生图的投喂源只负责文字与 DOM 结构。开启后保留原图片槽位位置，
+    # 但不读取参考图片视觉特征，避免背景规则被外部文章图片污染。
+    skip_reference_image_understanding: bool = False
     style_profile: Optional[dict] = None
     # Layout template for structure imitation
     layout_template: Optional[LayoutTemplate] = None
@@ -134,3 +141,14 @@ class ArticleState(BaseModel):
     article_count: int = 1
     # Local image pre-selection
     selected_image_urls: Optional[List[str]] = None
+    # ERP 定时任务选择的单个产品原图。该字段只作为图生图参考，不会直接插入正文。
+    reference_image_url: Optional[str] = None
+    # OpenAI 兼容图片编辑通过 multipart 直接上传规范化参考图；COS URL 仅供万相
+    # 降级使用。字节字段不会写入 Article 数据库，只存在于单次任务状态中。
+    reference_image_bytes: Optional[bytes] = None
+    reference_content_type: Optional[str] = None
+    # 从当前品牌知识库检索出的视觉约束，供图生图提示词合成使用。
+    image_prompt_context: Optional[str] = None
+    # ERP 定时任务本次选中的唯一产品名称。标题、正文和图片 Agent 共用该字段，
+    # 避免各阶段根据不同关键词猜测产品而导致标题与图片主体不一致。
+    product_name: Optional[str] = None

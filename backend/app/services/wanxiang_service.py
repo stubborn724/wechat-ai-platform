@@ -5,6 +5,7 @@ Uses the async task API: submit -> poll -> return image URL.
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import httpx
@@ -16,9 +17,23 @@ logger = logging.getLogger(__name__)
 WANXIANG_SUBMIT_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis"
 )
+WANXIANG_IMAGE_EDIT_SUBMIT_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/image2image/image-synthesis"
+)
 WANXIANG_TASK_URL = "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
 POLL_INTERVAL = 2.0
 MAX_POLL_ATTEMPTS = 60
+WANXIANG_MODEL = "wanx2.1-t2i-turbo"
+# 图生图使用同一异步服务接口，但必须显式传入产品参考图，才能让生成结果以 ERP
+# 商品为主体而不是仅依据产品名称重新臆造外观。
+# 经过实际 API 探测，`wanx2.1-i2i-turbo` 已不可用；改用百炼当前可识别的
+# 图像编辑模型，仍通过参考图约束保留 ERP 产品主体。
+WANXIANG_IMAGE_TO_IMAGE_MODEL = "wanx2.1-imageedit"
+
+
+def _summarize(value: object, limit: int) -> str:
+    """压缩诊断日志字段，保留故障线索并避免输出敏感或过长内容。"""
+    return " ".join(str(value or "").split())[:limit]
 
 
 class WanxiangImageService:
@@ -33,6 +48,7 @@ class WanxiangImageService:
         size: str = "1024*1024",
         n: int = 1,
         no_text: bool = True,
+        reference_image_url: Optional[str] = None,
     ) -> Optional[str]:
         """Submit an image generation task and wait for completion.
 
@@ -41,6 +57,8 @@ class WanxiangImageService:
             size: Image size (e.g. "1024*1024", "720*1280").
             n: Number of images to generate (1-4).
             no_text: Whether to instruct the model not to generate text.
+            reference_image_url: 可访问的产品原图 URL。存在时使用图生图模型，
+                保留产品主体并仅变化背景、场景和氛围。
 
         Returns:
             URL of the first generated image, or None on failure.
@@ -48,6 +66,8 @@ class WanxiangImageService:
         if not self.api_key:
             logger.warning("No DashScope API key configured for image generation")
             return None
+
+        started_at = time.monotonic()
 
         # 如果未明确说要文字，默认添加无文字指令
         if no_text and "文字" not in prompt and "文本" not in prompt:
@@ -63,41 +83,80 @@ class WanxiangImageService:
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable",
         }
-        body = {
-            "model": "wanx2.1-t2i-turbo",
-            "input": {"prompt": prompt},
-            "parameters": {"size": size, "n": n},
-        }
+        if reference_image_url:
+            # 万相 2.1 图像编辑使用独立 image2image 接口。description_edit 适合不依赖
+            # 蒙版的指令编辑；低强度优先保留 ERP 家具主体、材质和颜色，只替换背景。
+            model = WANXIANG_IMAGE_TO_IMAGE_MODEL
+            submit_url = WANXIANG_IMAGE_EDIT_SUBMIT_URL
+            body = {
+                "model": model,
+                "input": {
+                    "function": "description_edit",
+                    "prompt": prompt,
+                    "base_image_url": reference_image_url,
+                },
+                "parameters": {"n": n, "strength": 0.35},
+            }
+        else:
+            model = WANXIANG_MODEL
+            submit_url = WANXIANG_SUBMIT_URL
+            body = {
+                "model": model,
+                "input": {"prompt": prompt},
+                "parameters": {"size": size, "n": n},
+            }
+        logger.info(
+            "Wanxiang submit model=%s size=%s count=%s prompt_len=%d prompt=%r",
+            model, size, n, len(prompt), _summarize(prompt, 240),
+        )
+        print(
+            f"  [万相] 提交 model={model} size={size} count={n} "
+            f"prompt_len={len(prompt)}"
+        )
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Step 1: Submit task
             try:
-                resp = await client.post(WANXIANG_SUBMIT_URL, headers=headers, json=body)
+                resp = await client.post(submit_url, headers=headers, json=body)
                 if resp.status_code != 200:
                     try:
                         err_detail = resp.json()
                     except Exception:
                         err_detail = resp.text[:500]
-                    logger.warning("通义万相图片生成请求失败 (HTTP %s): %s", resp.status_code, err_detail)
+                    logger.warning(
+                        "Wanxiang submit failed status=%s response=%r",
+                        resp.status_code, _summarize(err_detail, 800),
+                    )
+                    print(
+                        f"  [万相] 提交失败 status={resp.status_code}: "
+                        f"{_summarize(err_detail, 800)}"
+                    )
                     return None
                 resp.raise_for_status()
                 data = resp.json()
             except httpx.HTTPError as e:
                 err_text = repr(e) if not str(e) else str(e)
-                logger.warning("通义万相图片生成请求异常: %s", err_text)
+                logger.warning(
+                    "Wanxiang submit network_error type=%s message=%r",
+                    type(e).__name__, _summarize(err_text, 800),
+                )
                 print(f"  ⚠️ 通义万相请求失败: {err_text}")
                 return None
             except Exception as e:
-                logger.warning("通义万相请求未知异常: %s", repr(e))
+                logger.warning(
+                    "Wanxiang submit unexpected_error type=%s message=%r",
+                    type(e).__name__, _summarize(repr(e), 800),
+                )
                 print(f"  ⚠️ 通义万相请求未知异常: {repr(e)}")
                 return None
 
             task_id = data.get("output", {}).get("task_id")
             if not task_id:
-                logger.warning("No task_id in Wanxiang response: %s", data)
+                logger.warning("Wanxiang submit missing_task_id response=%r", _summarize(data, 800))
                 return None
 
-            logger.info("Wanxiang task submitted: task_id=%s, prompt='%s'", task_id, prompt[:80])
+            logger.info("Wanxiang task submitted task_id=%s", task_id)
+            print(f"  [万相] 任务已提交 task_id={task_id}")
 
             # Step 2: Poll for completion
             for attempt in range(MAX_POLL_ATTEMPTS):
@@ -111,8 +170,11 @@ class WanxiangImageService:
                     poll_data = poll_resp.json()
                 except httpx.HTTPError as e:
                     err_text = repr(e) if not str(e) else str(e)
-                    logger.warning("Wanxiang poll attempt %d/%d failed: %s",
-                                   attempt + 1, MAX_POLL_ATTEMPTS, err_text)
+                    logger.warning(
+                        "Wanxiang poll request failed task_id=%s attempt=%d/%d type=%s message=%r",
+                        task_id, attempt + 1, MAX_POLL_ATTEMPTS,
+                        type(e).__name__, _summarize(err_text, 800),
+                    )
                     continue
 
                 task_status = poll_data.get("output", {}).get("task_status")
@@ -122,16 +184,35 @@ class WanxiangImageService:
                     results = poll_data.get("output", {}).get("results", [])
                     if results:
                         url = results[0].get("url", "")
-                        logger.info("Wanxiang image generated: %s", url[:80])
+                        logger.info(
+                            "Wanxiang task succeeded task_id=%s elapsed_ms=%d image_url=%r",
+                            task_id, int((time.monotonic() - started_at) * 1000), _summarize(url, 160),
+                        )
+                        print(
+                            f"  [万相] 生成成功 task_id={task_id} "
+                            f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+                        )
                         return url
-                    logger.warning("Wanxiang succeeded but no results returned")
+                    logger.warning("Wanxiang task succeeded_without_result task_id=%s", task_id)
                     return None
                 elif task_status in ("FAILED", "CANCELED"):
                     err_msg = poll_data.get("output", {}).get("message", "unknown error")
-                    logger.warning("Wanxiang task %s: %s", task_status, err_msg)
+                    logger.warning(
+                        "Wanxiang task failed task_id=%s status=%s elapsed_ms=%d message=%r",
+                        task_id, task_status, int((time.monotonic() - started_at) * 1000),
+                        _summarize(err_msg, 800),
+                    )
+                    print(
+                        f"  [万相] 任务失败 task_id={task_id} status={task_status}: "
+                        f"{_summarize(err_msg, 800)}"
+                    )
                     return None
 
-            logger.debug("Wanxiang task timed out after %d attempts", MAX_POLL_ATTEMPTS)
+            logger.warning(
+                "Wanxiang task timed_out task_id=%s attempts=%d elapsed_ms=%d",
+                task_id, MAX_POLL_ATTEMPTS, int((time.monotonic() - started_at) * 1000),
+            )
+            print(f"  [万相] 任务超时 task_id={task_id} attempts={MAX_POLL_ATTEMPTS}")
             return None
 
 

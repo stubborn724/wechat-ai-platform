@@ -1,8 +1,9 @@
 """Asset archive service — usage tracking, auto-archive, and library saving."""
 
 import logging
+import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
 from sqlalchemy.orm import Session
@@ -13,6 +14,22 @@ from app.services.url_safety import validate_url
 from app.services.watermark_service import watermark_service
 
 logger = logging.getLogger(__name__)
+
+
+def build_archive_filename(name_hint: Optional[str], extension: str) -> str:
+    """生成素材库可读的原始文件名，并隔离不允许出现在文件名中的字符。
+
+    对象存储键由 UUID 保证唯一性，显示名无需拼接时间戳。这样 ERP 产品导入后，
+    用户看到的是产品名称，而不是自动归档过程产生的技术文件名。
+    """
+    fallback_name = f"auto_archive_{int(datetime.now().timestamp())}"
+    raw_name = (name_hint or fallback_name).strip()
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).rstrip(". ")
+    safe_name = safe_name or fallback_name
+    normalized_extension = extension if extension.startswith(".") else f".{extension}"
+    if safe_name.lower().endswith(normalized_extension.lower()):
+        return safe_name[:255]
+    return f"{safe_name[:255 - len(normalized_extension)]}{normalized_extension}"
 
 
 def record_asset_usage(
@@ -44,6 +61,8 @@ async def save_image_to_asset_library(
     keywords: str = "",
     usage_type: str = "generated_image",
     watermark_enabled: Optional[bool] = None,
+    original_filename: Optional[str] = None,
+    article_image_attribution: Optional[Any] = None,
 ) -> Optional[Asset]:
     """Download an image URL and save it to the asset library.
 
@@ -114,8 +133,27 @@ async def save_image_to_asset_library(
             except Exception as exc:
                 logger.warning("Failed to apply watermark on archive: %s", exc)
 
+        # 文章图片必须在归档地址上叠加当前产品和品牌联系方式。该步骤位于租户
+        # 全局水印之后，确保动态产品名不会被后续 Logo 覆盖；普通素材库导入不传
+        # ``article_image_attribution``，继续保持原有的全局水印行为。
+        if article_image_attribution is not None:
+            try:
+                from app.services.article_publication_polish_service import (
+                    apply_article_image_attribution_to_bytes,
+                )
+
+                file_bytes = apply_article_image_attribution_to_bytes(
+                    file_bytes,
+                    attribution=article_image_attribution,
+                    content_type=content_type,
+                )
+                logger.info("Applied dynamic article image attribution")
+            except Exception as exc:
+                logger.warning("Failed to apply article image attribution: %s", exc)
+
         # Upload to MinIO
-        filename = f"auto_archive_{int(datetime.now().timestamp())}{ext}"
+        # 业务调用方可以提供产品名作为展示文件名；存储键仍使用 UUID，防止重名覆盖。
+        filename = build_archive_filename(original_filename, ext)
         storage_key = generate_object_key(tenant_id, filename, prefix="assets/auto")
         storage_service.upload_bytes(
             object_name=storage_key,
@@ -156,12 +194,20 @@ async def save_images_to_asset_library(
     image_urls: List[str],
     keywords: Optional[List[str]] = None,
     watermark_enabled: Optional[bool] = None,
+    article_image_attribution: Optional[Any] = None,
 ) -> List[Asset]:
     """Save multiple image URLs to the asset library."""
     assets = []
     for i, url in enumerate(image_urls):
         kw = keywords[i] if keywords and i < len(keywords) else ""
-        asset = await save_image_to_asset_library(db, tenant_id, url, kw, watermark_enabled=watermark_enabled)
+        asset = await save_image_to_asset_library(
+            db,
+            tenant_id,
+            url,
+            kw,
+            watermark_enabled=watermark_enabled,
+            article_image_attribution=article_image_attribution,
+        )
         if asset:
             assets.append(asset)
     return assets

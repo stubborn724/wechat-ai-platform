@@ -63,6 +63,7 @@ class ImageTextGenerator(ContentGenerator):
         state = ArticleState(
             task_id=f"job_{job.id}_{slot.sort_order}",
             user_id=job.created_by or 0,
+            tenant_id=job.tenant_id,
             topic=job.topic or "",
             style=config.get("style", "default"),
             footer_template=job.footer_template,
@@ -93,6 +94,8 @@ class ImageTextGenerator(ContentGenerator):
                     )
                     if articles:
                         state.reference_articles = [a.body_markdown or "" for a in articles if a.body_markdown]
+                        # 首篇文章提供唯一 HTML 版式模板，其余文章只作为文字风格参考。
+                        state.reference_html = articles[0].body_html or None
 
             # Knowledge base context
             kb_ids = config.get("knowledge_base_ids", [])
@@ -194,26 +197,11 @@ class PureImageGenerator(ContentGenerator):
 
     def generate(self, db: Session, job: ContentJob, slot: ContentJobArticle) -> Dict[str, Any]:
         config = job.generation_config or {}
-        image_source = config.get("image_source", "pexels")
 
         images = []
         cover_url = None
 
-        # Try to get images from Pexels based on topic
-        if image_source == "pexels":
-            try:
-                from app.services.article_agent_service import _search_pexels_images
-                pexels_results = _search_pexels_images(job.topic or "", count=3)
-                for i, img in enumerate(pexels_results):
-                    url = img.get("url") or img.get("src", {}).get("original", "") if isinstance(img, dict) else str(img)
-                    if url:
-                        if i == 0:
-                            cover_url = url
-                        images.append({"url": url, "position": i + 1})
-            except Exception as exc:
-                logger.warning("Pexels search failed for pure_image: %s", exc)
-
-        # Fallback: use any images from the job config
+        # Use images from the job config
         if not images:
             existing_images = config.get("selected_image_urls", [])
             for i, url in enumerate(existing_images):
@@ -236,6 +224,8 @@ class PureImagePublisher(WeChatPublisherAdapter):
 
     def publish(self, db: Session, article_data: Dict[str, Any],
                 account_id: int, tenant_id: int) -> Dict[str, Any]:
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("纯图片发布")
         from app.services.wechat_publisher import _get_publisher_for_account
 
         publisher = _get_publisher_for_account(db, account_id, tenant_id, actor_id=0)
@@ -311,6 +301,8 @@ class VideoPublisher(WeChatPublisherAdapter):
 
     def publish(self, db: Session, article_data: Dict[str, Any],
                 account_id: int, tenant_id: int) -> Dict[str, Any]:
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("视频发布")
         from app.services.wechat_publisher import _get_publisher_for_account
 
         publisher = _get_publisher_for_account(db, account_id, tenant_id, actor_id=0)

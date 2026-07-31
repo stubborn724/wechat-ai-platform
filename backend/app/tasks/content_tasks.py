@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 async def _process_image_job_sync(db: Session, job: ContentJob, req) -> dict:
     """Process an image job synchronously (inline, no Celery). Falls back to placeholder images on failure."""
-    from app.services.wanxiang_service import WanxiangImageService
+    from app.services.image_generation_service import image_generation_service
     from app.services.storage_service import generate_object_key, storage_service
     from app.services.asset_archive_service import save_image_to_asset_library
 
@@ -60,30 +60,17 @@ async def _process_image_job_sync(db: Session, job: ContentJob, req) -> dict:
               "极简构图，几何美学，干净线条，高级感",
               "丰富层次，纵深感强，光影交错，沉浸氛围"]
 
-    wanxiang = WanxiangImageService()
-
     for i in range(image_count):
         style = styles[i % len(styles)]
         prompt = f"{topic}，{style}"
         print(f"  ▶ 图片 {i+1}/{image_count}")
         img_url = None
         try:
-            img_url = await asyncio.wait_for(
-                wanxiang.generate_image(prompt, size=img_size),
-                timeout=120.0
+            img_url = await image_generation_service.generate_image(
+                prompt,
+                size=img_size,
+                tenant_id=job.tenant_id,
             )
-        except asyncio.TimeoutError:
-            print(f"  ⚠️ 图片 {i+1} API 超时，等待重试...")
-            # 超时后重试一次
-            try:
-                img_url = await asyncio.wait_for(
-                    wanxiang.generate_image(prompt, size=img_size),
-                    timeout=120.0
-                )
-            except asyncio.TimeoutError:
-                print(f"  ⚠️ 图片 {i+1} 再次超时")
-            except Exception as e:
-                print(f"  ⚠️ 图片 {i+1} 重试失败: {e}")
         except Exception as e:
             print(f"  ⚠️ 图片 {i+1} 生成失败: {e}")
         if not img_url:
@@ -231,7 +218,7 @@ def process_image_job(self, job_id: int):
         if job.status != "queued":
             return {"error": f"Job {job_id} is not in queued state"}
 
-        from app.services.wanxiang_service import WanxiangImageService
+        from app.services.image_generation_service import image_generation_service
         from app.services.storage_service import generate_object_key, storage_service
         from app.services.asset_archive_service import save_image_to_asset_library
 
@@ -245,7 +232,6 @@ def process_image_job(self, job_id: int):
             job.status = "generating"
             db.commit()
 
-            wanxiang = WanxiangImageService()
             size_map = {"1:1": "1024*1024", "3:4": "1024*1365", "9:16": "1024*1820", "16:9": "1820*1024", "4:3": "1365*1024"}
             img_size = size_map.get(config.get("aspect_ratio", "4:3"), "1365*1024")
 
@@ -266,7 +252,11 @@ def process_image_job(self, job_id: int):
 
                 img_url = None
                 try:
-                    img_url = await wanxiang.generate_image(full_prompt, size=img_size)
+                    img_url = await image_generation_service.generate_image(
+                        full_prompt,
+                        size=img_size,
+                        tenant_id=job.tenant_id,
+                    )
                 except Exception as img_err:
                     logger.warning("Image %d generation failed: %s", i + 1, img_err)
 
@@ -425,7 +415,7 @@ def process_video_job(self, job_id: int):
             return {"error": f"Job {job_id} is not in queued state"}
 
         from app.services.video_script_service import generate_video_script
-        from app.services.wanxiang_service import WanxiangImageService
+        from app.services.image_generation_service import image_generation_service
         from app.services.tts_service import tts_service
         from app.services.video_composition_service import video_composition_service
 
@@ -464,7 +454,6 @@ def process_video_job(self, job_id: int):
 
             # Step 2: 生成每个分镜的图片
             print(f"\n  >>> Step 2/3: 生成分镜图片 ({storyboard_count}张) <<<")
-            wanxiang = WanxiangImageService()
             size_map = {"9:16": "1024*1820", "16:9": "1820*1024"}
             img_size = size_map.get(aspect_ratio, "1024*1820")
 
@@ -474,9 +463,10 @@ def process_video_job(self, job_id: int):
             for i, sb in enumerate(script.storyboards):
                 print(f"\n  >>> 分镜 {i+1}/{len(script.storyboards)} <<<")
                 print(f"  ├─ prompt: {sb.image_prompt[:80] if sb.image_prompt else '默认'}")
-                img_url = await wanxiang.generate_image(
+                img_url = await image_generation_service.generate_image(
                     sb.image_prompt or f"{job.topic} {sb.visual_desc}",
                     size=img_size,
+                    tenant_id=job.tenant_id,
                 )
                 if img_url:
                     from app.services.asset_archive_service import save_image_to_asset_library

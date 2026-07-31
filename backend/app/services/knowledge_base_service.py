@@ -318,33 +318,52 @@ def process_document(db: Session, kb_id: int, tenant_id: int,
 
 def list_documents(db: Session, kb_id: int,
                     tenant_id: Optional[int] = None) -> List[KbDocument]:
-    """List documents in a knowledge base, newest first."""
+    """列出知识库文档，并通过知识库本身完成租户边界校验。
+
+    ``KbDocument`` 不冗余保存 ``tenant_id``，必须先校验 ``KnowledgeBase``，
+    不能访问不存在的文档租户字段。
+    """
+    if tenant_id is not None and not get_knowledge_base(db, kb_id, tenant_id):
+        return []
     query = db.query(KbDocument).filter(
         KbDocument.knowledge_base_id == kb_id,
         KbDocument.status != "deleted",
     )
-    if tenant_id is not None:
-        query = query.filter(KbDocument.tenant_id == tenant_id)
     return query.order_by(KbDocument.id.desc()).all()
 
 
 def get_document(db: Session, doc_id: int,
                  tenant_id: Optional[int] = None) -> Optional[KbDocument]:
-    """Get a single document by id."""
+    """获取单份文档，并通过所属知识库而非文档字段校验租户。"""
     query = db.query(KbDocument).filter(KbDocument.id == doc_id)
-    if tenant_id is not None:
-        query = query.filter(KbDocument.tenant_id == tenant_id)
-    return query.first()
+    document = query.first()
+    if not document or tenant_id is None:
+        return document
+    return document if get_knowledge_base(db, document.knowledge_base_id, tenant_id) else None
+
+
+def list_document_chunks(db: Session, document_id: int) -> List[dict]:
+    """返回文档的已入库切片，供前端只读预览按原文顺序展示。"""
+    chunks = (
+        db.query(KbDocumentChunk)
+        .filter(KbDocumentChunk.document_id == document_id)
+        .order_by(KbDocumentChunk.chunk_index.asc())
+        .all()
+    )
+    return [
+        {"chunk_index": chunk.chunk_index, "content": chunk.content}
+        for chunk in chunks
+    ]
 
 
 def delete_document(db: Session, doc_id: int,
                     tenant_id: Optional[int] = None) -> bool:
-    """Delete a document and its chunks."""
+    """删除文档及切片，并通过所属知识库校验租户。"""
     query = db.query(KbDocument).filter(KbDocument.id == doc_id)
-    if tenant_id is not None:
-        query = query.filter(KbDocument.tenant_id == tenant_id)
     doc = query.first()
     if not doc:
+        return False
+    if tenant_id is not None and not get_knowledge_base(db, doc.knowledge_base_id, tenant_id):
         return False
     # Delete chunks first
     db.query(KbDocumentChunk).filter(

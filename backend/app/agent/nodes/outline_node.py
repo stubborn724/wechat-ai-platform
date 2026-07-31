@@ -30,8 +30,10 @@ def _build_outline_prompt(state: ArticleGenState) -> str:
         topic=topic,
         main_title=main_title,
         sub_title=sub_title,
+        style=style or "default",
         user_description=user_description or "无",
         style_section=style_section,
+        section_count="4-6",
     )
 
     # Append user description section if provided

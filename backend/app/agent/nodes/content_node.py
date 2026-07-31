@@ -22,7 +22,7 @@ def _build_content_prompt(state: ArticleGenState) -> str:
 
     outline = state.get("outline")
     style = state.get("style") or ""
-    image_source = state.get("image_source", "pexels")
+    image_source = state.get("image_source", "DASHSCOPE")
 
     # Serialise the outline into a readable text format
     outline_text = ""
@@ -47,8 +47,8 @@ def _build_content_prompt(state: ArticleGenState) -> str:
     # Append image source instruction
     if image_source == "local":
         prompt += "\n\n【图片来源说明】优先使用本地素材库中的图片（类型标记为 LOCAL）。"
-    elif image_source == "pexels":
-        prompt += "\n\n【图片来源说明】优先使用 Pexels 图库图片（类型标记为 PEXELS）。"
+    elif image_source == "DASHSCOPE":
+        prompt += "\n\n【图片来源说明】使用 AI 生成图片（类型标记为 DASHSCOPE）。"
 
     return prompt
 

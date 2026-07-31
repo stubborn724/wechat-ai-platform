@@ -5,11 +5,15 @@ Provides pluggable image search back-ends that can be registered with
 """
 
 import abc
+import logging
 from typing import List, Optional
 
 import httpx
 
 from app.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Base abstraction
@@ -29,7 +33,7 @@ class ImageSearchService(abc.ABC):
 
     @abc.abstractmethod
     def get_method(self) -> str:
-        """Return the unique method identifier for this service (e.g. ``"PEXELS"``)."""
+        """Return the unique method identifier for this service (e.g. ``"DASHSCOPE"``)."""
         ...
 
     @staticmethod
@@ -44,55 +48,21 @@ class ImageSearchService(abc.ABC):
 # ---------------------------------------------------------------------------
 
 
-class PexelsService(ImageSearchService):
-    """Search images via the Pexels public API."""
-
-    SEARCH_URL = "https://api.pexels.com/v1/search"
-    PER_PAGE = 5
-
-    def __init__(self) -> None:
-        self.api_key = settings.pexels_api_key
-
-    def get_method(self) -> str:
-        return "PEXELS"
-
-    async def search_image(self, keywords: str, **kwargs) -> Optional[str]:
-        if not self.api_key:
-            return self.get_fallback_image(keywords)
-
-        headers = {"Authorization": self.api_key}
-        params = {"query": keywords, "per_page": self.PER_PAGE}
-
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(
-                    self.SEARCH_URL, headers=headers, params=params, timeout=60.0
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                photos = data.get("photos", [])
-                if photos:
-                    return photos[0]["src"]["medium"]
-            except httpx.HTTPError:
-                pass
-
-        return self.get_fallback_image(keywords)
-
-
 # ---------------------------------------------------------------------------
 # Strategy registry / dispatcher
 # ---------------------------------------------------------------------------
 
 
 class DashScopeImageGenService(ImageSearchService):
-    """Generate images via DashScope Wanxiang (通义万相) API.
+    """兼容历史 ``DASHSCOPE`` 来源值的统一 AI 图片生成入口。
 
-    Uses the prompt from ImageRequirement.prompt as the generation prompt.
+    历史任务和前端仍使用 ``DASHSCOPE`` 作为“AI 生成”标识，但实际主备提供商
+    由全局图片配置决定，业务代码不再绑定通义万相。
     """
 
     def __init__(self) -> None:
-        from app.services.wanxiang_service import WanxiangImageService
-        self.wanxiang = WanxiangImageService()
+        from app.services.image_generation_service import image_generation_service
+        self.generator = image_generation_service
 
     def get_method(self) -> str:
         return "DASHSCOPE"
@@ -100,13 +70,19 @@ class DashScopeImageGenService(ImageSearchService):
     async def search_image(self, keywords: str, **kwargs) -> Optional[str]:
         prompt = kwargs.get("prompt") or keywords
         if not prompt:
-            return self.get_fallback_image(keywords)
+            logger.error("Wanxiang generation skipped because the final prompt is empty")
+            return None
         # 默认不生成文字，除非 prompt 中明确要求了
-        url = await self.wanxiang.generate_image(prompt, no_text=True)
+        url = await self.generator.generate_image(
+            prompt,
+            no_text=True,
+            tenant_id=int(kwargs.get("tenant_id") or 0),
+        )
         if url:
             return url
-        # Fallback to Pexels if Wanxiang fails
-        return self.get_fallback_image(keywords)
+        # 仿写流程不得用随机图库图伪装成功，必须把失败交还给上游明确处理。
+        logger.error("AI 图片生成失败；随机图库回退已阻止 keywords=%r", keywords[:120])
+        return None
 
 
 class ImageServiceStrategy:
@@ -115,15 +91,13 @@ class ImageServiceStrategy:
     Usage::
 
         strategy = ImageServiceStrategy()
-        url = await strategy.execute("PEXELS", "mountain sunset")
+        url = await strategy.execute("DASHSCOPE", "mountain sunset")
     """
 
     def __init__(self) -> None:
         self._services: dict = {}
 
         # Register built-in services
-        pexels = PexelsService()
-        self.register(pexels)
         dashscope = DashScopeImageGenService()
         self.register(dashscope)
 
@@ -142,14 +116,15 @@ class ImageServiceStrategy:
     async def execute(self, method: str, keywords: str, **kwargs) -> Optional[str]:
         """Execute an image search using the service identified by *method*.
 
-        Falls back to the Pexels service if the requested method is not
+        Falls back to the DashScope service if the requested method is not
         registered.
         """
         service = self.get_service(method)
         if service is None:
-            # Fall back to Pexels
-            service = self.get_service("PEXELS")
+            # Fall back to DashScope
+            service = self.get_service("DASHSCOPE")
         if service is None:
-            return ImageSearchService.get_fallback_image(keywords)
+            logger.error("No image provider is registered; 随机图库回退已阻止 method=%s", method)
+            return None
 
         return await service.search_image(keywords, **kwargs)

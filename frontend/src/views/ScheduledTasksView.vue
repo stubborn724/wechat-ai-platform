@@ -3,6 +3,7 @@ import { onMounted, computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import type { Account, FeedSource } from '@/api/types'
+import { listErpProductSources, type ErpProductSource } from '@/api/erpProducts'
 
 interface ScheduledTask {
   id: number
@@ -25,6 +26,13 @@ interface ScheduledTask {
   account_ids: number[] | null
   publish_mode: string
   image_source: string
+  enabled_image_methods: string[] | null
+  erp_image_config?: {
+    source_key: string
+    commodity_category?: string | null
+    repeat_after_days: number
+    image_count: number
+  } | null
   footer_template: string | null
   total_generated: number
   last_run_at: string | null
@@ -41,6 +49,7 @@ const tasks = ref<ScheduledTask[]>([])
 const accounts = ref<Account[]>([])
 const feedSources = ref<FeedSource[]>([])
 const knowledgeBases = ref<any[]>([])
+const erpProductSources = ref<ErpProductSource[]>([])
 const showForm = ref(false)
 const editing = ref(false)
 const currentId = ref<number | null>(null)
@@ -59,10 +68,14 @@ const form = reactive({
   articles_per_day: 1,
   account_ids: [] as number[],
   publish_mode: 'draft',
-  image_source: 'pexels',
+  image_source: 'DASHSCOPE',
+  erp_source_key: '',
+  erp_commodity_category: '',
+  erp_repeat_after_days: 3,
+  erp_image_count: 8,
   footer_template: '',
   content_type: 'article',
-  enabled_image_methods: ['PEXELS', 'DASHSCOPE'],
+  enabled_image_methods: ['DASHSCOPE'],
   enable_watermark: false,
 })
 
@@ -73,8 +86,9 @@ const dayOptions = [
 ]
 
 const imageMethodOptions = [
-  { value: 'PEXELS', label: 'Pexels 图库' },
   { value: 'DASHSCOPE', label: 'AI 生图（通义万相）' },
+  { value: 'LOCAL', label: '本地素材库' },
+  { value: 'ERP', label: 'ERP 产品库' },
 ]
 
 // Feed source article picker
@@ -82,8 +96,8 @@ const feedSourceArticles = ref<any[]>([])
 const showFeedArticlePicker = ref(false)
 const loadingFeedArticles = ref(false)
 
-async function handleFeedSourceChange() {
-  form.feed_article_ids = []
+async function handleFeedSourceChange(preserveSelectedArticles = false) {
+  if (!preserveSelectedArticles) form.feed_article_ids = []
   feedSourceArticles.value = []
   if (!form.feed_source_id) return
   loadingFeedArticles.value = true
@@ -96,6 +110,15 @@ async function handleFeedSourceChange() {
     ElMessage.warning('加载投喂源文章失败')
   } finally {
     loadingFeedArticles.value = false
+  }
+}
+
+/** 只加载允许公开的 ERP 来源，前端永远不持有 ERP 凭证。 */
+async function loadErpProductSources() {
+  try {
+    erpProductSources.value = await listErpProductSources()
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || 'ERP 产品来源加载失败')
   }
 }
 
@@ -132,19 +155,25 @@ function getFeedSourceNames(ids: number[] | null): string {
   return ids.map(id => feedSources.value.find(f => f.id === id)?.name || `#${id}`).join(', ')
 }
 
+function getErpSourceName(sourceKey: string): string {
+  return erpProductSources.value.find(source => source.key === sourceKey)?.name || sourceKey
+}
+
 async function load() {
   loading.value = true
   try {
-    const [t, a, f, k] = await Promise.all([
+    const [t, a, f, k, erpSources] = await Promise.all([
       client.get<{ total: number; items: ScheduledTask[] }>('/scheduled-tasks'),
       client.get<{ items: Account[] }>('/accounts'),
       client.get<{ total: number; items: FeedSource[] }>('/feed-sources').catch(() => ({ data: { items: [] } })),
       client.get<{ items: any[] }>('/knowledge-bases').catch(() => ({ data: { items: [] } })),
+      listErpProductSources().catch(() => []),
     ])
     tasks.value = t.data.items || []
     accounts.value = a.data.items || []
     feedSources.value = f.data.items || []
     knowledgeBases.value = k.data.items || []
+    erpProductSources.value = erpSources
   } catch { ElMessage.error('加载失败') }
   finally { loading.value = false }
 }
@@ -164,9 +193,13 @@ function resetForm() {
   form.articles_per_day = 1
   form.account_ids = []
   form.publish_mode = 'draft'
-  form.image_source = 'pexels'
+  form.image_source = 'DASHSCOPE'
+  form.erp_source_key = ''
+  form.erp_commodity_category = ''
+  form.erp_repeat_after_days = 3
+  form.erp_image_count = 8
   form.footer_template = ''
-  form.enabled_image_methods = ['PEXELS', 'DASHSCOPE']
+  form.enabled_image_methods = ['DASHSCOPE']
   form.enable_watermark = false
   footerQrUrl.value = ''
   editing.value = false
@@ -175,7 +208,7 @@ function resetForm() {
 
 function openCreate() { resetForm(); showForm.value = true }
 
-function openEdit(task: ScheduledTask) {
+async function openEdit(task: ScheduledTask) {
   editing.value = true
   currentId.value = task.id
   form.name = task.name
@@ -192,14 +225,21 @@ function openEdit(task: ScheduledTask) {
   form.articles_per_day = task.articles_per_day
   form.account_ids = task.account_ids || []
   form.publish_mode = task.publish_mode || 'draft'
-  form.image_source = task.image_source || 'pexels'
+  form.image_source = task.image_source || 'DASHSCOPE'
+  form.erp_source_key = task.erp_image_config?.source_key || ''
+  form.erp_commodity_category = task.erp_image_config?.commodity_category || ''
+  form.erp_repeat_after_days = task.erp_image_config?.repeat_after_days || 3
+  form.erp_image_count = task.erp_image_config?.image_count || 8
   form.footer_template = task.footer_template || ''
-  form.enabled_image_methods = (task as any).enabled_image_methods || ['PEXELS', 'DASHSCOPE']
+  form.enabled_image_methods = (task as any).enabled_image_methods || ['DASHSCOPE']
   form.enable_watermark = (task as any).enable_watermark || false
   // 从 footer_template 中提取二维码 URL 用于预览
   const qrMatch = form.footer_template.match(/!\[二维码\]\(([^)]+)\)/)
   footerQrUrl.value = qrMatch ? qrMatch[1] : ''
   showForm.value = true
+  // 编辑已有投喂任务时也必须加载文章列表，否则用户只能看到来源无法选择文章。
+  if (form.feed_source_id) await handleFeedSourceChange(true)
+  if (erpProductSources.value.length === 0) await loadErpProductSources()
 }
 
 function addTime() { form.publish_times.push('08:00') }
@@ -250,6 +290,14 @@ async function save() {
       footer_template: form.footer_template || null,
       enabled_image_methods: form.enabled_image_methods,
       enable_watermark: form.enable_watermark,
+      erp_image_config: form.erp_source_key
+        ? {
+            source_key: form.erp_source_key,
+            commodity_category: form.erp_commodity_category.trim() || undefined,
+            repeat_after_days: form.erp_repeat_after_days,
+            image_count: form.erp_image_count,
+          }
+        : null,
     }
 
     if (editing.value && currentId.value) {
@@ -352,8 +400,16 @@ onMounted(load)
             <span>{{ task.publish_mode === 'direct' ? '直接发布' : '存草稿箱' }}</span>
           </div>
           <div class="info-row">
-            <span class="label">图片来源</span>
-            <span>{{ { pexels: 'Pexels 图库', local: '本地素材', DASHSCOPE: 'AI 生图' }[task.image_source] || task.image_source }}</span>
+            <span class="label">封面来源</span>
+            <span>{{ { DASHSCOPE: 'AI 生图', local: '本地素材库', erp: 'ERP 产品库' }[task.image_source] || task.image_source }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">正文配图</span>
+            <span>{{ (task.enabled_image_methods || []).map((method: string) => ({ DASHSCOPE: 'AI 生图', LOCAL: '本地素材库', ERP: 'ERP 产品库' }[method] || method)).join('、') || '未设置' }}</span>
+          </div>
+          <div v-if="task.erp_image_config" class="info-row">
+            <span class="label">ERP 配图</span>
+            <span>{{ getErpSourceName(task.erp_image_config.source_key) }}，{{ task.erp_image_config.commodity_category || '全部分类' }}，近{{ task.erp_image_config.repeat_after_days }}天不重复</span>
           </div>
           <div class="info-row">
             <span class="label">已生成</span>
@@ -399,30 +455,48 @@ onMounted(load)
               </el-select>
             </el-form-item>
           </el-col>
-          <el-col :span="8">
+          <el-col :span="12">
             <el-form-item label="封面图片来源">
               <el-radio-group v-model="form.image_source">
-                <el-radio value="pexels">Pexels 图库</el-radio>
-                <el-radio value="local">素材库</el-radio>
                 <el-radio value="DASHSCOPE">AI 生图</el-radio>
+                <el-radio value="local">本地素材库</el-radio>
+                <el-radio value="erp">ERP 产品库</el-radio>
               </el-radio-group>
             </el-form-item>
           </el-col>
         </el-row>
 
-        <el-form-item label="正文配图方式">
+        <el-form-item v-if="form.content_type === 'article'" label="正文配图来源（可多选）">
           <el-checkbox-group v-model="form.enabled_image_methods">
             <el-checkbox v-for="opt in imageMethodOptions" :key="opt.value" :value="opt.value">
               {{ opt.label }}
             </el-checkbox>
           </el-checkbox-group>
-          <span class="form-hint">正文中插入的图片来源。封面已单独设置，不受此项影响</span>
+          <span class="form-hint">
+            选择 ERP 产品库时：投喂源只决定文章结构和文案风格，不使用投喂源图片；ERP 产品图作为生成主体，所选知识库决定产品所在场景与背景。只有未选择 ERP 时，AI 生图才会参考投喂源图片风格。
+          </span>
         </el-form-item>
 
-        <el-form-item label="知识库参考（可选，勾选后 AI 会自动检索相关内容）">
+        <el-form-item v-if="form.content_type === 'article' && (form.image_source === 'erp' || form.enabled_image_methods.includes('ERP'))" label="ERP 自动配图规则">
+          <div class="erp-rule-grid">
+            <el-select v-model="form.erp_source_key" placeholder="选择 ERP 产品来源" style="width:100%">
+              <el-option v-for="source in erpProductSources" :key="source.key" :label="source.name" :value="source.key" />
+            </el-select>
+            <el-input v-model="form.erp_commodity_category" clearable placeholder="产品分类（留空表示全部分类）" />
+            <el-input-number v-model="form.erp_repeat_after_days" :min="1" :max="30" controls-position="right" />
+            <el-input-number v-model="form.erp_image_count" :min="1" :max="20" controls-position="right" />
+          </div>
+          <div class="erp-rule-labels"><span>ERP 来源</span><span>产品分类</span><span>防重天数</span><span>每篇上限</span></div>
+          <span class="form-hint">留空分类会从当前 ERP 来源的全部产品中随机选择。每次只选一款产品作为整篇图片主体，知识库规则用于生成不同背景；图片使用历史按任务记录，近三天不会重复。</span>
+        </el-form-item>
+
+        <el-form-item label="知识库规则（可选）">
           <el-select v-model="form.knowledge_base_ids" multiple clearable collapse-tags collapse-tags-tooltip placeholder="选择知识库（可选）" style="width:100%">
             <el-option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id" :label="kb.name" />
           </el-select>
+          <span class="form-hint">
+            系统会按知识库章节拆分使用：文章形式、文案和固定联系方式传给文章 Agent；品牌调性、色彩、材质、场景和图片要求传给图片 Agent。ERP 产品任务需要选择知识库作为背景规则。
+          </span>
         </el-form-item>
 
         <el-form-item label="仿写来源（可选，选择后 AI 会按该来源的风格仿写）">
@@ -582,6 +656,8 @@ onMounted(load)
 .slot-row, .time-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .slot-index { min-width: 24px; font-size: 13px; color: #909399; }
 .feed-source-wrapper { width: 100%; }
+.erp-rule-grid { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr; gap: 10px; width: 100%; }
+.erp-rule-labels { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr; gap: 10px; width: 100%; margin-top: 5px; color: #909399; font-size: 12px; }
 .feed-articles-banner { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .selected-count { font-size: 13px; color: #409eff; font-weight: 500; }
 .selected-count.muted { color: #909399; font-weight: 400; }

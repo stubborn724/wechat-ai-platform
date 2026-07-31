@@ -166,6 +166,9 @@ class WeChatCommentService:
     # ------------------------------------------------------------------
 
     async def _post(self, path: str, data: dict) -> dict:
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("评论管理")
+
         url = f"{_BASE}{path}?access_token={self.access_token}"
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=data)
@@ -181,6 +184,8 @@ class WeChatCommentService:
     def _post_sync(self, path: str, data: dict) -> dict:
         """同步版 _post，用于 Celery 等非异步上下文"""
         import requests as _requests
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("评论管理")
         url = f"{_BASE}{path}?access_token={self.access_token}"
         resp = _requests.post(url, json=data, timeout=15)
         resp.raise_for_status()
@@ -292,6 +297,8 @@ class WeChatCommentService:
 
 async def _get_service(db: Session, account_id: int) -> "WeChatCommentService":
     """从账号获取 access_token（使用 AppID + AppSecret）"""
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("评论管理")
     from app.config import settings
     from app.models.mysql_models import AccountCredential, WeChatAccount
     from app.services.encryption_service import derive_key, decrypt_secret
@@ -473,10 +480,14 @@ async def process_auto_reply_and_msg(
                 continue
 
             try:
-                await _send_msg(
+                result = await _send_msg(
                     db, tenant_id, account_id,
                     comment.openid, config.auto_msg_content,
                 )
+                if isinstance(result, dict) and result.get("errcode", 0) != 0:
+                    raise RuntimeError(
+                        f"auto msg failed: errcode={result.get('errcode')}, errmsg={result.get('errmsg', 'unknown')}"
+                    )
                 messaged += 1
             except RuntimeError as e:
                 logger.warning("Auto-msg failed for openid %s: %s", comment.openid, e)

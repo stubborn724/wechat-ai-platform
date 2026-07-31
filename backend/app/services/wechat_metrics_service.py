@@ -37,6 +37,9 @@ class WeChatMetricsService:
         Returns:
             { "list": [ { "ref_date": "...", "int_page_read_count": N, ... } ] }
         """
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("阅读数据同步")
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"{_BASE}/datacube/getarticleint",
@@ -81,6 +84,9 @@ async def get_metrics_service(
     db: Session, account_id: int, tenant_id: int = 0
 ) -> WeChatMetricsService:
     """构造 WeChatMetricsService 实例"""
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("阅读数据同步")
+
     query = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),

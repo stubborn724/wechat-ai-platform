@@ -343,6 +343,15 @@ def poll_publishing_articles(self):
     """定时任务：轮询「发布中」状态的文章，发布完成后自动获取 msg_data_id"""
     db = MysqlSessionLocal()
     try:
+        from app.services.wechat_gateway_policy import is_wechat_relay_enabled
+        if is_wechat_relay_enabled():
+            logger.info("Skip publish polling: relay mode requires relay freepublish/get endpoint")
+            return {
+                "polled": 0,
+                "skipped": True,
+                "reason": "relay mode requires relay freepublish/get endpoint",
+            }
+
         from app.models.mysql_models import Article, AccountCredential, WeChatAccount
 
         articles = (

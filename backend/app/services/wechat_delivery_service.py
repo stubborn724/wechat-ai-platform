@@ -167,6 +167,11 @@ def _record_attempt(db: Session, delivery_id: int, step: str, attempt_no: int) -
 def _complete_attempt(db: Session, attempt: ContactDeliveryAttempt,
                       status: str, error_code: str = None, error_message: str = None,
                       response_snapshot: dict = None):
+    """完成单次发送尝试。
+
+    这里使用 merge 是为了兼容前面为了控制会话生命周期而关闭过的 Session。
+    """
+    attempt = db.merge(attempt)
     attempt.status = status
     attempt.completed_at = datetime.now(timezone.utc)
     if error_code:
@@ -176,6 +181,20 @@ def _complete_attempt(db: Session, attempt: ContactDeliveryAttempt,
     if response_snapshot:
         attempt.response_snapshot = response_snapshot
     db.commit()
+
+
+def _ensure_send_result_ok(result: dict, step: str):
+    """把微信客服消息的 errcode 显式转换成异常。
+
+    `wechat_message_service` 会记录消息结果，但不会因为 errcode 非 0 自动抛错。
+    发送编排层必须自己兜住这一点，否则 delivery 会被误判为成功。
+    """
+    if not isinstance(result, dict):
+        return
+    errcode = result.get("errcode", 0)
+    if errcode != 0:
+        errmsg = result.get("errmsg", "unknown error")
+        raise RuntimeError(f"{step} send failed: errcode={errcode}, errmsg={errmsg}")
 
 
 # ---- 异步执行核心 ----
@@ -274,6 +293,7 @@ async def execute_delivery(delivery_id: int):
         _update_status(db, delivery, "sending_text")
         attempt_text = _record_attempt(db, delivery.id, "text", delivery.text_attempts + 1)
         delivery.text_attempts += 1
+        db.commit()
         db.close()
         db = MysqlSessionLocal()
         delivery = db.query(ContactDelivery).filter(ContactDelivery.id == delivery_id).first()
@@ -281,10 +301,11 @@ async def execute_delivery(delivery_id: int):
         text_sent = False
         try:
             text_content = (delivery.package_snapshot or {}).get("text_content", "")
-            await _wms.send_text_message(
+            text_result = await _wms.send_text_message(
                 db, delivery.tenant_id, delivery.account_id,
                 delivery.openid, text_content or "",
             )
+            _ensure_send_result_ok(text_result, "text")
 
             delivery.text_status = "success"
             delivery.text_sent_at = datetime.now(timezone.utc)
@@ -305,6 +326,7 @@ async def execute_delivery(delivery_id: int):
         _update_status(db, delivery, "sending_qr")
         attempt_qr = _record_attempt(db, delivery.id, "qr", delivery.qr_attempts + 1)
         delivery.qr_attempts += 1
+        db.commit()
         db.close()
         db = MysqlSessionLocal()
         delivery = db.query(ContactDelivery).filter(ContactDelivery.id == delivery_id).first()
@@ -312,12 +334,13 @@ async def execute_delivery(delivery_id: int):
         qr_sent = False
         try:
             if not text_sent:
-                raise RuntimeError("文字发送失败，跳过二维码")
+                raise RuntimeError("text send failed, skip qr")
 
-            await _wms.send_image_message(
+            image_result = await _wms.send_image_message(
                 db, delivery.tenant_id, delivery.account_id,
                 delivery.openid, media_id or "",
             )
+            _ensure_send_result_ok(image_result, "qr")
 
             delivery.qr_status = "success"
             delivery.qr_sent_at = datetime.now(timezone.utc)
@@ -450,7 +473,8 @@ async def retry_delivery(
 
             try:
                 text_content = (d2.package_snapshot or {}).get("text_content", "")
-                await _wms.send_text_message(db2, tenant_id, d2.account_id, d2.openid, text_content or "")
+                text_result = await _wms.send_text_message(db2, tenant_id, d2.account_id, d2.openid, text_content or "")
+                _ensure_send_result_ok(text_result, "text")
                 d2.text_status = "success"
                 d2.text_error_code = None
                 d2.text_error_message = None
@@ -485,7 +509,8 @@ async def retry_delivery(
                     media_id = None
 
                 if True and media_id:
-                    await _wms.send_image_message(db2, tenant_id, d2.account_id, d2.openid, media_id)
+                    image_result = await _wms.send_image_message(db2, tenant_id, d2.account_id, d2.openid, media_id)
+                    _ensure_send_result_ok(image_result, "qr")
 
                 d2.qr_status = "success"
                 d2.qr_error_code = None

@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 import re
+from urllib.parse import urlparse
 import time
 from datetime import datetime
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -28,10 +29,11 @@ class CreateArticleRequest(BaseModel):
     topic: str
     content_type: str = "article"  # article / image / pure_image / video
     style: Optional[str] = None
-    image_source: str = "PEXELS"
+    image_source: str = "DASHSCOPE"
     enabled_image_methods: Optional[List[str]] = None
     user_description: Optional[str] = None
-    mode: str = "manual"  # "manual" or "auto"
+    # 文章生成已收敛为单一全自动链路，拒绝旧客户端的手动协作模式。
+    mode: Literal["auto"] = "auto"
     article_count: int = 1
     account_ids: Optional[List[int]] = None  # 要发布到的公众号列表，可多选
     publish_mode: str = "draft"  # 发布模式: "draft" 存草稿箱, "direct" 直接发布
@@ -39,37 +41,12 @@ class CreateArticleRequest(BaseModel):
     source_feed_id: Optional[int] = None  # Feed源ID，用于仿写模式
     feed_article_ids: Optional[List[int]] = None  # 具体要仿写的文章ID列表
     selected_image_urls: Optional[List[str]] = None  # 本地素材预选图片URL
+    selected_cover_image_url: Optional[str] = None  # 本地素材库或 ERP 导入后选定的封面图
     footer_template: Optional[str] = None  # 文章底部固定内容
     watermark_enabled: Optional[bool] = None  # 是否加水印，None 则使用租户全局配置
     # 视频专用字段
     duration_sec: Optional[int] = None  # 视频时长（秒）
     aspect_ratio: Optional[str] = None  # 画面比例
-
-
-class ConfirmTitleRequest(BaseModel):
-    main_title: str
-    sub_title: str
-    user_description: Optional[str] = None
-
-
-class OutlineSectionSchema(BaseModel):
-    section: int
-    title: str
-    points: List[str]
-
-
-class OutlineResultSchema(BaseModel):
-    sections: List[OutlineSectionSchema]
-
-
-class ConfirmOutlineRequest(BaseModel):
-    outline: OutlineResultSchema
-    watermark_enabled: Optional[bool] = None  # None = use tenant global config
-
-
-class AiModifyOutlineRequest(BaseModel):
-    instruction: str
-    outline: OutlineResultSchema
 
 
 class ArticleResponse(BaseModel):
@@ -130,6 +107,13 @@ def _strip_photography_text(text: str, pre_extracted_keywords: list | None = Non
     """Remove lines containing photography/image description language from article body."""
     if not text:
         return text
+
+    # HTML 仿写正文通常只有一行，且包含正文与原位图片节点。按文本行检查摄影词
+    # 会把整篇 HTML 当作图片描述删除；HTML 图片信息已在前置 Agent 阶段处理，
+    # 此兼容清理只适用于 Markdown/纯文本内容。
+    if re.search(r"<[^>]+>", text):
+        return text
+
     # Use pre-extracted keywords, or extract from [IMAGE:] markers + markdown alt text
     image_keywords = pre_extracted_keywords or re.findall(r'keywords=([^,\]]+)', text)
     alt_texts = re.findall(r'!\[([^\]]+)\]\([^)]+\)', text)
@@ -167,67 +151,23 @@ def _strip_photography_text(text: str, pre_extracted_keywords: list | None = Non
 
 
 def _render_image_markers(content: str, task_id: str) -> str:
-    """Replace [IMAGE:] markers in content with appropriate HTML.
+    """清理未生成图片的标记，避免旧入口用随机图库伪装生成结果。
 
-    Handles type=gallery markers by grouping them into a carousel.
+    此函数仅由旧同步流程在没有可用图片 URL 时调用。过去会在这里把每个
+    ``[IMAGE:...]`` 标记替换为 Picsum 随机图，造成文章看似生成成功，实际画面
+    与主题和参考图完全无关。新的约束是：图片生成失败时正文仍可保存，但图片槽位
+    必须为空，并在后端日志中保留任务编号供排障。
     """
     import re as _re
-    gallery_markers = []
-    text_markers = []
-
-    for m in _re.finditer(r'\[IMAGE:(.*?)\]', content):
-        marker = m.group(0)
-        inner = m.group(1)
-        pos = _re.search(r'position=(\d+)', inner)
-        idx = int(pos.group(1)) if pos else 1
-        kw = _re.search(r'keywords=([^,\]]+)', inner)
-        keywords = kw.group(1) if kw else ""
-        is_gallery = 'type=gallery' in inner
-        url = f"https://picsum.photos/seed/{task_id[:8]}{idx}/800/400"
-        if is_gallery:
-            gallery_markers.append((marker, url, keywords, idx))
-        else:
-            text_markers.append((marker, url, keywords, idx))
-
-    result = content
-    for marker, url, keywords, _ in text_markers:
-        img = f'<img src="{url}" alt="{keywords}" style="width:100%;border-radius:8px;margin:16px 0;" />'
-        result = result.replace(marker, img, 1)
-
-    if gallery_markers:
-        thumbs = ""
-        images = []
-        for i, (_, url, kw, _) in enumerate(gallery_markers):
-            images.append((url, kw, i))
-            border = '#07c160' if i == 0 else 'transparent'
-            op = '1' if i == 0 else '0.6'
-            thumbs += (
-                f'<div style="flex:0 0 80px;height:60px;border-radius:6px;overflow:hidden;'
-                f'cursor:pointer;border:2px solid {border};opacity:{op};transition:all .2s;" '
-                f'onclick="let p=this.parentElement;'
-                f'p.querySelectorAll(\'>div\').forEach(d=>{{d.style.border=\'2px solid transparent\';d.style.opacity=\'0.6\'}});'
-                f'this.style.border=\'2px solid #07c160\';this.style.opacity=\'1\';'
-                f'p.parentElement.querySelector(\'.gallery-main img\').src=\'{url}\';">'
-                f'<img src="{url}" alt="{kw}" loading="lazy" '
-                f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
-                f'</div>'
-            )
-
-        first = images[0]
-        html = (
-            f'<div class="image-gallery" style="margin:16px 0;">'
-            f'<div class="gallery-main" style="width:100%;background:#f0f0f0;border-radius:8px;'
-            f'overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:300px;">'
-            f'<img src="{first[0]}" alt="{first[1]}" '
-            f'style="max-width:100%;max-height:65vh;width:auto;height:auto;object-fit:contain;" />'
-            f'</div>'
-            f'<div style="display:flex;gap:8px;margin-top:12px;overflow-x:auto;padding:4px 0;">'
-            f'{thumbs}</div></div>'
-        )
-        for marker, _, _, _ in gallery_markers:
-            result = result.replace(marker, "", 1)
-        result = html + result
-
+    marker_count = len(_re.findall(r'\[IMAGE:[^\]]*\]', content))
+    result = _re.sub(r'\[IMAGE:[^\]]*\]', '', content)
+    result = _re.sub(r'\n{3,}', '\n\n', result).strip()
+    logger.error(
+        "旧文章流程图片生成结果缺失，已移除图片槽位 task=%s image_slots=%s；"
+        "随机图库回退已阻止，请检查万相诊断日志",
+        task_id,
+        marker_count,
+    )
     return result
 
 
@@ -259,24 +199,6 @@ def _require_api_key():
 # Agent runners (sync wrappers around async agent functions)
 # ---------------------------------------------------------------------------
 
-async def _run_title_agent(state):
-    """Run agent1 (title generation). Returns list of title option dicts."""
-    from app.services.article_agent_service import (
-        AGENT1_TITLE_PROMPT,
-        agent1_generate_title_options,
-    )
-
-    _require_api_key()
-    t0 = time.perf_counter()
-    state = await agent1_generate_title_options(state)
-    elapsed = int((time.perf_counter() - t0) * 1000)
-
-    prompt = AGENT1_TITLE_PROMPT.format(topic=state.topic, style=state.style or "default")
-    raw = json.dumps([opt.model_dump() for opt in state.title_options], ensure_ascii=False)
-    _log_io("Agent1 标题生成", prompt, raw, elapsed)
-    return [opt.model_dump() for opt in state.title_options]
-
-
 async def _run_outline_agent(state):
     """Run agent2 (outline generation). Returns outline dict."""
     from app.services.article_agent_service import AGENT2_OUTLINE_PROMPT, agent2_generate_outline
@@ -286,10 +208,16 @@ async def _run_outline_agent(state):
     state = await agent2_generate_outline(state)
     elapsed = int((time.perf_counter() - t0) * 1000)
 
+    section_count = (
+        str(len(state.layout_template.sections))
+        if getattr(state, 'layout_template', None) and state.layout_template.sections
+        else "4-6"
+    )
     prompt = AGENT2_OUTLINE_PROMPT.format(
         topic=state.topic, main_title=state.title.main_title,
         sub_title=state.title.sub_title, style=state.style or "default",
         user_description=state.user_description or "无", style_section="",
+        section_count=section_count,
     )
     raw = json.dumps(state.outline.model_dump() if state.outline else {}, ensure_ascii=False)
     _log_io("Agent2 大纲生成", prompt, raw, elapsed)
@@ -347,6 +275,57 @@ def _sample_content(main_title: str, sub_title: str, outline: dict) -> str:
 # Routes
 # ---------------------------------------------------------------------------
 
+
+def _require_generated_content(content: str, generation_error: Optional[str] = None) -> str:
+    """校验正文 Agent 的初始输出，保证后续图片流程有可处理的正文。
+
+    HTML 仿写会先生成带 ``__AI_IMAGE_SLOT_*__`` 的 DOM，再由图片 Agent 原位
+    回填真实地址。因此本阶段只能校验正文非空，不能将图片槽位视为异常。
+    """
+    normalized_content = (content or "").strip()
+    if not normalized_content:
+        detail = generation_error or "模型未返回可用正文"
+        raise ValueError(f"正文生成失败，已中止后续发布：{detail}")
+    return normalized_content
+
+
+def _require_publishable_content(content: str, generation_error: Optional[str] = None) -> str:
+    """校验图片回填与保存后的最终正文，阻止无效 HTML 发往微信中转站。
+
+    该函数只能在 Agent4/Agent5 完成、图片 URL 已写回 DOM 后调用。此时仍存在
+    图片槽位意味着图片回填失败，若继续提交，中转站会把占位符当作图片地址并
+    拒绝发布。将它和初始正文校验拆分，可避免误伤 HTML 仿写的正常中间状态。
+    """
+    normalized_content = _require_generated_content(content, generation_error)
+    if "__AI_IMAGE_SLOT_" in normalized_content:
+        raise ValueError("正文生成失败，已中止后续发布：图片占位符未替换")
+    return normalized_content
+
+
+def select_delivery_image_url(source_url: str, archived_url: str) -> str:
+    """选择可交付给前端和微信中转站的图片地址。
+
+    中转站模式会在真正发送前把本地 MinIO 图片临时转成 COS HTTPS 地址，因此必须
+    优先使用已经叠加水印和产品署名的归档地址；不能因本地地址不是 HTTPS 又回退到
+    模型原图，否则用户看到的发布图将丢失署名。直连微信模式仍要求公网 HTTPS，
+    此时保留源地址以兼容尚未配置公网对象存储的历史环境。
+    """
+    normalized_source_url = (source_url or "").strip()
+    normalized_archived_url = (archived_url or "").strip()
+    if str(settings.wechat_api_channel or "").strip().lower() == "relay":
+        return normalized_archived_url or normalized_source_url
+
+    parsed_archived_url = urlparse(normalized_archived_url)
+    archived_host = (parsed_archived_url.hostname or "").lower()
+    is_public_https_archive = (
+        parsed_archived_url.scheme == "https"
+        and bool(archived_host)
+        and archived_host not in {"localhost", "127.0.0.1", "::1"}
+    )
+    if is_public_https_archive:
+        return normalized_archived_url
+    return normalized_source_url or normalized_archived_url
+
 @router.post("/articles/create", status_code=status.HTTP_201_CREATED)
 async def create_article(
     req: CreateArticleRequest,
@@ -367,16 +346,19 @@ async def create_article(
                 from app.agent.nodes.title_imitation_node import imitate_title
                 from app.agent.nodes.image_understanding_node import understand_images
                 from app.agent.nodes.prompt_crafting_node import craft_prompt
-                from app.services.wanxiang_service import WanxiangImageService
+                from app.agent.nodes.image_prompt_builder import build_wanxiang_prompt
+                from functools import partial
+                from app.services.image_generation_service import image_generation_service
                 from app.services.asset_archive_service import save_image_to_asset_library
+                from app.services.reference_image_imitation_service import imitate_reference_images
+                from app.services.reference_media_analysis_service import extract_markdown_image_urls
                 from app.models.mysql_models import FeedSourceArticle as FSA
-                import re as _re
 
                 ref_articles = db.query(FSA).filter(FSA.id.in_(req.feed_article_ids)).all()
                 ref = ref_articles[0] if ref_articles else None
                 ref_title = ref.title if ref else ""
                 ref_body = ref.body_markdown if ref else ""
-                image_urls = _re.findall(r'!\[.*?\]\((.*?)\)', ref_body or "")
+                image_urls = extract_markdown_image_urls(ref_body)
 
                 print(f"  参考文章: {ref_title}")
                 print(f"  提取图片: {len(image_urls)} 张")
@@ -391,30 +373,35 @@ async def create_article(
                     new_title = titles[0] if titles else ref_title
                 print(f"  标题: {new_title}")
 
-                # Agent 3: 视觉理解
-                visual_descs = understand_images(image_urls)
-
-                # Agent 4+5: 逐张生成
-                wanxiang = WanxiangImageService()
-                gen_urls = []
-                for i, desc in enumerate(visual_descs):
-                    print(f"\n  >>> 图片 {i+1}/{len(visual_descs)} <<<")
-                    pd = craft_prompt(desc, topic=new_title, similarity="medium")
-                    prompt = pd["prompt"]
-                    if not prompt:
-                        from app.agent.nodes.image_prompt_builder import build_wanxiang_prompt
-                        prompt = build_wanxiang_prompt(desc, new_title, "medium")
-                    print(f"  生成 prompt ({len(prompt)}字): {prompt[:200]}")
-                    img_url = await wanxiang.generate_image(prompt, size="1024*1365")
-                    if img_url:
-                        asset = await save_image_to_asset_library(db, principal.tenant_id, img_url, keywords=new_title[:50])
-                        gen_urls.append(img_url)
-                        print(f"  ✅ 图片 {i+1} 生成成功")
-                    else:
-                        print(f"  ⚠️ 图片 {i+1} 生成失败")
+                # 视觉理解、二维码过滤、提示词构建与图片生成统一由共享服务编排，
+                # 保证即时任务和定时任务不会因各自维护循环而出现规则漂移。
+                imitation_result = await imitate_reference_images(
+                    image_urls,
+                    new_title,
+                    tenant_id=principal.tenant_id,
+                    understand_images_fn=understand_images,
+                    craft_prompt_fn=craft_prompt,
+                    fallback_prompt_fn=build_wanxiang_prompt,
+                    generate_image_fn=partial(
+                        image_generation_service.generate_image,
+                        tenant_id=principal.tenant_id,
+                    ),
+                    archive_image_fn=lambda tenant_id, image_url, **kwargs: save_image_to_asset_library(
+                        db,
+                        tenant_id,
+                        image_url,
+                        **kwargs,
+                    ),
+                )
+                gen_urls = list(imitation_result.generated_urls)
+                if imitation_result.skipped_qrcode_count:
+                    print(f"  🚫 已跳过 {imitation_result.skipped_qrcode_count} 张二维码参考图")
 
                 if not gen_urls:
-                    return {"type": "content_job", "error": "所有图片生成失败", "status": "fail"}
+                    error = "参考图片均为二维码，已跳过仿写" if (
+                        imitation_result.skipped_qrcode_count == len(image_urls)
+                    ) else "所有非二维码图片生成失败"
+                    return {"type": "content_job", "error": error, "status": "fail"}
 
                 # 保存到微信草稿箱
                 if req.publish_mode in ("draft", "direct") and req.account_ids:
@@ -568,12 +555,15 @@ async def create_article(
             # 用 AI 生成视频封面
             cover_url = ""
             try:
-                from app.services.wanxiang_service import WanxiangImageService as _WX
+                from app.services.image_generation_service import image_generation_service
                 from app.services.asset_archive_service import save_image_to_asset_library
                 cover_prompt = f"{req.topic}，封面图，视觉冲击力，高清，适合做视频封面"
                 print(f"  >>> 生成封面: {req.topic}")
-                _wx = _WX()
-                _cover_img_url = await _wx.generate_image(cover_prompt, size="720*1280")
+                _cover_img_url = await image_generation_service.generate_image(
+                    cover_prompt,
+                    size="720*1280",
+                    tenant_id=principal.tenant_id,
+                )
                 if _cover_img_url:
                     _asset = await save_image_to_asset_library(db, principal.tenant_id, _cover_img_url, keywords=f"video_cover_{job.id}")
                     if _asset and _asset.storage_key:
@@ -635,12 +625,12 @@ async def create_article(
 
     try:
         from app.schemas.article import ArticleState
-        from app.services.article_service import save_title_options
 
         state = ArticleState(
             task_id=article.task_id, user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
             topic=req.topic, style=req.style or "default",
-            enabled_image_methods=req.enabled_image_methods or ["PEXELS", "DASHSCOPE"],
+            enabled_image_methods=req.enabled_image_methods or ["DASHSCOPE"],
             knowledge_base_ids=req.knowledge_base_ids,
             source_feed_id=req.source_feed_id,
             feed_article_ids=req.feed_article_ids,
@@ -675,6 +665,7 @@ async def create_article(
                 print(f"  ⚠️ 知识库检索失败: {exc}")
 
         # ========== 加载投喂源文章内容（仿写用） ==========
+        reference_article_title = ""
         if req.source_feed_id and req.feed_article_ids:
             try:
                 from app.models.mysql_models import FeedSourceArticle
@@ -688,10 +679,20 @@ async def create_article(
                     .all()
                 )
                 if articles_to_imitate:
+                    reference_article_title = (articles_to_imitate[0].title or "").strip()
+                    # 一篇投喂文章决定最终版式。多篇文章仍可作为文字风格参考，但不
+                    # 混合 HTML 模板，避免不同页面结构相互覆盖造成图文顺序错乱。
+                    state.reference_html = articles_to_imitate[0].body_html or None
                     ref_texts = []
                     for a in articles_to_imitate:
                         title = a.title or ""
-                        body = a.body_markdown or ""
+                        # 来源账号的购买提示、电话和二维码不能成为语言仿写样本，
+                        # 否则即使最终页脚替换成功，正文 Agent 仍可能复写来源联系卡。
+                        from app.services.reference_contact_filter_service import (
+                            strip_reference_contact_markdown,
+                        )
+
+                        body = strip_reference_contact_markdown(a.body_markdown or "")
                         # Clean: strip [IMAGE:], photography lines, then truncate to 300 chars
                         body = re.sub(r'\[IMAGE:[^\]]*\]', '', body)
                         body = re.sub(r'^.*?(?:45度|俯拍|仰拍|微距|特写|暖光|逆光|打光|布光).*?(?:场景|效果|展示|组合|特写).*?\n', '', body, flags=re.MULTILINE)
@@ -727,26 +728,52 @@ async def create_article(
             except Exception as exc:
                 print(f"  ⚠️ 加载投喂源风格失败: {exc}")
 
-        # ========== AUTO MODE: 跳过标题生成，直接用主题作为标题 ==========
+        # ========== AUTO MODE: 自动确定标题，再生成大纲与正文 ==========
         if req.mode == "auto":
             from app.schemas.article import SelectedTitle
             from app.services.article_service import save_outline, save_content
 
-            # 直接用主题作为标题
-            main_title = req.topic
-            sub_title = ""
+            user_topic = (req.topic or "").strip()
+            if user_topic:
+                # 用户明确给出主题时，主题就是本次创作方向，保持现有自动生成行为。
+                main_title = user_topic
+                sub_title = ""
+                title_options = [{"main_title": main_title, "sub_title": sub_title}]
+                print(f"  ▶ [自动] 使用用户主题作为标题: {main_title}")
+            else:
+                # 未输入主题时，必须先由标题仿写 Agent 产出原创标题。禁止将投喂
+                # 文章原题作为回退值，否则后续大纲和正文会变成围绕原题的复述。
+                if not reference_article_title:
+                    raise ValueError("未填写主题且未选择包含标题的投喂文章，无法生成文章")
+                if not settings.dashscope_api_key:
+                    raise RuntimeError("未配置模型密钥，无法为投喂文章生成仿写标题")
+
+                from app.services.article_agent_service import agent1_generate_imitation_title
+
+                print("  ▶ [自动] 调用标题仿写 Agent...")
+                state = await agent1_generate_imitation_title(state, reference_article_title)
+                if state.error or not state.title_options:
+                    raise ValueError(state.error or "标题仿写 Agent 未返回可用标题")
+
+                selected_option = state.title_options[0]
+                main_title = selected_option.main_title.strip()
+                sub_title = selected_option.sub_title.strip()
+                title_options = [option.model_dump() for option in state.title_options]
+                print(f"  ▶ [自动] 标题仿写完成: {main_title}")
+
+            state.topic = main_title
             state.title = SelectedTitle(main_title=main_title, sub_title=sub_title)
+            article.topic = main_title
             article.main_title = main_title
             article.sub_title = sub_title
-            article.title_options = [{"main_title": main_title, "sub_title": sub_title}]
+            article.title_options = title_options
             db.commit()
-            print(f"  ▶ [自动] 直接用主题作为标题: {main_title}")
 
             # Generate outline
             if settings.dashscope_api_key:
                 outline_data = await _run_outline_agent(state)
             else:
-                outline_data = _sample_outline(req.topic, main_title)
+                outline_data = _sample_outline(state.topic, main_title)
             save_outline(db, article.task_id, outline_data)
             print(f"  ▶ [自动] 大纲已生成")
 
@@ -756,31 +783,43 @@ async def create_article(
                 state.content = content
             else:
                 content = _sample_content(main_title, sub_title, outline_data)
+            content = _require_generated_content(content, state.error)
+            state.content = content
             print(f"  ▶ [自动] 正文已生成 ({len(content)} chars)")
 
             # ===== Generate images (Agent4+Agent5) & auto-archive =====
-            cover_image_url = None
-            if settings.dashscope_api_key:
+            # 封面与正文配图是两条独立数据流。手动选择的本地/ERP 图片只作为封面，
+            # 正文配图仍由 enabled_image_methods 和 Agent4/Agent5 决定。
+            cover_image_url = req.selected_cover_image_url or None
+            from app.services.image_generation_service import is_image_generation_configured
+
+            if is_image_generation_configured():
                 try:
                     from app.services.article_agent_service import (
                         agent4_analyze_image_requirements,
                         agent5_generate_images,
                         merge_images_into_content,
                     )
-                    # Step 1: Generate a dedicated AI cover image from the article title
-                    print("  ▶ [自动] 生成AI封面图...")
-                    try:
-                        from app.services.wanxiang_service import WanxiangImageService
-                        cover_prompt = f"公众号文章封面图：{main_title}。扁平化设计，简洁大气，适合社交媒体传播。不要包含任何文字或标题。"
-                        ws = WanxiangImageService()
-                        cover_url = await ws.generate_image(cover_prompt, size="1024*1024")
-                        if cover_url:
-                            cover_image_url = cover_url
-                            print(f"  ✅ AI封面图生成成功: {cover_url[:60]}")
-                        else:
-                            print(f"  ⚠️ AI封面生成失败，将使用正文配图")
-                    except Exception as cover_err:
-                        print(f"  ⚠️ AI封面图生成异常: {cover_err}")
+                    # 仅在用户未指定本地/ERP 封面时调用万相生成，避免覆盖明确选择。
+                    if cover_image_url:
+                        print(f"  ▶ [自动] 使用已选择的封面图: {cover_image_url[:80]}")
+                    else:
+                        print("  ▶ [自动] 生成AI封面图...")
+                        try:
+                            from app.services.image_generation_service import image_generation_service
+                            cover_prompt = f"公众号文章封面图：{main_title}。扁平化设计，简洁大气，适合社交媒体传播。不要包含任何文字或标题。"
+                            cover_url = await image_generation_service.generate_image(
+                                cover_prompt,
+                                size="1024*1024",
+                                tenant_id=principal.tenant_id,
+                            )
+                            if cover_url:
+                                cover_image_url = cover_url
+                                print(f"  ✅ AI封面图生成成功: {cover_url[:60]}")
+                            else:
+                                print(f"  ⚠️ AI封面生成失败，将使用正文配图")
+                        except Exception as cover_err:
+                            print(f"  ⚠️ AI封面图生成异常: {cover_err}")
 
                     # Detect pure-image gallery BEFORE agent4 (which may hang)
                     is_gallery = state.content and all(
@@ -806,21 +845,35 @@ async def create_article(
                     # Save images to asset library (include cover image)
                     if state.images:
                         from app.services.asset_archive_service import save_images_to_asset_library
+                        from app.services.article_publication_polish_service import (
+                            build_article_image_attribution,
+                        )
                         image_urls = [img.url for img in state.images if img.url]
-                        if cover_image_url and cover_image_url not in image_urls:
+                        # 手动封面已经存在本地素材库，无需再次下载归档形成重复素材。
+                        if (
+                            cover_image_url
+                            and not req.selected_cover_image_url
+                            and cover_image_url not in image_urls
+                        ):
                             image_urls.append(cover_image_url)
                         print(f"  ▶ [自动] 归档 {len(image_urls)} 张素材到素材库...")
                         archived = await save_images_to_asset_library(
                             db, principal.tenant_id, image_urls,
                             watermark_enabled=req.watermark_enabled,
+                            article_image_attribution=build_article_image_attribution(
+                                state.product_name or main_title,
+                            ),
                         )
-                        # Build mapping: original URL -> watermarked MinIO URL
+                        # 归档始终执行；文章交付地址则必须保证微信中转站能够访问。
                         from app.services.storage_service import storage_service as _ss
                         url_map: dict[str, str] = {}
                         for orig_url, asset_obj in zip(image_urls, archived):
                             if asset_obj:
-                                url_map[orig_url] = _ss.get_url(asset_obj.storage_key)
-                        # Replace original URLs with watermarked versions
+                                url_map[orig_url] = select_delivery_image_url(
+                                    orig_url,
+                                    _ss.get_url(asset_obj.storage_key),
+                                )
+                        # 公网 HTTPS MinIO 使用水印归档图；本机 HTTP MinIO 保留万相原图。
                         if url_map:
                             for img in state.images:
                                 if img.url and img.url in url_map:
@@ -847,10 +900,26 @@ async def create_article(
 
             # Post-processing: strip image descriptions using pre-extracted keywords
             content_rich = _strip_photography_text(content_rich, image_keywords_auto)
+            # 不让模型或投喂源自行决定 AI 图片说明。统一在最终正文落库前追加，
+            # 并且内部已实现幂等，自动保存与重试发布都不会产生多份说明。
+            from app.services.article_publication_polish_service import append_ai_image_disclaimer
 
-            save_content(db, article.task_id, content, content_rich,
-                         cover_image=cover_image_url,
-                         footer_template=req.footer_template)
+            content_rich = append_ai_image_disclaimer(content_rich)
+
+            saved_article = save_content(
+                db,
+                article.task_id,
+                content,
+                content_rich,
+                cover_image=cover_image_url,
+                footer_template=req.footer_template,
+            )
+            # ``save_content`` 仍会兼容处理旧 Markdown 内容。读取持久化后的结果
+            # 再次校验，确保任一后处理步骤都不能把空正文继续交给微信中转站。
+            _require_publishable_content(
+                (saved_article.full_content or saved_article.content) if saved_article else "",
+                "保存正文后内容为空",
+            )
             if cover_image_url:
                 article.cover_image = cover_image_url
             article.status = "completed"
@@ -878,243 +947,17 @@ async def create_article(
                     article.phase = "PUBLISHED" if req.publish_mode == "direct" else "DRAFT_SAVED"
                     db.commit()
 
-        # ========== MANUAL MODE: 生成标题供用户选择 ==========
-        else:
-            if settings.dashscope_api_key:
-                print("  ▶ 运行 Agent1 标题生成...")
-                title_opts = await _run_title_agent(state)
-            else:
-                print("  ▶ 使用示例标题 (dashscope_api_key 未配置)")
-                title_opts = [
-                    {"main_title": f"{req.topic}：深度解析与未来展望", "sub_title": "一文读懂核心要点"},
-                    {"main_title": f"揭秘{req.topic}背后的真相", "sub_title": "你可能不知道的五个事实"},
-                    {"main_title": f"{req.topic}实用指南", "sub_title": "从入门到精通"},
-                    {"main_title": f"为什么{req.topic}如此重要", "sub_title": "影响你我的关键因素"},
-                    {"main_title": f"{req.topic}的过去、现在与未来", "sub_title": "全面回顾与发展趋势"},
-                ]
-
-            if title_opts:
-                save_title_options(db, article.task_id, title_opts)
-                print(f"  ✅ 已保存 {len(title_opts)} 个标题方案\n")
-
     except Exception as exc:
         logger.warning("Article generation pipeline failed: %s", exc)
         print(f"  ❌ 生成失败: {exc}\n")
         import traceback
         traceback.print_exc()
-        db.refresh(article)
+        article.status = "failed"
+        article.phase = "FAILED"
+        article.error_message = str(exc)[:2000]
+        db.commit()
 
     return article
-
-
-@router.post("/articles/{task_id}/confirm-title")
-async def confirm_title(
-    task_id: str,
-    req: ConfirmTitleRequest,
-    db: Session = Depends(get_mysql_db),
-    principal: CurrentPrincipal = Depends(require_auth),
-):
-    """Confirm the selected title, then generate outline (agent2)."""
-    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
-    if not article:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
-
-    article.main_title = req.main_title
-    article.sub_title = req.sub_title
-    db.commit()
-    print(f"\n{'='*60}")
-    print(f"  ✅ 标题已确认: {req.main_title} / {req.sub_title}")
-    print(f"{'='*60}")
-
-    try:
-        from app.schemas.article import ArticleState, SelectedTitle
-        from app.services.article_service import save_outline
-
-        state = ArticleState(
-            task_id=task_id, user_id=principal.user_id,
-            topic=article.topic or "", style=article.style or "default",
-            title=SelectedTitle(main_title=req.main_title, sub_title=req.sub_title),
-            user_description=req.user_description or article.topic,
-        )
-
-        if settings.dashscope_api_key:
-            print("  ▶ 运行 Agent2 大纲生成...")
-            outline_data = await _run_outline_agent(state)
-        else:
-            print("  ▶ 使用示例大纲 (dashscope_api_key 未配置)")
-            outline_data = _sample_outline(article.topic or "", req.main_title)
-
-        save_outline(db, task_id, outline_data)
-        print(f"  ✅ 大纲已保存\n")
-
-    except Exception as exc:
-        logger.warning("Outline generation failed: %s", exc)
-        print(f"  ❌ 大纲生成失败: {exc}\n")
-        import traceback
-        traceback.print_exc()
-
-    return {"message": "Title confirmed", "task_id": task_id}
-
-
-@router.post("/articles/{task_id}/confirm-outline")
-async def confirm_outline(
-    task_id: str,
-    req: ConfirmOutlineRequest,
-    db: Session = Depends(get_mysql_db),
-    principal: CurrentPrincipal = Depends(require_auth),
-):
-    """Confirm the outline, then generate content (agent3)."""
-    article = db.query(Article).filter(Article.task_id == task_id, Article.tenant_id == principal.tenant_id).first()
-    if not article:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
-
-    outline_data = req.outline.model_dump()
-    article.outline = outline_data
-    db.commit()
-    print(f"\n{'='*60}")
-    print(f"  ✅ 大纲已确认")
-    print(f"{'='*60}")
-
-    try:
-        from app.schemas.article import ArticleState, OutlineResult, SelectedTitle
-        from app.services.article_service import save_content
-
-        outline_result = OutlineResult(**outline_data)
-        state = ArticleState(
-            task_id=task_id, user_id=principal.user_id,
-            topic=article.topic or "", style=article.style or "default",
-            title=SelectedTitle(main_title=article.main_title or "", sub_title=article.sub_title or ""),
-            outline=outline_result,
-        )
-
-        if settings.dashscope_api_key:
-            print("  ▶ 运行 Agent3 正文生成...")
-            content = await _run_content_agent(state)
-        else:
-            print("  ▶ 使用示例正文 (dashscope_api_key 未配置)")
-            content = _sample_content(article.main_title or "", article.sub_title or "", outline_data)
-
-        # Generate a dedicated AI cover image from the title
-        cover_image_url = None
-        if settings.dashscope_api_key:
-            try:
-                from app.services.wanxiang_service import WanxiangImageService
-                cover_prompt = f"公众号文章封面图：{article.main_title or article.topic}。扁平化设计，简洁大气，适合社交媒体传播。不要包含任何文字或标题。"
-                ws = WanxiangImageService()
-                cover_url = await ws.generate_image(cover_prompt, size="1024*1024")
-                if cover_url:
-                    cover_image_url = cover_url
-                    print(f"  ✅ AI封面图生成成功: {cover_url[:60]}")
-            except Exception as cover_err:
-                print(f"  ⚠️ AI封面生成失败: {cover_err}")
-
-        # Generate images via Agent4+Agent5
-        if settings.dashscope_api_key:
-            try:
-                from app.services.article_agent_service import (
-                    agent4_analyze_image_requirements,
-                    agent5_generate_images,
-                    merge_images_into_content,
-                )
-                state.content = content
-                state.footer_template = article.footer_template
-
-                # Detect pure-image gallery BEFORE agent4
-                is_gallery = state.content and all(
-                    l.strip().startswith('[IMAGE:') and 'type=gallery' in l
-                    for l in state.content.split('\n') if l.strip()
-                )
-                if is_gallery:
-                    print("  ▶ 纯图画廊模式，跳过配图获取，使用占位图...")
-                    state.images = []
-                    full_content = _render_image_markers(state.content, state.task_id)
-                    state.full_content = full_content
-                else:
-                    print("  ▶ 分析配图需求...")
-                    state = await agent4_analyze_image_requirements(state)
-                    print(f"     需要 {len(state.image_requirements)} 张配图")
-
-                    print("  ▶ 获取配图...")
-                    state = await agent5_generate_images(state)
-                    print(f"     已获取 {len(state.images)} 张配图")
-
-                # ========== Archive images FIRST (watermark applied here) ==========
-                url_map: dict[str, str] = {}
-                if state.images:
-                    from app.services.asset_archive_service import save_images_to_asset_library
-                    from app.services.storage_service import storage_service as _ss
-                    # Include cover image in the archive list so it also gets watermarked
-                    image_urls = [img.url for img in state.images if img.url]
-                    if cover_image_url and cover_image_url not in image_urls:
-                        image_urls.append(cover_image_url)
-                    archived = await save_images_to_asset_library(
-                        db, principal.tenant_id, image_urls,
-                        watermark_enabled=req.watermark_enabled,
-                    )
-                    for orig_url, asset_obj in zip(image_urls, archived):
-                        if asset_obj:
-                            url_map[orig_url] = _ss.get_url(asset_obj.storage_key)
-                    if url_map:
-                        for img in state.images:
-                            if img.url and img.url in url_map:
-                                img.url = url_map[img.url]
-                        if cover_image_url and cover_image_url in url_map:
-                            cover_image_url = url_map[cover_image_url]
-
-                # Merge images into content (now uses watermarked URLs)
-                if state.images:
-                    state = merge_images_into_content(state)
-                    full_content = state.full_content or content
-
-                # 封面图不嵌入正文（已存为 article.cover_image，前端自行展示）
-
-            except Exception as img_exc:
-                print(f"  ⚠️ 配图处理失败，使用占位图: {img_exc}")
-                import re
-                def _ph(m):
-                    pos = re.search(r'position=(\d+)', m.group(1))
-                    idx = int(pos.group(1)) if pos else 1
-                    return f'<img src="https://picsum.photos/seed/{task_id[:8]}{idx}/800/400" style="width:100%;border-radius:8px;margin:16px 0;" />'
-                content_rich = re.sub(r'\[IMAGE:(.*?)\]', _ph, content)
-                footer = article.footer_template or ""
-                full_content = f"{content_rich}\n\n---\n\n{footer.strip()}" if footer else content_rich
-                if cover_image_url:
-                    full_content = (
-                        f'<img src="{cover_image_url}" alt="封面" '
-                        f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />\n\n'
-                        f'{full_content}'
-                    )
-        else:
-            import re
-            def _ph(m):
-                pos = re.search(r'position=(\d+)', m.group(1))
-                idx = int(pos.group(1)) if pos else 1
-                return f'<img src="https://picsum.photos/seed/{task_id[:8]}{idx}/800/400" style="width:100%;border-radius:8px;margin:16px 0;" />'
-            content_rich = re.sub(r'\[IMAGE:(.*?)\]', _ph, content)
-            footer = article.footer_template or ""
-            full_content = f"{content_rich}\n\n---\n\n{footer.strip()}" if footer else content_rich
-            if cover_image_url:
-                full_content = (
-                    f'<img src="{cover_image_url}" alt="封面" '
-                    f'style="width:100%;max-width:640px;border-radius:8px;display:block;margin:16px auto;" />\n\n'
-                    f'{full_content}'
-                )
-
-        # Post-processing: strip photography text from final content
-        full_content = _strip_photography_text(full_content)
-
-        save_content(db, task_id, content, full_content,
-                     cover_image=cover_image_url,
-                     footer_template=article.footer_template)
-        print(f"  ✅ 正文已保存 (content_len={len(content)})")
-
-    except Exception as exc:
-        logger.warning("Content generation failed: %s", exc)
-        print(f"  ❌ 正文生成失败: {exc}\n")
-        import traceback
-        traceback.print_exc()
-
-    return {"message": "Outline confirmed", "task_id": task_id}
 
 
 @router.post("/articles/{task_id}/publish-draft")
@@ -1205,17 +1048,6 @@ def set_article_msg_data_id(
     return {"success": True, "task_id": task_id, "msg_data_id": msg_data_id}
 
 
-@router.post("/articles/{task_id}/ai-modify-outline")
-def ai_modify_outline(
-    task_id: str,
-    req: AiModifyOutlineRequest,
-    db: Session = Depends(get_mysql_db),
-    principal: CurrentPrincipal = Depends(require_auth),
-):
-    """AI modify outline (VIP feature)."""
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="AI outline modification not yet implemented")
-
-
 @router.get("/articles/{task_id}", response_model=ArticleResponse)
 def get_article(
     task_id: str,
@@ -1297,12 +1129,6 @@ async def article_progress_stream(
             yield f"event: ERROR\ndata: {article.error_message or 'Generation failed'}\n\n"
             await asyncio.sleep(5)
             return
-
-        if phase in ("title_generated", "TITLE_SELECTING") and article.title_options:
-            yield f"event: TITLES_GENERATED\ndata: {json.dumps({'title_options': article.title_options})}\n\n"
-
-        if phase in ("outline_generated", "OUTLINE_EDITING") and article.outline:
-            yield f"event: OUTLINE_GENERATED\ndata: {json.dumps(article.outline)}\n\n"
 
         if article.content:
             yield f"event: AGENT3_STREAMING\ndata: {json.dumps({'content': article.content})}\n\n"

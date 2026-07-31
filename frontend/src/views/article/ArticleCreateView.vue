@@ -1,19 +1,22 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElNotification } from 'element-plus'
 import {
   createArticle,
-  confirmTitle,
-  confirmOutline,
-  aiModifyOutline,
   getArticle,
   getExecutionLogs,
   publishDraft,
 } from '@/api/article'
+import {
+  importErpProductImage,
+  listErpProductSources,
+  searchErpProducts,
+  type ErpProduct,
+  type ErpProductSource,
+} from '@/api/erpProducts'
 import client from '@/api/client'
-import type { TitleOption, Article, Account, KnowledgeBase, FeedSource } from '@/api/types'
-import { SseConnection } from '@/utils/sse'
+import type { Article, Account, KnowledgeBase, FeedSource } from '@/api/types'
 import { marked } from 'marked'
 import { sanitizeHtml } from '@/utils/sanitizer'
 
@@ -23,10 +26,13 @@ const router = useRouter()
 const topic = ref('')
 const style = ref('')
 const contentType = ref('article')
-const imageSource = ref<'local' | 'pexels'>('pexels')
-const enabledImageMethods = ref<string[]>(['PEXELS', 'DASHSCOPE'])
-const userDescription = ref('')
-const mode = ref<'manual' | 'auto'>('manual')
+type CoverImageSource = 'local' | 'DASHSCOPE' | 'erp'
+type BodyImageSource = 'DASHSCOPE' | 'LOCAL' | 'ERP'
+type ImagePickerTarget = 'cover' | 'body'
+
+// 封面来源与正文来源属于两条独立数据流，不能共享选择状态。
+const imageSource = ref<CoverImageSource>('DASHSCOPE')
+const enabledImageMethods = ref<BodyImageSource[]>(['DASHSCOPE'])
 const articleCount = ref(1)
 const loading = ref(false)
 const currentTaskId = ref('')
@@ -36,40 +42,16 @@ const agentLogs = ref<any[]>([])
 // Phase tracking
 type Phase =
   | 'INPUT'
-  | 'TITLE_GENERATING'
-  | 'TITLE_SELECTING'
-  | 'OUTLINE_GENERATING'
-  | 'OUTLINE_EDITING'
   | 'CONTENT_GENERATING'
   | 'COMPLETED'
   | 'FAILED'
 
 const currentPhase = ref<Phase>('INPUT')
 
-// Title options
-const titleOptions = ref<TitleOption[]>([])
-const selectedTitle = ref<TitleOption | null>(null)
-
-// Outline
-const outline = ref<any>(null)
-const outlineRaw = ref('')
-const outlineEditMode = ref(false)
-const modifySuggestion = ref('')
-const aiModifyingOutline = ref(false)
-
-// Content streaming
-const streamedContent = ref('')
-const isStreaming = ref(false)
-
 // 视频配置
 const videoAspectRatio = ref('9:16')
 
 // Image progress
-const imageProgress = ref<{ total: number; completed: number; items: any[] }>({
-  total: 0,
-  completed: 0,
-  items: [],
-})
 
 // WeChat drafts — 支持多选公众号
 const accounts = ref<Account[]>([])
@@ -203,12 +185,107 @@ function toggleFeedArticle(id: number) {
   }
 }
 
-// Local image selector
+// 本地素材弹窗同时服务封面单选与正文多选，目标由显式上下文决定。
 const localAssets = ref<any[]>([])
 const loadingAssets = ref(false)
-const selectedImageUrls = ref<string[]>([])
-const imageSelectionMode = ref<'auto' | 'manual'>('auto')
+const selectedCoverImageUrl = ref('')
+const selectedBodyImageUrls = ref<string[]>([])
 const showAssetPicker = ref(false)
+const assetPickerTarget = ref<ImagePickerTarget>('cover')
+
+// ERP 弹窗同样区分封面和正文；ERP 凭证只由后端保管，前端只接收规范化产品数据。
+const showErpProductPicker = ref(false)
+const erpPickerTarget = ref<ImagePickerTarget>('cover')
+const erpProductSources = ref<ErpProductSource[]>([])
+const selectedErpProductSource = ref('')
+const erpProductModel = ref('')
+const erpProductSeries = ref('')
+const erpProducts = ref<ErpProduct[]>([])
+const erpProductPageNo = ref(1)
+const erpProductPageSize = 30
+const erpProductTotal = ref(0)
+const loadingErpProducts = ref(false)
+const importingErpImageUrl = ref('')
+
+async function loadErpProductSources() {
+  try {
+    erpProductSources.value = await listErpProductSources()
+    if (!selectedErpProductSource.value && erpProductSources.value.length > 0) {
+      selectedErpProductSource.value = erpProductSources.value[0].key
+    }
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || 'ERP 产品素材源未配置或加载失败')
+  }
+}
+
+/**
+ * 打开 ERP 产品选图器并记录用途。
+ *
+ * 用途必须在打开弹窗前固定，避免异步查询完成后把正文图片误写入封面字段。
+ */
+async function openErpProductPicker(target: ImagePickerTarget) {
+  erpPickerTarget.value = target
+  showErpProductPicker.value = true
+  if (erpProductSources.value.length === 0) {
+    await loadErpProductSources()
+  }
+  if (selectedErpProductSource.value && erpProducts.value.length === 0) {
+    await searchProductsFromErp()
+  }
+}
+
+async function searchProductsFromErp(pageNo = 1) {
+  if (!selectedErpProductSource.value) {
+    ElMessage.warning('请先选择 ERP 产品品牌')
+    return
+  }
+  loadingErpProducts.value = true
+  erpProductPageNo.value = pageNo
+  try {
+    const page = await searchErpProducts(selectedErpProductSource.value, {
+      pageNo,
+      pageSize: erpProductPageSize,
+      productModel: erpProductModel.value.trim() || undefined,
+      series: erpProductSeries.value.trim() || undefined,
+    })
+    erpProducts.value = page.items || []
+    erpProductTotal.value = page.total || 0
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '查询 ERP 产品失败')
+  } finally {
+    loadingErpProducts.value = false
+  }
+}
+
+/** 用户切换来源或筛选条件时从首页开始，防止旧页码落到空结果页。 */
+function resetErpProductSearch() {
+  void searchProductsFromErp(1)
+}
+
+async function importSelectedErpProduct(product: ErpProduct) {
+  if (!selectedErpProductSource.value || importingErpImageUrl.value) return
+  importingErpImageUrl.value = product.image_url
+  try {
+    const imported = await importErpProductImage(selectedErpProductSource.value, product)
+    if (erpPickerTarget.value === 'cover') {
+      selectedCoverImageUrl.value = imported.preview_url
+      // 保留 ERP 作为封面入口；后端实际接收的是导入后的本地素材 URL。
+      imageSource.value = 'erp'
+      ElMessage.success(`已导入「${product.name}」并设为文章封面`)
+    } else {
+      // ERP 正文图导入后与本地图片使用相同 URL 契约，同时按 URL 去重。
+      if (!selectedBodyImageUrls.value.includes(imported.preview_url)) {
+        selectedBodyImageUrls.value.push(imported.preview_url)
+      }
+      ElMessage.success(`已导入「${product.name}」并加入正文配图`)
+    }
+    await loadLocalAssets()
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '导入 ERP 产品图片失败')
+  } finally {
+    importingErpImageUrl.value = ''
+  }
+}
 
 async function loadLocalAssets() {
   loadingAssets.value = true
@@ -224,29 +301,63 @@ async function loadLocalAssets() {
   }
 }
 
-function toggleAsset(url: string) {
-  const idx = selectedImageUrls.value.indexOf(url)
-  if (idx >= 0) {
-    selectedImageUrls.value.splice(idx, 1)
+/** 根据当前弹窗用途执行封面单选或正文多选。 */
+function selectLocalAsset(url: string) {
+  if (!url) return
+  if (assetPickerTarget.value === 'cover') {
+    selectedCoverImageUrl.value = url
+    return
+  }
+
+  const selectedIndex = selectedBodyImageUrls.value.indexOf(url)
+  if (selectedIndex >= 0) {
+    selectedBodyImageUrls.value.splice(selectedIndex, 1)
   } else {
-    selectedImageUrls.value.push(url)
+    selectedBodyImageUrls.value.push(url)
   }
 }
 
+/** 打开本地素材选择器，正文模式允许多选，封面模式保持单选。 */
+async function openLocalAssetPicker(target: ImagePickerTarget) {
+  assetPickerTarget.value = target
+  showAssetPicker.value = true
+  if (localAssets.value.length === 0) {
+    await loadLocalAssets()
+  }
+}
+
+/** 判断素材是否属于当前弹窗的已选集合，用于统一卡片选中态。 */
+function isLocalAssetSelected(url: string): boolean {
+  if (assetPickerTarget.value === 'cover') return selectedCoverImageUrl.value === url
+  return selectedBodyImageUrls.value.includes(url)
+}
+
+/** ERP 与本地正文入口最终都映射为后端可识别的 LOCAL 方法。 */
+function resolveBodyImageMethods(): string[] {
+  const methods = new Set<string>()
+  if (enabledImageMethods.value.includes('DASHSCOPE')) methods.add('DASHSCOPE')
+  if (enabledImageMethods.value.includes('LOCAL') || enabledImageMethods.value.includes('ERP')) {
+    methods.add('LOCAL')
+  }
+  return Array.from(methods)
+}
+
+/**
+ * 切换产品素材的选择入口。
+ *
+ * 本地素材库和 ERP 产品库是并列的选图入口；ERP 图会在用户明确选择后导入本地，
+ * 因此不会让远端地址进入生成或发布流程。
+ */
 function handleImageSourceChange() {
   if (imageSource.value === 'local') {
-    imageSelectionMode.value = 'auto'
-    selectedImageUrls.value = []
+    selectedCoverImageUrl.value = ''
     loadLocalAssets()
-  } else if (imageSource.value === 'ai') {
-    // AI 生图模式：只启用 DASHSCOPE
-    enabledImageMethods.value = ['DASHSCOPE']
-    imageSelectionMode.value = 'auto'
-    selectedImageUrls.value = []
+  } else if (imageSource.value === 'erp') {
+    // ERP 封面只接受用户明确选择并导入的产品图，不能退化为随机图片。
+    selectedCoverImageUrl.value = ''
+    void openErpProductPicker('cover')
   } else {
-    enabledImageMethods.value = ['PEXELS', 'DASHSCOPE']
-    imageSelectionMode.value = 'auto'
-    selectedImageUrls.value = []
+    selectedCoverImageUrl.value = ''
   }
 }
 
@@ -279,13 +390,16 @@ async function handlePublishDraft() {
   savingDraft.value = false
 }
 
-// SSE
-let sseConnection: SseConnection | null = null
-const sseConnected = ref(false)
-const sseCompleted = ref(false)
-
 // ==================== Computed ====================
 const canCreate = computed(() => {
+  if (contentType.value === 'article') {
+    // 图文文章的封面与正文来源必须分别校验，隐藏字段不能影响纯图片或视频任务。
+    if ((imageSource.value === 'local' || imageSource.value === 'erp') && !selectedCoverImageUrl.value) return false
+    // 不允许空来源触发后端默认 AI 生图；仅选手动来源时至少要明确选择一张正文图。
+    if (enabledImageMethods.value.length === 0) return false
+    const manualOnly = !enabledImageMethods.value.includes('DASHSCOPE')
+    if (manualOnly && selectedBodyImageUrls.value.length === 0) return false
+  }
   // 有投喂源参考时，主题可以简短（标题由仿写生成）
   if (selectedFeedArticleIds.value.length > 0) return true
   return topic.value.trim().length >= 5
@@ -300,9 +414,9 @@ const styleOptions = [
 ]
 
 const imageMethodOptions = [
-  { value: 'PEXELS', label: 'Pexels 图库' },
   { value: 'DASHSCOPE', label: 'AI 生图（通义万相）' },
-  { value: 'LOCAL', label: '素材库' },
+  { value: 'LOCAL', label: '本地素材库' },
+  { value: 'ERP', label: 'ERP 产品库' },
 ]
 
 // ==================== Methods ====================
@@ -398,15 +512,20 @@ async function handleCreate() {
 
     // 图文专属参数
     if (contentType.value === 'article') {
-      payload.image_source = imageSource.value === 'ai' ? 'DASHSCOPE' : imageSource.value
-      payload.enabled_image_methods = enabledImageMethods.value
-      payload.mode = mode.value
+      // 封面来源与正文配图方式独立提交，不能再把封面图片误传给正文图片 Agent。
+      payload.image_source = imageSource.value === 'erp' ? 'local' : imageSource.value
+      payload.enabled_image_methods = resolveBodyImageMethods()
+      payload.mode = 'auto'
       payload.article_count = articleCount.value
       payload.knowledge_base_ids = selectedKbIds.value.length > 0 ? selectedKbIds.value : undefined
       payload.source_feed_id = selectedFeedSourceId.value ?? undefined
       payload.feed_article_ids = selectedFeedArticleIds.value.length > 0 ? selectedFeedArticleIds.value : undefined
-      payload.selected_image_urls = imageSelectionMode.value === 'manual' && selectedImageUrls.value.length > 0
-        ? selectedImageUrls.value : undefined
+      payload.selected_cover_image_url = selectedCoverImageUrl.value || undefined
+      // 正文仅接收正文选图集合，封面 URL 永远不会混入该字段。
+      const manualBodySourceEnabled = enabledImageMethods.value.includes('LOCAL') || enabledImageMethods.value.includes('ERP')
+      if (manualBodySourceEnabled && selectedBodyImageUrls.value.length > 0) {
+        payload.selected_image_urls = selectedBodyImageUrls.value
+      }
     }
 
     // 纯图片 & 视频共享参数（投喂源参考）
@@ -453,8 +572,14 @@ async function handleCreate() {
     const article = data
     currentTaskId.value = article.task_id
     currentArticle.value = article
-    currentArticle.value = article
     console.log('[DEBUG] createArticle response:', JSON.stringify(article).slice(0, 500))
+
+    // 后端会把生成阶段错误写入文章状态；不能将失败任务误展示为已完成。
+    if (article.status === 'failed') {
+      currentPhase.value = 'FAILED'
+      ElMessage.error(article.error_message || '文章生成失败，请查看执行日志')
+      return
+    }
 
     // If scheduling is enabled, create a scheduled task
     if (enableSchedule.value) {
@@ -480,18 +605,10 @@ async function handleCreate() {
       }
     }
 
-    if (mode.value === 'auto') {
-      // 全自动模式：后端已同步完成所有流程（含自动保存草稿）
-      currentPhase.value = 'COMPLETED'
-      sseCompleted.value = true
-      ElMessage.success('文章生成完成！')
-      loadArticle()
-    } else {
-      currentPhase.value = 'TITLE_GENERATING'
-      ElMessage.success('文章创建成功，正在生成标题方案...')
-      // Connect SSE
-      connectSSE(article.task_id)
-    }
+    // 后端创建接口完成后返回完整文章，全程不再需要人工确认标题或大纲。
+    currentPhase.value = 'COMPLETED'
+    ElMessage.success('文章生成完成！')
+    loadArticle()
   } catch (err: any) {
     console.error('[DEBUG] handleCreate error:', err)
     console.error('[DEBUG] response:', err?.response?.data)
@@ -501,211 +618,6 @@ async function handleCreate() {
     currentPhase.value = 'FAILED'
   } finally {
     loading.value = false
-  }
-}
-
-function connectSSE(taskId: string) {
-  const baseUrl = window.location.origin
-  const sseUrl = `${baseUrl}/api/v1/articles/${taskId}/progress`
-
-  sseConnection = new SseConnection(sseUrl, {
-    onMessage: handleSSEMessage,
-    onStatusChange: (connected) => {
-      sseConnected.value = connected
-    },
-    onError: () => {
-      if (!sseCompleted.value) {
-        ElMessage.warning('SSE 连接断开，尝试重连...')
-      }
-    },
-  })
-  sseConnection.connect()
-}
-
-function reconnectSSE() {
-  if (currentTaskId.value) {
-    sseConnection?.disconnect()
-    connectSSE(currentTaskId.value)
-  }
-}
-
-function handleSSEMessage(event: string, data: string) {
-  console.log('[SSE] event:', event, 'data.length:', data?.length || 0, 'data:', data?.slice(0, 100))
-  switch (event) {
-    case 'AGENT1_COMPLETE':
-      try {
-        const status = JSON.parse(data)
-        if (status.status === 'pending' || status.phase === 'pending') {
-          ElMessage.info('文章已加入生成队列，正在等待 AI 处理...')
-        }
-      } catch {
-        // ignore
-      }
-      break
-
-    case 'TITLES_GENERATED':
-      try {
-        const parsed = JSON.parse(data)
-        titleOptions.value = parsed.title_options || []
-        currentPhase.value = 'TITLE_SELECTING'
-        ElMessage.success('标题方案生成完成，请选择一个')
-      } catch {
-        ElMessage.error('标题方案解析失败')
-      }
-      break
-
-    case 'AGENT2_STREAMING':
-      // Stream outline tokens
-      outlineRaw.value += data
-      break
-
-    case 'OUTLINE_GENERATED':
-      // Try event data first (SSE reconnect path), fall back to outlineRaw (streaming path)
-      try {
-        const parsed = JSON.parse(data)
-        outline.value = parsed.sections ? parsed : JSON.parse(outlineRaw.value)
-        currentPhase.value = 'OUTLINE_EDITING'
-        ElMessage.success('大纲生成完成，您可以编辑或直接确认')
-      } catch {
-        try {
-          outline.value = JSON.parse(outlineRaw.value)
-          currentPhase.value = 'OUTLINE_EDITING'
-          ElMessage.success('大纲生成完成，您可以编辑或直接确认')
-        } catch {
-          // Try to extract JSON from the raw text
-          const raw = outlineRaw.value
-          const jsonMatch = raw.match(/\{[\s\S]*\}/)
-          if (jsonMatch) {
-            try {
-              outline.value = JSON.parse(jsonMatch[0])
-              currentPhase.value = 'OUTLINE_EDITING'
-              ElMessage.success('大纲生成完成')
-            } catch {
-              ElMessage.error('大纲解析失败，请重试')
-            }
-          }
-        }
-      }
-      break
-
-    case 'AGENT3_STREAMING':
-      isStreaming.value = true
-      // Try JSON (reconnect path), fall back to raw text (streaming path)
-      try {
-        const parsed = JSON.parse(data)
-        if (parsed.content) {
-          streamedContent.value = parsed.content
-        } else {
-          streamedContent.value += data
-        }
-      } catch {
-        streamedContent.value += data
-      }
-      break
-
-    case 'AGENT3_COMPLETE':
-      isStreaming.value = false
-      break
-
-    case 'AGENT4_COMPLETE':
-      ElMessage.info('配图需求分析完成')
-      break
-
-    case 'IMAGE_COMPLETE':
-      try {
-        const imgData = JSON.parse(data)
-        imageProgress.value.completed++
-        imageProgress.value.items.push(imgData)
-      } catch {
-        // ignore
-      }
-      break
-
-    case 'AGENT5_COMPLETE':
-      ElMessage.success('配图生成完成')
-      break
-
-    case 'MERGE_COMPLETE':
-      ElMessage.success('图文合成完成')
-      break
-
-    case 'ALL_COMPLETE':
-      sseCompleted.value = true
-      currentPhase.value = 'COMPLETED'
-      ElMessage.success('文章生成完成！')
-      loadArticle()
-      break
-
-    case 'ERROR':
-      sseCompleted.value = true
-      ElMessage.error(data || '生成过程出错')
-      currentPhase.value = 'FAILED'
-      break
-  }
-}
-
-async function handleSelectTitle(option: TitleOption) {
-  selectedTitle.value = option
-  loading.value = true
-
-  try {
-    await confirmTitle(currentTaskId.value, {
-      main_title: option.main_title,
-      sub_title: option.sub_title,
-      user_description: userDescription.value,
-    })
-    currentPhase.value = 'OUTLINE_GENERATING'
-    outlineRaw.value = ''
-    ElMessage.info('正在生成大纲...')
-    // Reconnect SSE to pick up the generated outline
-    reconnectSSE()
-  } catch (err: any) {
-    ElMessage.error(err?.response?.data?.message || '确认标题失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handleConfirmOutline() {
-  if (!outline.value) return
-  loading.value = true
-
-  try {
-    await confirmOutline(currentTaskId.value, {
-      outline: outline.value,
-      watermark_enabled: enableWatermark.value,
-    })
-    currentPhase.value = 'CONTENT_GENERATING'
-    streamedContent.value = ''
-    imageProgress.value = { total: 0, completed: 0, items: [] }
-    ElMessage.info('正在生成正文...')
-    // Reconnect SSE to pick up the generated content
-    reconnectSSE()
-  } catch (err: any) {
-    ElMessage.error(err?.response?.data?.message || '确认大纲失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handleAiModifyOutline() {
-  if (!modifySuggestion.value.trim() || !outline.value || !selectedTitle.value) return
-  aiModifyingOutline.value = true
-
-  try {
-    const result = await aiModifyOutline(currentTaskId.value, {
-      main_title: selectedTitle.value.main_title,
-      sub_title: selectedTitle.value.sub_title,
-      current_outline: outline.value,
-      modify_suggestion: modifySuggestion.value,
-    })
-    outline.value = result
-    modifySuggestion.value = ''
-    ElMessage.success('大纲已更新')
-  } catch (err: any) {
-    ElMessage.error(err?.response?.data?.message || 'AI 修改大纲失败')
-  } finally {
-    aiModifyingOutline.value = false
   }
 }
 
@@ -721,17 +633,9 @@ async function loadArticle() {
 }
 
 function handleReset() {
-  sseConnection?.disconnect()
-  sseCompleted.value = false
   currentPhase.value = 'INPUT'
   topic.value = ''
   style.value = ''
-  selectedTitle.value = null
-  titleOptions.value = []
-  outline.value = null
-  outlineRaw.value = ''
-  streamedContent.value = ''
-  imageProgress.value = { total: 0, completed: 0, items: [] }
   currentTaskId.value = ''
   currentArticle.value = null
   agentLogs.value = []
@@ -739,6 +643,8 @@ function handleReset() {
 
 function renderMarkdown(text: string): string {
   if (!text) return ''
+  // 投喂仿写完成后返回的是 HTML；直接清洗并预览才能保留原有节点层级与样式。
+  if (/^\s*</.test(text)) return sanitizeHtml(text)
   const html = marked.parse(text, { async: false }) as string
   return sanitizeHtml(html)
 }
@@ -748,11 +654,9 @@ onMounted(() => {
   loadKnowledgeBases()
   loadFeedSources()
   loadWatermarkConfig()
+  loadErpProductSources()
 })
 
-onUnmounted(() => {
-  sseConnection?.disconnect()
-})
 </script>
 
 <template>
@@ -796,52 +700,72 @@ onUnmounted(() => {
                 </el-select>
               </el-form-item>
             </el-col>
-            <el-col v-if="contentType === 'article'" :span="6">
-              <el-form-item label="生成模式">
-                <el-radio-group v-model="mode">
-                  <el-radio value="manual">手动配合</el-radio>
-                  <el-radio value="auto">全自动</el-radio>
-                </el-radio-group>
-                <span class="form-hint">{{ mode === 'auto' ? '自动选标题→生成大纲→写正文' : 'AI生成→您选择→AI确认→AI写正文' }}</span>
-              </el-form-item>
-            </el-col>
-            <el-col v-if="contentType === 'article' || contentType === 'image'" :span="6">
+            <el-col v-if="contentType === 'article'" :span="12">
               <el-form-item label="封面图片来源">
+                <!-- 封面来源与下方正文配图方式完全独立。 -->
                 <el-radio-group v-model="imageSource" @change="handleImageSourceChange">
-                  <el-radio value="pexels">Pexels 图库</el-radio>
-                  <el-radio value="local">素材库</el-radio>
-                  <el-radio value="ai">AI 生图</el-radio>
+                  <el-radio value="DASHSCOPE">AI 生图</el-radio>
+                  <el-radio value="local">本地素材库</el-radio>
+                  <el-radio value="erp">ERP 产品库</el-radio>
                 </el-radio-group>
               </el-form-item>
-              <!-- Local asset selection mode -->
+              <!-- 本地素材库封面必须明确选择一张，避免自动使用不相关图片。 -->
               <div v-if="imageSource === 'local'" class="image-source-options">
-                <el-radio-group v-model="imageSelectionMode" size="small">
-                  <el-radio-button value="auto">AI 自动选择</el-radio-button>
-                  <el-radio-button value="manual">手动选择</el-radio-button>
-                </el-radio-group>
-                <div v-if="imageSelectionMode === 'manual'" class="manual-image-selector">
-                  <el-button size="small" @click="showAssetPicker = true" :type="selectedImageUrls.length > 0 ? 'success' : 'default'">
-                    {{ selectedImageUrls.length > 0 ? `已选 ${selectedImageUrls.length} 张` : '选择图片' }}
+                <div class="manual-image-selector">
+                  <el-button size="small" @click="openLocalAssetPicker('cover')" :type="selectedCoverImageUrl ? 'success' : 'default'">
+                    {{ selectedCoverImageUrl ? '已选择封面' : '选择一张封面' }}
                   </el-button>
-                  <div v-if="selectedImageUrls.length > 0" class="selected-previews">
-                    <div v-for="(url, idx) in selectedImageUrls.slice(0, 5)" :key="idx" class="mini-preview">
-                      <el-image :src="url" fit="cover" style="width: 48px; height: 48px; border-radius: 4px;" />
+                  <div v-if="selectedCoverImageUrl" class="selected-previews">
+                    <div class="mini-preview">
+                      <el-image :src="selectedCoverImageUrl" fit="cover" style="width: 48px; height: 48px; border-radius: 4px;" />
                     </div>
-                    <span v-if="selectedImageUrls.length > 5" class="more-badge">+{{ selectedImageUrls.length - 5 }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-else-if="imageSource === 'erp'" class="image-source-options">
+                <div class="manual-image-selector">
+                  <el-button size="small" type="primary" @click="openErpProductPicker('cover')">
+                    查询并选择封面
+                  </el-button>
+                  <span v-if="!selectedCoverImageUrl" class="form-hint">请选择一张 ERP 产品图片作为封面</span>
+                  <div v-else class="selected-previews">
+                    <div class="mini-preview">
+                      <el-image :src="selectedCoverImageUrl" fit="cover" style="width: 48px; height: 48px; border-radius: 4px;" />
+                    </div>
                   </div>
                 </div>
               </div>
             </el-col>
           </el-row>
 
-          <!-- 正文配图方式 -->
-          <el-form-item v-if="contentType === 'article' || contentType === 'image'" label="正文配图方式（可多选）">
-            <el-checkbox-group v-model="enabledImageMethods">
-              <el-checkbox v-for="opt in imageMethodOptions" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </el-checkbox>
-            </el-checkbox-group>
-            <span class="form-hint">正文中插入的图片来源。封面已单独设置，不受此项影响</span>
+          <!-- 正文配图来源只属于图文文章，不能与封面或纯图片任务复用。 -->
+          <el-form-item v-if="contentType === 'article'" label="正文配图来源（可多选）">
+            <div class="body-image-source-control">
+              <el-checkbox-group v-model="enabledImageMethods">
+                <el-checkbox v-for="opt in imageMethodOptions" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+
+              <div v-if="enabledImageMethods.includes('LOCAL')" class="manual-image-selector">
+                <el-button size="small" @click="openLocalAssetPicker('body')">正文使用本地素材库</el-button>
+              </div>
+              <div v-if="enabledImageMethods.includes('ERP')" class="manual-image-selector">
+                <el-button size="small" type="primary" @click="openErpProductPicker('body')">正文使用 ERP 产品库</el-button>
+              </div>
+
+              <div v-if="selectedBodyImageUrls.length > 0" class="body-image-selection-summary">
+                <span>正文已选 {{ selectedBodyImageUrls.length }} 张</span>
+                <div class="selected-previews">
+                  <div v-for="url in selectedBodyImageUrls.slice(0, 4)" :key="url" class="mini-preview">
+                    <el-image :src="url" fit="cover" style="width: 48px; height: 48px; border-radius: 4px;" />
+                  </div>
+                  <span v-if="selectedBodyImageUrls.length > 4" class="more-badge">+{{ selectedBodyImageUrls.length - 4 }}</span>
+                </div>
+                <el-button text type="danger" size="small" @click="selectedBodyImageUrls = []">清空正文选图</el-button>
+              </div>
+              <span class="form-hint">本地与 ERP 图片会作为正文配图使用；ERP 图片会先安全导入本地素材库。</span>
+            </div>
           </el-form-item>
 
           <!-- Knowledge Base Selector -->
@@ -1067,131 +991,6 @@ onUnmounted(() => {
       </el-card>
     </div>
 
-    <!-- ======== Phase: AUTO_GENERATING ======== -->
-    <div v-if="currentPhase === 'AUTO_GENERATING'" class="phase-generating">
-      <el-card>
-        <template #header>
-          <span class="card-title">全自动生成中...</span>
-        </template>
-        <div class="generating-placeholder">
-          <el-steps :active="1" align-center>
-            <el-step title="生成标题" description="AI 正在构思标题方案" />
-            <el-step title="生成大纲" description="正在规划文章结构" />
-            <el-step title="撰写正文" description="正在生成文章内容" />
-            <el-step title="完成" description="即将完成" />
-          </el-steps>
-          <el-progress :percentage="60" :stroke-width="6" indeterminate style="margin-top: 24px" />
-        </div>
-      </el-card>
-    </div>
-
-    <!-- ======== Phase: TITLE_GENERATING ======== -->
-    <div v-if="currentPhase === 'TITLE_GENERATING'" class="phase-generating">
-      <el-card>
-        <template #header>
-          <span class="card-title">AI 正在生成标题方案...</span>
-        </template>
-        <div class="generating-placeholder">
-          <el-progress :percentage="50" :stroke-width="6" indeterminate />
-          <p class="hint-text">正在分析主题，生成多个标题方案供您选择</p>
-        </div>
-      </el-card>
-    </div>
-
-    <!-- ======== Phase: TITLE_SELECTING ======== -->
-    <div v-if="currentPhase === 'TITLE_SELECTING'" class="phase-select-title">
-      <el-card>
-        <template #header>
-          <span class="card-title">请选择一个标题方案</span>
-        </template>
-
-        <div class="title-options">
-          <div
-            v-for="(opt, index) in titleOptions"
-            :key="index"
-            class="title-option-card"
-            :class="{ selected: selectedTitle === opt }"
-            @click="handleSelectTitle(opt)"
-          >
-            <div class="option-index">方案 {{ index + 1 }}</div>
-            <div class="option-main-title">{{ opt.main_title }}</div>
-            <div class="option-sub-title">{{ opt.sub_title }}</div>
-          </div>
-        </div>
-
-        <el-form-item label="补充说明（可选）" class="mt-4">
-          <el-input
-            v-model="userDescription"
-            type="textarea"
-            :rows="2"
-            placeholder="对文章内容的额外要求或补充说明..."
-            maxlength="500"
-          />
-        </el-form-item>
-      </el-card>
-    </div>
-
-    <!-- ======== Phase: OUTLINE_GENERATING ======== -->
-    <div v-if="currentPhase === 'OUTLINE_GENERATING'" class="phase-generating">
-      <el-card>
-        <template #header>
-          <span class="card-title">AI 正在生成大纲...</span>
-        </template>
-        <div class="generating-placeholder">
-          <el-progress :percentage="50" :stroke-width="6" indeterminate />
-          <pre class="streaming-text">{{ outlineRaw }}</pre>
-        </div>
-      </el-card>
-    </div>
-
-    <!-- ======== Phase: OUTLINE_EDITING ======== -->
-    <div v-if="currentPhase === 'OUTLINE_EDITING'" class="phase-edit-outline">
-      <el-card>
-        <template #header>
-          <span class="card-title">编辑大纲</span>
-        </template>
-
-        <div v-if="outline" class="outline-display">
-          <div
-            v-for="section in outline.sections"
-            :key="section.section"
-            class="outline-section"
-          >
-            <div class="section-header">
-              <span class="section-number">第{{ section.section }}部分</span>
-              <span class="section-title">{{ section.title }}</span>
-            </div>
-            <ul class="section-points">
-              <li v-for="(point, i) in section.points" :key="i">{{ point }}</li>
-            </ul>
-          </div>
-        </div>
-
-        <!-- AI Modify -->
-        <el-divider />
-        <el-form-item label="AI 修改大纲">
-          <el-input
-            v-model="modifySuggestion"
-            type="textarea"
-            :rows="2"
-            placeholder="输入修改建议，如：增加一个关于实际案例的章节..."
-          />
-        </el-form-item>
-        <el-button
-          :loading="aiModifyingOutline"
-          :disabled="!modifySuggestion.trim()"
-          @click="handleAiModifyOutline"
-        >
-          AI 修改
-        </el-button>
-
-        <el-divider />
-        <el-button type="primary" size="large" :loading="loading" @click="handleConfirmOutline">
-          确认大纲并生成正文
-        </el-button>
-      </el-card>
-    </div>
-
     <!-- ======== Phase: CONTENT_GENERATING ======== -->
     <div v-if="currentPhase === 'CONTENT_GENERATING'" class="phase-generating">
       <!-- 图片/视频：轮询等待 -->
@@ -1208,29 +1007,6 @@ onUnmounted(() => {
         </div>
       </el-card>
 
-      <!-- 图文：流式生成 -->
-      <el-card v-if="!contentJobId" class="content-stream-card">
-        <template #header>
-          <span class="card-title">AI 正在生成正文...</span>
-        </template>
-        <div class="content-stream">
-          <div v-if="streamedContent" class="rendered-content" v-html="renderMarkdown(streamedContent)" />
-          <el-progress v-if="isStreaming" :percentage="50" :stroke-width="4" indeterminate />
-        </div>
-      </el-card>
-
-      <!-- Image Progress -->
-      <el-card v-if="imageProgress.completed > 0" class="image-progress-card">
-        <template #header>
-          <span>配图进度 ({{ imageProgress.completed }})</span>
-        </template>
-        <div class="image-grid">
-          <div v-for="img in imageProgress.items" :key="img.position" class="image-item">
-            <el-image :src="img.url" fit="cover" />
-            <span class="image-label">{{ img.section_title || img.type }}</span>
-          </div>
-        </div>
-      </el-card>
     </div>
 
     <!-- ======== Phase: COMPLETED ======== -->
@@ -1288,7 +1064,7 @@ onUnmounted(() => {
       <!-- 图文结果 -->
       <el-alert v-if="contentJobType !== 'image' && contentJobType !== 'video'" title="文章生成完成！" type="success" show-icon :closable="false" />
 
-      <el-card class="article-preview" v-if="currentArticle || (streamedContent && !contentJobId)">
+      <el-card class="article-preview" v-if="currentArticle">
         <template #header>
           <span class="card-title">{{ currentArticle?.main_title || '文章完成' }}</span>
           <span class="card-subtitle">{{ currentArticle?.sub_title }}</span>
@@ -1300,7 +1076,7 @@ onUnmounted(() => {
 
         <div
           class="article-content"
-          v-html="renderMarkdown(currentArticle?.full_content || streamedContent)"
+          v-html="renderMarkdown(currentArticle?.full_content || '')"
         />
       </el-card>
 
@@ -1429,14 +1205,18 @@ onUnmounted(() => {
   </el-dialog>
 
   <!-- ======== Local Asset Picker Dialog ======== -->
-  <el-dialog v-model="showAssetPicker" title="选择本地素材图片" width="760px" top="5vh">
+  <el-dialog
+    v-model="showAssetPicker"
+    :title="assetPickerTarget === 'cover' ? '选择本地封面图片' : '选择本地正文图片（可多选）'"
+    width="760px"
+    top="5vh"
+  >
     <div v-if="loadingAssets" style="padding: 24px; text-align: center;">
       <el-skeleton :rows="3" animated />
     </div>
     <template v-else>
       <p style="color: #909399; font-size: 13px; margin-bottom: 12px;">
-        选择要用在文章中的图片。AI 会根据文章内容自动匹配合适的位置。
-        已选 {{ selectedImageUrls.length }} 张。
+        {{ assetPickerTarget === 'cover' ? '选择一张图片作为文章封面。' : '选择一张或多张图片用于正文，已选图片可再次点击取消。' }}
       </p>
       <div v-if="localAssets.length === 0" style="padding: 24px; text-align: center; color: #909399;">
         暂无本地素材，请先在「素材库」中上传图片
@@ -1446,8 +1226,8 @@ onUnmounted(() => {
           v-for="asset in localAssets"
           :key="asset.id"
           class="asset-item-dialog"
-          :class="{ selected: selectedImageUrls.includes(asset.preview_url || '') }"
-          @click="toggleAsset(asset.preview_url || '')"
+          :class="{ selected: isLocalAssetSelected(asset.preview_url || '') }"
+          @click="selectLocalAsset(asset.preview_url || '')"
         >
           <div class="asset-thumb-dialog">
             <el-image
@@ -1461,16 +1241,68 @@ onUnmounted(() => {
           <div class="asset-label-dialog">
             <span class="asset-name-dialog">{{ asset.original_filename || asset.filename }}</span>
           </div>
-          <div v-if="selectedImageUrls.includes(asset.preview_url || '')" class="asset-checked-badge">✓</div>
+          <div v-if="isLocalAssetSelected(asset.preview_url || '')" class="asset-checked-badge">✓</div>
         </div>
       </div>
     </template>
     <template #footer>
       <el-button @click="showAssetPicker = false">取消</el-button>
-      <el-button type="primary" @click="showAssetPicker = false" :disabled="selectedImageUrls.length === 0">
-        确定（已选 {{ selectedImageUrls.length }} 张）
+      <el-button
+        type="primary"
+        @click="showAssetPicker = false"
+        :disabled="assetPickerTarget === 'cover' && !selectedCoverImageUrl"
+      >
+        {{ assetPickerTarget === 'cover' ? '确定使用此封面' : `完成（已选 ${selectedBodyImageUrls.length} 张）` }}
       </el-button>
     </template>
+  </el-dialog>
+
+  <!-- ERP 产品图片先复制到本地素材库，再交由文章生成与发布链路使用。 -->
+  <el-dialog
+    v-model="showErpProductPicker"
+    :title="erpPickerTarget === 'cover' ? '从 ERP 产品库选择封面' : '从 ERP 产品库选择正文图片'"
+    width="860px"
+    top="5vh"
+  >
+    <div class="erp-search-form">
+      <el-select v-model="selectedErpProductSource" placeholder="选择品牌" style="width: 180px" @change="resetErpProductSearch">
+        <el-option v-for="source in erpProductSources" :key="source.key" :label="source.name" :value="source.key" />
+      </el-select>
+      <el-input v-model="erpProductModel" clearable placeholder="按产品型号筛选" @keyup.enter="searchProductsFromErp" />
+      <el-input v-model="erpProductSeries" clearable placeholder="按系列筛选" @keyup.enter="searchProductsFromErp" />
+      <el-button type="primary" :loading="loadingErpProducts" @click="resetErpProductSearch">查询</el-button>
+    </div>
+    <p class="form-hint">选择后会复制到本地素材库，再用于文章配图和公众号发布；不会直接引用 ERP 远端图片。</p>
+    <div v-if="loadingErpProducts" style="padding: 24px; text-align: center;"><el-skeleton :rows="3" animated /></div>
+    <div v-else-if="erpProductSources.length === 0" class="empty-erp-products">尚未配置 ERP 产品来源，请在后端 `.env` 配置后重启服务。</div>
+    <div v-else-if="erpProducts.length === 0" class="empty-erp-products">未查询到带报价图片的产品。</div>
+    <div v-else class="erp-product-grid">
+      <article v-for="product in erpProducts" :key="`${product.name}-${product.image_url}`" class="erp-product-card">
+        <el-image :src="product.image_url" fit="cover" class="erp-product-image" />
+        <div class="erp-product-info">
+          <strong>{{ product.name }}</strong>
+          <span v-if="product.series.length">{{ product.series.join(' / ') }}</span>
+          <span v-if="product.categories.length">{{ product.categories.join(' / ') }}</span>
+        </div>
+        <el-button
+          type="primary"
+          size="small"
+          :loading="importingErpImageUrl === product.image_url"
+          :disabled="Boolean(importingErpImageUrl) && importingErpImageUrl !== product.image_url"
+          @click="importSelectedErpProduct(product)"
+        >{{ erpPickerTarget === 'cover' ? '导入并设为封面' : '导入并加入正文' }}</el-button>
+      </article>
+    </div>
+    <div v-if="erpProductTotal > erpProductPageSize" class="erp-product-pagination">
+      <el-pagination
+        v-model:current-page="erpProductPageNo"
+        :page-size="erpProductPageSize"
+        :total="erpProductTotal"
+        layout="prev, pager, next, jumper, total"
+        @current-change="searchProductsFromErp"
+      />
+    </div>
+    <template #footer><el-button @click="showErpProductPicker = false">完成</el-button></template>
   </el-dialog>
 </template>
 
@@ -1802,6 +1634,25 @@ onUnmounted(() => {
   margin-top: 8px;
 }
 
+.body-image-source-control {
+  display: grid;
+  width: 100%;
+  gap: 8px;
+}
+
+.body-image-selection-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  background: #fafafa;
+  color: #606266;
+  font-size: 13px;
+}
+
 .manual-image-selector {
   display: flex;
   align-items: center;
@@ -1900,6 +1751,73 @@ onUnmounted(() => {
   place-items: center;
   font-size: 12px;
   font-weight: 700;
+}
+
+/* ERP 产品查询结果保持与本地素材选择相同的信息密度，图片主体优先。 */
+.erp-search-form {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.erp-product-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.erp-product-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.erp-product-card {
+  display: grid;
+  grid-template-rows: 150px auto auto;
+  gap: 8px;
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fff;
+}
+
+.erp-product-image {
+  width: 100%;
+  height: 150px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #f5f7fa;
+}
+
+.erp-product-info {
+  display: grid;
+  gap: 3px;
+  min-height: 50px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.erp-product-info strong {
+  color: #303133;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty-erp-products {
+  padding: 36px 16px;
+  color: #909399;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .erp-search-form { grid-template-columns: 1fr; }
 }
 
 /* Gallery card renders */

@@ -12,15 +12,17 @@ Pipeline
 6. Merge images into text  (helper)
 """
 
+import asyncio
 import json
+import logging
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.constants.prompt import (
+    AGENT1_IMITATION_TITLE_PROMPT,
     AGENT1_TITLE_PROMPT,
     AGENT2_OUTLINE_PROMPT,
     AGENT3_CONTENT_PROMPT,
@@ -30,28 +32,15 @@ from app.constants.prompt import (
 )
 from app.schemas.article import ArticleState, ImageRequirement, ImageResult, TitleOption
 
-# ---------------------------------------------------------------------------
-# DashScope-compatible OpenAI client
-# ---------------------------------------------------------------------------
 
-_client: Optional[AsyncOpenAI] = None
-
-
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(
-            api_key=settings.dashscope_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        )
-    return _client
-
+# 本模块同时被接口请求与 Celery 定时任务调用，使用标准日志器可确保图片成本限制、
+# 降级和异常信息进入各自进程的控制台日志，且不会把排障信息暴露到前端响应中。
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = settings.dashscope_model
 STREAM_CHUNK_TIMEOUT = 30.0
 
 
@@ -141,25 +130,41 @@ def _build_outline_text(state: ArticleState) -> str:
     return "\n".join(lines)
 
 
+def _append_product_title_requirement(prompt: str, product_name: str | None) -> str:
+    """向不同标题 Agent 追加统一的 ERP 产品名硬约束。
+
+    定时任务既可能走通用标题生成，也可能走专用仿写标题生成；使用同一合成函数
+    可以避免只修改其中一个入口，导致实际发布标题再次遗漏产品名称。
+    """
+
+    normalized_name = str(product_name or "").strip()
+    if not normalized_name:
+        return prompt
+    return prompt + (
+        "\n\n## ERP 目标产品\n"
+        f"产品名称：{normalized_name}\n"
+        "每一组主标题都必须原样包含以上完整产品名称，并围绕该产品创作。"
+    )
+
+
 async def _call_llm(
     system_prompt: str,
     user_message: str,
     model: Optional[str] = None,
     temperature: float = 0.8,
 ) -> str:
-    """Call the LLM with a system and user message, returning the full text
-    response."""
-    client = _get_client()
-    response = await client.chat.completions.create(
-        model=model or DEFAULT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=temperature,
-        stream=False,
+    """通过统一文生文路由返回完整结果，主站失败时自动切换百炼。"""
+    from app.services.text_generation_service import (
+        TextGenerationRequest,
+        text_generation_service,
     )
-    return response.choices[0].message.content or ""
+
+    return await text_generation_service.complete(TextGenerationRequest(
+        system_prompt=system_prompt,
+        user_message=user_message,
+        temperature=temperature,
+        model_override=model,
+    ))
 
 
 async def _call_llm_with_streaming(
@@ -174,26 +179,20 @@ async def _call_llm_with_streaming(
 
     Returns the fully assembled response string.
     """
-    client = _get_client()
-    full_content: List[str] = []
-
-    stream = await client.chat.completions.create(
-        model=model or DEFAULT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=temperature,
-        stream=True,
+    from app.services.text_generation_service import (
+        TextGenerationRequest,
+        text_generation_service,
     )
 
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content or ""
-        if delta:
-            full_content.append(delta)
-            stream_handler(delta)
-
-    return "".join(full_content)
+    return await text_generation_service.stream(
+        TextGenerationRequest(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=temperature,
+            model_override=model,
+        ),
+        stream_handler,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +220,12 @@ async def agent1_generate_title_options(state: ArticleState) -> ArticleState:
         prompt += _build_style_profile_section(state.style_profile)
 
     # Inject reference articles for imitation (full content)
-    if state.reference_articles:
+    # HTML 仿写已经以 DOM 槽位锁定格式；标题只需产品与风格信息，不再携带整篇
+    # 投喂原文，避免为六个候选标题重复消耗数千 token。
+    if state.reference_articles and not state.reference_html:
         prompt += _build_reference_articles_section(state.reference_articles)
+    # 通用标题入口同样用于 ERP 定时任务，必须在调用模型前注入真实产品名。
+    prompt = _append_product_title_requirement(prompt, state.product_name)
 
     system_msg = "你是一个专业的微信公众号标题生成专家。所有输出必须使用纯中文，禁止任何英文单词或中英混合。"
     if state.style_profile:
@@ -241,6 +244,81 @@ async def agent1_generate_title_options(state: ArticleState) -> ArticleState:
         state.error = f"Failed to parse title options: {exc}"
 
     return state
+
+
+async def agent1_generate_imitation_title(
+    state: ArticleState,
+    reference_title: str,
+) -> ArticleState:
+    """根据投喂文章生成一个原创仿写标题。
+
+    此 Agent 专门服务于“已选择投喂文章但未填写主题”的自动流程。参考标题和
+    参考正文用于分析原文主题及表达风格，模型只负责给出新标题；调用方随后把
+    新标题作为大纲和正文 Agent 的主题，确保全篇围绕同一个仿写方向生成。
+
+    参考原标题绝不能作为失败兜底。若模型返回空标题或复用原题，函数写入
+    ``state.error``，由上层停止生成，避免将投喂文章原题误发布为新文章。
+    """
+    normalized_reference_title = (reference_title or "").strip()
+    if not normalized_reference_title:
+        state.error = "标题仿写失败：投喂文章缺少可用标题"
+        return state
+
+    style_prompt = get_style_prompt(state.style or "")
+    prompt = AGENT1_IMITATION_TITLE_PROMPT.format(
+        reference_title=normalized_reference_title,
+    )
+    if style_prompt:
+        prompt += f"\n\n{style_prompt}"
+    if state.style_profile:
+        prompt += _build_style_profile_section(state.style_profile)
+    if state.reference_articles:
+        prompt += _build_reference_articles_section(state.reference_articles)
+
+    # 专用仿写入口和通用标题入口共用同一产品名规则，保证后续切换 Agent 时行为一致。
+    prompt = _append_product_title_requirement(prompt, state.product_name)
+
+    raw = await _call_llm(
+        "你是严谨的微信公众号标题仿写 Agent。只返回一个包含原创标题的 JSON 对象。",
+        prompt,
+        temperature=0.7,
+    )
+
+    try:
+        data = _parse_json_response(raw)
+        raw_options = data.get("title_options", [])
+        valid_options = []
+        for raw_option in raw_options:
+            option = TitleOption(**raw_option)
+            if not option.main_title.strip():
+                continue
+            if _is_same_title(option.main_title, normalized_reference_title):
+                continue
+            valid_options.append(option)
+
+        if not valid_options:
+            state.error = "标题仿写失败：生成标题不能为空，且不能与参考原标题相同"
+            state.title_options = []
+            return state
+
+        state.title_options = valid_options
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        state.error = f"标题仿写失败：模型返回格式无效：{exc}"
+        state.title_options = []
+
+    return state
+
+
+def _is_same_title(candidate_title: str, reference_title: str) -> bool:
+    """比较标题是否只是参考原题的标点或空白变体。
+
+    仅靠字符串全等会放过“原标题！”这类伪仿写结果。这里移除空白和标点后
+    再比较，允许真实改写保留相同主题，但拒绝不具有原创性的原题复用。
+    """
+    def normalize(title: str) -> str:
+        return re.sub(r"[\W_]", "", title, flags=re.UNICODE).casefold()
+
+    return normalize(candidate_title) == normalize(reference_title)
 
 
 async def agent2_generate_outline(
@@ -324,8 +402,17 @@ async def agent3_generate_content(
     1. Layout template present → structured JSON output (LLM fills blocks)
     2. No template → free-form Markdown output (original behavior)
     """
-    if not state.title or not state.outline:
-        state.error = "Title and outline are required before content generation"
+    if not state.title:
+        state.error = "Title is required before content generation"
+        return state
+
+    # 投喂仿写存在原始 HTML 时，优先锁定真实 DOM 结构。这个分支必须先于旧的
+    # LayoutTemplate/Markdown 流程执行，避免已经拿到的网页样式再次被压缩成文本块。
+    if state.reference_html:
+        return await agent3_generate_html_imitation_content(state)
+
+    if not state.outline:
+        state.error = "Outline is required before non-HTML content generation"
         return state
 
     # ========================================================================
@@ -371,6 +458,292 @@ async def agent3_generate_content(
     handler = stream_handler or _noop
     state.content = await _call_llm_with_streaming(system_msg, prompt, handler)
     return state
+
+
+async def agent3_generate_html_imitation_content(state: ArticleState) -> ArticleState:
+    """执行 HTML 主流程的文字与图片内容分析 Agent。
+
+    输入是投喂文章的原始 HTML，而不是 Markdown。函数先由程序构建不可变 DOM
+    蓝图，再让模型仅返回各槽位的新文字与图片提示词；随后由结构服务完成回填。
+    这样文字 Agent 无法移动节点，图片 Agent 也只能替换原来的 ``img`` 位置。
+    """
+    from app.agent.nodes.image_understanding_node import understand_images
+    from app.services.html_imitation_service import (
+        analyze_html_for_imitation,
+        render_html_imitation,
+        select_html_image_slots,
+    )
+
+    try:
+        blueprint = analyze_html_for_imitation(state.reference_html or "")
+        if state.skip_reference_image_understanding:
+            # ERP 产品是唯一真实视觉主体，品牌知识库已经给出目标背景。此处仍保留
+            # 图片 DOM 槽位，但不调用参考文章图片理解，防止外部图片风格混入提示词。
+            visual_descriptions, excluded_image_slot_ids = {}, set()
+        else:
+            visual_descriptions, excluded_image_slot_ids = await _understand_reference_images(
+                blueprint,
+                understand_images,
+            )
+        generated_image_slot_ids, empty_image_slot_ids = select_html_image_slots(
+            blueprint,
+            excluded_image_slot_ids=excluded_image_slot_ids,
+            max_generated_images=5,
+        )
+        non_generated_image_slot_ids = excluded_image_slot_ids | set(empty_image_slot_ids)
+        prompt = _build_html_imitation_prompt(
+            state,
+            blueprint.prompt_payload(
+                excluded_image_slot_ids=non_generated_image_slot_ids,
+                include_source_urls=not state.skip_reference_image_understanding,
+            ),
+            visual_descriptions,
+        )
+        raw = await _call_llm(
+            "你是微信公众号 HTML 仿写内容 Agent。你只生成 JSON 槽位内容，绝不输出 HTML、"
+            "Markdown、参考原文句子或额外字段。",
+            prompt,
+            temperature=0.7,
+        )
+        data = _parse_json_response(raw)
+        text_by_slot = _index_agent_slots(data.get("text_slots", []), "content")
+        text_by_slot = await _repair_duplicate_article_title_slots(
+            state,
+            blueprint,
+            text_by_slot,
+        )
+        image_by_slot = _index_agent_slots(data.get("image_slots", []), "keywords")
+        image_by_slot = _compose_html_image_slot_prompts(
+            image_by_slot,
+            visual_descriptions,
+            non_generated_image_slot_ids,
+        )
+        rendered = render_html_imitation(
+            blueprint,
+            text_by_slot=text_by_slot,
+            image_by_slot=image_by_slot,
+            excluded_image_slot_ids=excluded_image_slot_ids,
+            empty_image_slot_ids=set(empty_image_slot_ids),
+            footer_template=state.footer_template or "",
+        )
+        state.content = rendered.html
+        state.image_requirements = list(rendered.image_requirements)
+        return state
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        state.error = f"HTML imitation content generation failed: {exc}"
+        return state
+
+
+async def _understand_reference_images(
+    blueprint,
+    understand_images: Callable[[List[str]], List[dict]],
+) -> tuple[dict, set[str]]:
+    """调用统一参考图片分析，并返回视觉特征和二维码槽位集合。
+
+    图片理解是网络模型调用，放入线程可避免阻塞当前的异步文章生成流程。不可访问
+    的图片不会中断文字生成；二维码则必须同时从内容 Agent 的槽位输入和最终 DOM
+    中移除，避免模型为二维码生成替代图。
+    """
+    slots_with_urls = [
+        slot for slot in blueprint.image_slots
+        if slot.source_url.startswith(("http://", "https://"))
+    ]
+    if not slots_with_urls:
+        return {}, set()
+
+    from app.services.reference_media_analysis_service import analyze_reference_images
+
+    analysis = await asyncio.to_thread(
+        analyze_reference_images,
+        [slot.source_url for slot in slots_with_urls],
+        understand_images,
+    )
+    visual_descriptions = {
+        slots_with_urls[item.source_index].slot_id: item.description
+        for item in analysis.usable_images
+    }
+    excluded_image_slot_ids = {
+        slots_with_urls[source_index].slot_id
+        for source_index in analysis.skipped_qrcode_source_indexes
+    }
+    return visual_descriptions, excluded_image_slot_ids
+
+
+def _build_html_imitation_prompt(
+    state: ArticleState,
+    blueprint_payload: dict,
+    visual_descriptions: dict,
+) -> str:
+    """构建内容文字分析与图片生成意图的统一 JSON 任务。
+
+    不将投喂文章全文放入 Prompt，既减少模型复述风险，也确保模型只能参照结构、
+    目标长度与图片视觉特征围绕用户主题重新创作。
+    """
+    outline_text = _build_outline_text(state)
+    knowledge_context = state.kb_context or "（未提供）"
+    # ERP 投喂仿写时，正文知识库与图片背景知识库已经按职责分流。背景规则
+    # 只在本次槽位内容 Agent 中完整传入，要求模型将它们落实到每个槽位的
+    # ``prompt``；后续每张图生图不再重复携带同一份长规则，从源头减少输入 token。
+    image_background_context = state.image_prompt_context or "（未提供）"
+    return f"""请围绕用户主题重新创作一篇公众号文章，并严格填充以下 HTML 槽位。
+
+用户主题：{state.topic}
+文章标题：{state.title.main_title if state.title else state.topic}
+文章大纲：
+{outline_text}
+
+目标产品：{state.product_name or state.topic}
+品牌与背景知识库：
+{knowledge_context}
+
+图片背景知识库（仅用于 image_slots.prompt，必须将全部硬性视觉约束落实到每个图片槽位）：
+{image_background_context}
+
+格式 Agent 输出的固定槽位：
+{json.dumps(blueprint_payload, ensure_ascii=False)}
+
+图片理解 Agent 输出的参考视觉特征：
+{json.dumps(visual_descriptions, ensure_ascii=False)}
+
+规则：
+1. text_slots 中每个 id 都必须返回一次，content 为围绕新主题创作的纯文本；长度接近 target_length。
+2. 文章标题已由公众号单独展示，任何 text_slots 都不得重复主标题或副标题；第一个 p 槽位必须写开场正文，不能把标题当作导语。
+3. image_slots 中每个 id 都必须返回一次。keywords 必须描述目标产品；prompt 必须是可直接交给图生图模型的完整中文视觉提示词，包含图片背景知识库的硬性视觉约束和参考视觉特征，但不能复刻文字、水印或二维码。
+4. 不得复制参考文章句子，不得输出 HTML、Markdown 或代码块。
+5. 只能返回下列 JSON，不能增加或删除字段：
+{{
+  "text_slots": [{{"id": "text-1", "content": ""}}],
+  "image_slots": [{{"id": "image-1", "keywords": "", "prompt": ""}}]
+}}"""
+
+
+def _index_agent_slots(items: object, primary_field: str) -> dict:
+    """将模型返回的槽位数组规整为 ``{slot_id: 内容}`` 映射。
+
+    图片槽位需要保留 keywords 与 prompt 两个字段；文字槽位仅返回 content。异常
+    项被忽略，最终由渲染服务输出空槽位而不是错误替换到其他节点。
+    """
+    if not isinstance(items, list):
+        return {}
+    result = {}
+    for item in items:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        slot_id = str(item["id"])
+        if primary_field == "content":
+            result[slot_id] = str(item.get("content", ""))
+        else:
+            result[slot_id] = {
+                "keywords": str(item.get("keywords", "")),
+                "prompt": str(item.get("prompt", "")),
+            }
+    return result
+
+
+async def _repair_duplicate_article_title_slots(
+    state: ArticleState,
+    blueprint,
+    text_by_slot: dict,
+) -> dict:
+    """只重写误返回文章标题的 HTML 文字槽位。
+
+    公众号页面会在正文外独立展示标题，模型若把标题再次写入 ``p`` 或标题槽，会让
+    用户看到连续两遍标题。直接删除该节点虽然能消除重复，却会损失投喂源原本的
+    开场正文，因此这里只对异常槽位追加一次小范围修复调用，其余已生成段落保持
+    不变。修复结果仍重复标题或为空时明确失败，阻止有缺陷的文章继续发布。
+    """
+
+    candidate_titles = [
+        title.strip()
+        for title in (
+            state.title.main_title if state.title else "",
+            state.title.sub_title if state.title else "",
+        )
+        if title and title.strip()
+    ]
+    if not candidate_titles:
+        return text_by_slot
+
+    duplicate_slots = [
+        slot
+        for slot in blueprint.text_slots
+        if any(
+            _is_same_title(str(text_by_slot.get(slot.slot_id, "")), title)
+            for title in candidate_titles
+        )
+    ]
+    if not duplicate_slots:
+        return text_by_slot
+
+    repair_payload = [
+        {
+            "id": slot.slot_id,
+            "tag": slot.tag_name,
+            "target_length": slot.target_length,
+        }
+        for slot in duplicate_slots
+    ]
+    repair_prompt = f"""修复微信公众号正文中误写成文章标题的文字槽位。
+
+文章标题：{state.title.main_title if state.title else state.topic}
+目标产品：{state.product_name or state.topic}
+文章大纲：
+{_build_outline_text(state)}
+
+需要修复的槽位：
+{json.dumps(repair_payload, ensure_ascii=False)}
+
+要求：
+1. 每个槽位都写成与上下文衔接的正文或章节观点，长度接近 target_length。
+2. 第一个 p 槽位应从真实需求或使用场景切入，不能重复文章标题，不能只写产品名。
+3. 不得虚构知识库未提供的参数、价格、品牌、案例或效果。
+4. 只能返回 JSON：{{"text_slots":[{{"id":"text-1","content":""}}]}}。
+"""
+    raw = await _call_llm(
+        "你是微信公众号正文槽位修复 Agent。只补写指定正文槽位，不能重复文章标题。",
+        repair_prompt,
+        temperature=0.6,
+    )
+    repaired_data = _parse_json_response(raw)
+    repaired_slots = _index_agent_slots(repaired_data.get("text_slots", []), "content")
+    merged_slots = dict(text_by_slot)
+    for slot in duplicate_slots:
+        repaired_content = str(repaired_slots.get(slot.slot_id, "")).strip()
+        if not repaired_content or any(
+            _is_same_title(repaired_content, title) for title in candidate_titles
+        ):
+            raise ValueError(f"正文槽位 {slot.slot_id} 重复文章标题且自动修复失败")
+        merged_slots[slot.slot_id] = repaired_content
+    return merged_slots
+
+
+def _compose_html_image_slot_prompts(
+    image_by_slot: dict,
+    visual_descriptions: dict,
+    excluded_image_slot_ids: set[str],
+) -> dict:
+    """为 HTML 图片槽位强制合成最终生图提示词。
+
+    内容 Agent 只提供新主体和补充描述，参考图片的视觉分析由程序写入最终提示词。
+    二维码槽位即使被模型异常返回也会被忽略，确保不会重新进入后续图片生成流程。
+    """
+    from app.services.reference_image_imitation_service import compose_visual_imitation_prompt
+
+    result = {}
+    for slot_id, image_data in image_by_slot.items():
+        if slot_id in excluded_image_slot_ids:
+            continue
+        subject = str(image_data.get("keywords", "")).strip()
+        supplement = str(image_data.get("prompt", "")).strip()
+        result[slot_id] = {
+            "keywords": subject,
+            "prompt": compose_visual_imitation_prompt(
+                visual_descriptions.get(slot_id, {}),
+                subject=subject,
+                supplement=supplement,
+            ),
+        }
+    return result
 
 
 async def _generate_structured_content(
@@ -427,6 +800,11 @@ async def _generate_structured_content(
         prompt += _build_style_profile_section(state.style_profile)
     if state.reference_articles:
         prompt += _build_reference_articles_section(state.reference_articles)
+    if state.kb_context:
+        prompt += (
+            "\n\n## 品牌与背景知识库（正文和图片要求必须遵守）\n"
+            f"{state.kb_context}\n"
+        )
 
     system_msg = (
         "你是一个专业的内容填充专家。你的任务是将模板中的每个 block 填写完整。\n"
@@ -544,7 +922,12 @@ async def agent4_analyze_image_requirements(state: ArticleState) -> ArticleState
         state.error = "Content is required before image requirement analysis"
         return state
 
-    enabled_methods = state.enabled_image_methods or ["PEXELS"]
+    # HTML 仿写 Agent 已基于原图片槽位生成需求。再次让通用 Agent 根据全文猜测
+    # 图片位置会破坏原位关系，因此直接沿用已生成的结构化需求。
+    if 'data-ai-image-slot=' in state.content and state.image_requirements:
+        return state
+
+    enabled_methods = state.enabled_image_methods or ["DASHSCOPE"]
     enabled_methods_text = ", ".join(enabled_methods)
 
     main_title = (
@@ -589,6 +972,88 @@ async def agent5_generate_images(
         state.error = "No image requirements to process"
         return state
 
+    # 所有生图入口共用五张成本上限。HTML 仿写会提前把多余节点留空，此处再做
+    # 统一兜底，防止 Markdown、结构化文章或旧 LangGraph 节点绕过限制。
+    if len(state.image_requirements) > 5:
+        logger.info(
+            "图片需求由 %d 张限制为 5 张，额外槽位保持空白",
+            len(state.image_requirements),
+        )
+        state.image_requirements = list(state.image_requirements[:5])
+
+    # ---- ERP 产品参考图生图 ----
+    # 定时任务每天只选择一个产品。每个图片槽位都以同一产品原图为参考生成不同场景，
+    # 不能走 selected_image_urls 的直插路径，否则不会产生新的背景海报。
+    if state.reference_image_url:
+        from app.services.image_generation_models import ImageGenerationRequest
+        from app.services.image_generation_service import image_generation_service
+
+        results: List[ImageResult] = []
+        for req in state.image_requirements:
+            slot_prompt = (req.prompt or "").strip()
+            if state.reference_html and not slot_prompt:
+                # HTML ERP 路径的背景规则只由槽位内容 Agent 编译一次。此处若允许
+                # 用产品关键词兜底，虽然能够少传 token，却会丢失品牌场景、色彩等
+                # 硬约束并让图像质量退化，因此必须中止本次发布。
+                raise RuntimeError(
+                    f"图生图失败：图片槽位 {req.placeholder_id or req.position} "
+                    "缺少完整视觉提示词"
+                )
+            base_prompt = (slot_prompt or req.keywords or req.section_title).strip()
+            if not base_prompt:
+                raise RuntimeError(
+                    f"图生图失败：图片槽位 {req.placeholder_id or req.position} 缺少视觉提示词"
+                )
+            product_rule = (
+                f"目标产品：{state.product_name}。必须保留参考图中该产品的主体结构、"
+                "材质和关键设计特征，只根据下述规则替换背景。\n\n"
+                if state.product_name else ""
+            )
+            if state.reference_html:
+                # HTML 槽位 Agent 已一次性读取完整图片背景知识库，并把规则写入
+                # 当前槽位的 ``prompt``。此处不得逐张重复拼接长知识库，否则五张
+                # 图片会产生五倍相同输入 token；空提示词已在上方明确阻止发布。
+                prompt = product_rule + base_prompt
+            else:
+                # 非 HTML 的旧文章路径没有统一的槽位内容 Agent，背景规则尚未被
+                # 编译进单图提示词。为兼容旧任务并保证视觉质量，仍保留原有注入。
+                brand_context = (state.image_prompt_context or "").strip()[:4000]
+                prompt = product_rule + (
+                    f"品牌视觉约束：{brand_context}\n\n{base_prompt}"
+                    if brand_context else base_prompt
+                )
+            generated = await image_generation_service.generate(
+                ImageGenerationRequest(
+                    prompt=prompt,
+                    tenant_id=state.tenant_id,
+                    reference_image_bytes=state.reference_image_bytes,
+                    reference_content_type=state.reference_content_type,
+                    reference_image_url=state.reference_image_url,
+                    size="1024*1365",
+                    no_text=True,
+                )
+            )
+            url = generated.url
+            if not url:
+                # 图生图是定时任务的硬依赖，少一张会造成正文槽位和素材库记录错位；
+                # 不允许把空 URL 静默带到发布阶段伪装成成功文章。
+                raise RuntimeError(f"图生图失败：第 {req.position} 张图片未返回有效地址")
+            results.append(ImageResult(
+                position=req.position,
+                url=url,
+                method=(
+                    f"{generated.provider}-fallback"
+                    if generated.fallback_used
+                    else generated.provider
+                ),
+                keywords=req.keywords or "",
+                section_title=req.section_title,
+                description=prompt,
+                placeholder_id=req.placeholder_id,
+            ))
+        state.images = results
+        return state
+
     # ---- User pre-selected local images ----
     if state.selected_image_urls:
         results: List[ImageResult] = []
@@ -615,11 +1080,26 @@ async def agent5_generate_images(
     strategy = ImageServiceStrategy()
     results: List[ImageResult] = []
 
-    for req in state.image_requirements:
-        method = req.image_source or "PEXELS"
+    total_requirements = len(state.image_requirements)
+    for image_index, req in enumerate(state.image_requirements, start=1):
+        method = req.image_source or "DASHSCOPE"
         keywords = req.keywords or req.section_title or ""
+        final_prompt = req.prompt or keywords
 
-        url = await strategy.execute(method, keywords, prompt=req.prompt)
+        # 控制台日志是排查“视觉分析是否真正传入生图模型”的关键证据。
+        # 仅记录提示词和结果摘要，不记录任何服务密钥或 HTTP 鉴权信息。
+        print(f"\n  [图片生成 {image_index}/{total_requirements}]")
+        print(f"  ├─ 槽位: {req.placeholder_id or req.position}")
+        print(f"  ├─ 主体: {keywords[:160]}")
+        print(f"  ├─ 最终提示词 ({len(final_prompt)}字): {final_prompt[:1200]}")
+
+        url = await strategy.execute(
+            method,
+            keywords,
+            prompt=final_prompt,
+            tenant_id=state.tenant_id,
+        )
+        print(f"  └─ 生成结果: {(url or '失败，未返回图片地址')[:240]}")
 
         results.append(
             ImageResult(
@@ -661,6 +1141,19 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
     This also populates ``state.full_content``.
     """
     content = state.content or ""
+
+    # HTML 仿写模式由结构服务在原 ``img`` 节点上标记图片槽位。此处必须优先
+    # 原位替换，不能沿用 Markdown 图片标记的“插入一段新图片”策略，否则图片会
+    # 被追加到文末或离开原文版式位置。
+    if 'data-ai-image-slot=' in content:
+        from app.services.html_imitation_service import replace_html_image_slots
+
+        image_urls_by_slot = {
+            image.placeholder_id: image.url
+            for image in state.images
+            if image.placeholder_id and image.url
+        }
+        content = replace_html_image_slots(content, image_urls_by_slot)
 
     if state.images:
         # Build a lookup by position
@@ -708,18 +1201,50 @@ def merge_images_into_content(state: ArticleState) -> ArticleState:
     # 去掉 AI 生成内容开头的标题（已由前端独立展示）
     content = _strip_leading_title(content, state)
 
-    # Append footer template（不加横线）
-    if state.footer_template:
+    # HTML 仿写渲染器会在正文末尾统一追加固定页脚。这里识别任意页脚标记，避免
+    # 图片合并阶段把同一份电话和二维码再追加一次。
+    footer_already_applied = "data-ai-footer-template=" in content
+    if state.footer_template and not footer_already_applied:
         footer = state.footer_template.strip()
         if footer:
-            content = f"{content}\n\n{footer}"
+            if content.lstrip().startswith("<"):
+                from app.services.footer_template_service import render_footer_template_html
 
-    state.full_content = content
+                footer_html = render_footer_template_html(footer)
+                if footer_html:
+                    content = f"{content}\n<div data-ai-footer-template=\"appended\">{footer_html}</div>"
+            else:
+                content = f"{content}\n\n{footer}"
+
+    # 无论内容来自 HTML 仿写、结构化模板还是普通 Markdown，AI 图片说明都由
+    # 程序统一追加。该函数具备幂等性，因此多个生成入口复用此步骤不会重复出现。
+    from app.services.article_publication_polish_service import append_ai_image_disclaimer
+
+    state.full_content = append_ai_image_disclaimer(content)
     return state
 
 
 def _strip_leading_title(content: str, state: ArticleState) -> str:
-    """去掉正文开头可能重复的标题行"""
+    """去掉正文开头可能重复的标题，同时兼容 HTML 与 Markdown。
+
+    HTML 仿写主流程会在槽位阶段主动修复标题，这里仍保留确定性兜底，覆盖旧
+    LangGraph 节点或历史任务直接返回整段 HTML 的情况。只检查第一个有文本的
+    内容块，避免误删正文中后续正常提及产品标题的段落。
+    """
+    if content.lstrip().startswith("<"):
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(content, "html.parser")
+        first_text_block = soup.find(
+            ["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li"]
+        )
+        if first_text_block is not None and state.title:
+            first_text = first_text_block.get_text(" ", strip=True)
+            titles = [state.title.main_title, state.title.sub_title]
+            if any(title and _is_same_title(first_text, title) for title in titles):
+                first_text_block.decompose()
+        return str(soup)
+
     lines = content.split("\n")
     while lines:
         stripped = lines[0].strip()
@@ -1138,6 +1663,10 @@ def render_final_content(
     if footer_template:
         footer = footer_template.strip()
         if footer:
-            content += f"\n\n{footer}"
+            from app.services.footer_template_service import render_footer_template_html
+
+            footer_html = render_footer_template_html(footer)
+            if footer_html:
+                content += f'\n<div data-ai-footer-template="appended">{footer_html}</div>'
 
     return content

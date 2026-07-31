@@ -77,6 +77,8 @@ async def get_or_prepare_image_media(
         raise ValueError(f"Asset {asset_id} not found")
 
     # live 模式 — 上传微信
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("微信素材上传")
     import httpx
     from app.services.wechat_comment_service import _get_service as _get_comment_svc
 

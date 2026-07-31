@@ -407,6 +407,7 @@ async def execute_imitation_generation(
     state = ArticleState(
         task_id=f"imitation_{task.id}_{slot_index}_{datetime.now(timezone.utc).timestamp()}",
         user_id=task.created_by or 0,
+        tenant_id=task.tenant_id,
         topic=topic,
         style="default",
         footer_template=task.footer_template,
@@ -478,7 +479,7 @@ async def execute_imitation_media_generation(
     from app.agent.nodes.title_imitation_node import imitate_title
     from app.agent.nodes.image_understanding_node import understand_images
     from app.agent.nodes.prompt_crafting_node import craft_prompt
-    from app.services.wanxiang_service import WanxiangImageService
+    from app.services.image_generation_service import image_generation_service
     from app.services.storage_service import generate_object_key, storage_service
     from app.services.asset_archive_service import save_image_to_asset_library
 
@@ -539,7 +540,6 @@ async def execute_imitation_media_generation(
         ]
         shot_plan = analyze_shots(shot_summaries, total_duration=min(len(visual_descs) * 3, 15))
 
-    wanxiang = WanxiangImageService()
     generated_urls = []
 
     if is_video:
@@ -648,7 +648,11 @@ async def execute_imitation_media_generation(
 
         img_url = None
         try:
-            img_url = await wanxiang.generate_image(gen_prompt, size="1024*1365")
+            img_url = await image_generation_service.generate_image(
+                gen_prompt,
+                size="1024*1365",
+                tenant_id=task.tenant_id,
+            )
         except Exception as e:
             logger.warning("Image %d generation failed: %s", i + 1, e)
 

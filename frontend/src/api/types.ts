@@ -6,7 +6,7 @@ export interface ContentJobPage { total: number; page: number; page_size: number
 export interface Account { id: number; name: string; app_id: string; status: string; auth_mode: string; credential_configured?: boolean; last_health_at?: string; capabilities?: any }
 export interface Asset { id: number; filename: string; original_filename?: string; asset_type: string; mime_type?: string; file_size?: number; storage_key?: string; tags?: string[]; width?: number; height?: number; usage_count?: number; preview_url?: string; is_watermarked?: boolean; created_at?: string }
 export interface FeedSource { id: number; name: string; slug: string; source_type: string; source_identifier: string; feed_url?: string; is_active: boolean; status?: string; style_profile?: any; article_count?: number; last_fetched_at?: string; created_at: string }
-export interface FeedSourceArticle { id: number; title: string; body_markdown?: string; summary?: string; cover_image_url?: string; word_count?: number; is_analyzed?: boolean; published_at?: string }
+export interface FeedSourceArticle { id: number; title: string; body_markdown?: string; body_html?: string; summary?: string; cover_image_url?: string; word_count?: number; is_analyzed?: boolean; published_at?: string }
 export interface FeedSourceArticlePage { total: number; page: number; page_size: number; items: FeedSourceArticle[] }
 export interface KnowledgeBase { id: number | string; name: string; slug?: string; kb_type?: string; description?: string; is_active?: boolean; created_at: string }
 export interface KbDocument { id: number | string; filename: string; file_type?: string; status: string; chunk_count?: number; error_message?: string; created_at: string }

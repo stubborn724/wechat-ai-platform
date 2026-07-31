@@ -68,7 +68,7 @@ def analyze_images_node(state: ArticleGenState) -> dict:
                     position=ph["position"],
                     type=ph["type"],
                     section_title="",
-                    image_source=state.get("image_source", "pexels").upper(),
+                    image_source=state.get("image_source", "DASHSCOPE").upper(),
                     keywords=ph["keywords"],
                     prompt="",
                     placeholder_id=str(ph["position"]),
@@ -77,7 +77,7 @@ def analyze_images_node(state: ArticleGenState) -> dict:
         return {"image_requirements": [r.model_dump() for r in image_requirements]}
 
     # Second pass — no placeholders, ask the LLM to analyse
-    enabled_methods = state.get("enabled_image_methods") or ["pexels", "local"]
+    enabled_methods = state.get("enabled_image_methods") or ["DASHSCOPE", "local"]
     enabled_methods_text = ", ".join(enabled_methods)
 
     prompt = PromptConstant.AGENT4_IMAGE_REQUIREMENTS_PROMPT.format(

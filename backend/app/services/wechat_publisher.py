@@ -2,6 +2,7 @@
 微信公众号 API 发布服务 — 直接移植自 WeChat-AI-Auto-Publisher
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +61,10 @@ class WechatPublisher:
 
     def _make_request(self, method, url, **kwargs):
         """统一请求方法，自动使用 IPv4 session，添加代理和重试逻辑"""
+        if "api.weixin.qq.com" in url or "mp.weixin.qq.com" in url:
+            from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+            ensure_direct_wechat_api_allowed("微信文章发布")
+
         if self.proxies:
             kwargs['proxies'] = self.proxies
         if 'timeout' not in kwargs:
@@ -387,7 +392,9 @@ class WechatPublisher:
         title = title.strip()
         title = re.sub(r'\s+', ' ', title)[:MAX_TITLE_LENGTH]
 
-        author = (author or "AI 运营平台").strip()
+        # 作者字段属于客户公众号的展示信息。业务未显式传入时保持为空，禁止使用
+        # 平台名称兜底，避免在客户文章中泄露“AI 运营平台”这一内部产品字段。
+        author = (author or "").strip()
         author = re.sub(r'\s+', ' ', author)[:MAX_AUTHOR_LENGTH]
 
         digest = (summary or "").strip()
@@ -545,6 +552,133 @@ def _get_publisher_for_account(db: Session, account_id: int, tenant_id: int,
     return WechatPublisher(app_id=account.app_id, app_secret=app_secret)
 
 
+def ensure_relay_image_urls_are_https(html: str, cover_image_url: str) -> None:
+    """校验交给微信中转站下载的图片必须是可公开访问的 HTTPS 地址。
+
+    中转站运行在独立服务器，无法访问本机 ``localhost`` 或普通 HTTP 地址。过去
+    的兼容代码会偷偷改成 Picsum 随机图，从而把真实的家具仿写图替换成无关图片。
+    这里选择显式失败：调用方能够修正对象存储公网域名，而不会发布内容错误的文章。
+    """
+    http_image_urls = set(re.findall(
+        r'<img[^>]+src\s*=\s*["\'](http://[^"\']+)["\']',
+        html or "",
+        re.IGNORECASE,
+    ))
+    if (cover_image_url or "").startswith("http://"):
+        http_image_urls.add(cover_image_url)
+
+    if not http_image_urls:
+        return
+
+    logger.error(
+        "中转站发布已阻止：检测到 %d 个非 HTTPS 图片 URL，示例=%s",
+        len(http_image_urls),
+        list(http_image_urls)[:3],
+    )
+    raise ValueError(
+        "微信中转站无法访问 HTTP/localhost 图片。请将 MINIO_PUBLIC_ENDPOINT 配置为"
+        "中转站可访问的 HTTPS 公网域名后重试；系统不会用随机图片替换真实生成图。"
+    )
+
+
+def _build_relay_publish_request_id(
+    *,
+    tenant_id: int,
+    account_id: int,
+    article_id: int,
+    mode: str,
+    html: str,
+    cover_image_url: str,
+) -> str:
+    """为实际发布请求体生成稳定且可区分的中转站幂等键。
+
+    COS 签名 URL 是请求体的一部分且每次准备可能变化。把正文和封面摘要加入
+    requestId，可保证完全相同的准备结果复用同一键，而不同签名体不会被中转站
+    判定为“同 requestId 绑定不同请求体”。摘要不会泄露正文或签名参数。
+    """
+    digest_source = json.dumps(
+        {"html": html or "", "cover_image_url": cover_image_url or ""},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    body_digest = hashlib.sha256(digest_source).hexdigest()[:16]
+    return f"article-{tenant_id}-{account_id}-{article_id}-{mode}-{body_digest}"
+
+
+def _publish_article_via_relay(db: Session, article: Article, account_id: int,
+                               mode: str, tenant_id: int, actor_id: int) -> dict:
+    """通过固定 IP 中转站发布文章。
+
+    中转站负责访问微信官方 API，因此本机后端不会再触发微信 IP 白名单校验。
+    这里复用现有账号归属校验、凭证解密和审计逻辑，只把最终微信调用替换为
+    中转站协议，保证业务层的发布入口保持稳定。
+    """
+    from app.services.wechat_gateway_policy import require_relay_publish_config
+    from app.services.wechat_relay_client import WeChatRelayClient
+    from app.services.wechat_relay_image_service import WeChatRelayImageService
+
+    require_relay_publish_config()
+    publisher = _get_publisher_for_account(
+        db, account_id, tenant_id, actor_id=actor_id,
+    )
+
+    content = article.full_content or article.content or ""
+    summary = article.sub_title or article.topic or ""
+    title = article.main_title or article.topic or "无标题"
+    cover_image_url = (article.cover_image or "").strip()
+    if not cover_image_url:
+        raise ValueError("微信中转站发布要求文章必须有可公网访问的封面图片 URL")
+
+    html = content if content.strip().startswith("<") else publisher._format_content(content)
+    relay_image_service = WeChatRelayImageService()
+    prepared_images = relay_image_service.prepare(
+        html=html,
+        cover_image_url=cover_image_url,
+        tenant_id=tenant_id,
+        article_id=article.id,
+    )
+
+    try:
+        # 本地 MinIO 图片已经临时公网化；若仍有普通 HTTP 地址，必须明确失败，
+        # 不能用随机图片替换真实内容或把外部不安全地址当作可信素材。
+        ensure_relay_image_urls_are_https(
+            prepared_images.html,
+            prepared_images.cover_image_url,
+        )
+
+        request_id = _build_relay_publish_request_id(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            article_id=article.id,
+            mode=mode,
+            html=prepared_images.html,
+            cover_image_url=prepared_images.cover_image_url,
+        )
+        client = WeChatRelayClient(
+            base_url=settings.wechat_relay_base_url,
+            relay_app_id=settings.wechat_relay_app_id,
+            relay_secret=settings.wechat_relay_secret,
+        )
+        return client.publish_article(
+            app_id=publisher.app_id,
+            app_secret=publisher.app_secret,
+            request_id=request_id,
+            tenant_id=str(tenant_id) if tenant_id else None,
+            publish_mode=mode,
+            confirm_publish=(mode == "direct"),
+            title=title.strip()[:64],
+            digest=(summary or "").strip()[:120],
+            html=prepared_images.html,
+            author="",
+            cover_image_url=prepared_images.cover_image_url,
+            need_open_comment=1,
+            only_fans_can_comment=0,
+        )
+    finally:
+        # 中转站在方法返回前已完成图片下载，签名对象此时即可释放；失败路径同样清理。
+        relay_image_service.cleanup(prepared_images.object_keys)
+
+
 def publish_article(db: Session, article: Article, account_id: int,
                     mode: str = "draft", tenant_id: int = 0,
                     actor_id: int = 0) -> dict:
@@ -562,6 +696,13 @@ def publish_article(db: Session, article: Article, account_id: int,
     """
     if tenant_id == 0:
         tenant_id = article.tenant_id or 0
+    from app.services.wechat_gateway_policy import is_wechat_relay_enabled
+    if is_wechat_relay_enabled():
+        return _publish_article_via_relay(
+            db, article, account_id, mode=mode,
+            tenant_id=tenant_id, actor_id=actor_id,
+        )
+
     publisher = _get_publisher_for_account(db, account_id, tenant_id, actor_id=actor_id)
     content = article.full_content or article.content or ""
     summary = article.sub_title or article.topic or ""

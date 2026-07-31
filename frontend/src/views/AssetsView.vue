@@ -3,12 +3,20 @@ import { onMounted, ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import type { Asset } from '@/api/types'
+import {
+  importErpProductImages,
+  listErpProductSources,
+  searchErpProducts,
+  type ErpProduct,
+  type ErpProductSource,
+} from '@/api/erpProducts'
 
 const assets = ref<Asset[]>([])
 const loading = ref(true)
 const total = ref(0)
 const filterType = ref('')
-const filterSource = ref('')  // '' = all, 'uploaded', 'generated'
+// 素材来源是本地素材库内的分类标签，不代表浏览器仍需访问 ERP 远端地址。
+const filterSource = ref<'all' | 'uploaded' | 'generated' | 'erp'>('all')
 const showUpload = ref(false)
 const uploading = ref(false)
 const uploadFile = ref<File | null>(null)
@@ -17,6 +25,23 @@ const selectedAsset = ref<Asset | null>(null)
 const showPreview = ref(false)
 const docContent = ref('')
 const docLoading = ref(false)
+const selectedAssetIds = ref<number[]>([])
+const deletingAssets = ref(false)
+
+// ERP 素材导入状态。远端产品仅在此弹窗中浏览，选中的图片会复制到本地素材库。
+const showErpImport = ref(false)
+const erpSources = ref<ErpProductSource[]>([])
+const selectedErpSource = ref('')
+const erpModelFilter = ref('')
+const erpSeriesFilter = ref('')
+const erpProducts = ref<ErpProduct[]>([])
+const selectedErpImageUrls = ref<string[]>([])
+const erpImportLimit = ref(10)
+const erpPageNo = ref(1)
+const erpPageSize = 50
+const erpProductTotal = ref(0)
+const loadingErpProducts = ref(false)
+const importingErpProducts = ref(false)
 
 // Watermark controls
 const applyingWatermark = ref(false)
@@ -56,6 +81,14 @@ const assetTypeOptions = [
   { value: 'document', label: '文档' },
 ]
 
+const selectedAssetCount = computed(() => selectedAssetIds.value.length)
+const allVisibleAssetsSelected = computed({
+  get: () => assets.value.length > 0 && assets.value.every(asset => selectedAssetIds.value.includes(asset.id)),
+  set: (checked: boolean) => {
+    selectedAssetIds.value = checked ? assets.value.map(asset => asset.id) : []
+  },
+})
+
 function formatSize(bytes: number | undefined): string {
   if (!bytes || bytes === 0) return '0 B'
   const k = 1024
@@ -70,10 +103,13 @@ async function load() {
     const params: Record<string, string | number> = { page: 1, page_size: 50 }
     if (filterType.value) params.asset_type = filterType.value
     if (filterSource.value === 'generated') params.tags = 'auto-archived'
-    else if (filterSource.value === 'uploaded') params.tags = '-auto-archived'
+    else if (filterSource.value === 'erp') params.tags = 'ERP产品'
+    // 手工上传不包含系统归档或 ERP 导入来源，避免两个来源混入“上传的”筛选。
+    else if (filterSource.value === 'uploaded') params.tags = '-auto-archived,-ERP产品'
     const res = await client.get<{ items: Asset[]; total: number }>('/assets', { params })
     assets.value = res.data.items || []
     total.value = res.data.total || 0
+    selectedAssetIds.value = []
   } catch {
     ElMessage.error('加载素材失败')
   } finally {
@@ -110,6 +146,81 @@ async function uploadAsset() {
   }
 }
 
+async function openErpImport() {
+  showErpImport.value = true
+  if (erpSources.value.length === 0) {
+    try {
+      erpSources.value = await listErpProductSources()
+      selectedErpSource.value = erpSources.value[0]?.key || ''
+    } catch (err: any) {
+      ElMessage.error(err?.response?.data?.detail || 'ERP 产品来源未配置')
+      return
+    }
+  }
+  if (selectedErpSource.value && erpProducts.value.length === 0) await searchErpProductsForImport()
+}
+
+async function searchErpProductsForImport(pageNo = 1) {
+  if (!selectedErpSource.value) return
+  loadingErpProducts.value = true
+  selectedErpImageUrls.value = []
+  erpPageNo.value = pageNo
+  try {
+    const page = await searchErpProducts(selectedErpSource.value, {
+      pageNo,
+      pageSize: erpPageSize,
+      productModel: erpModelFilter.value.trim() || undefined,
+      series: erpSeriesFilter.value.trim() || undefined,
+    })
+    erpProducts.value = page.items || []
+    erpProductTotal.value = page.total || 0
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '查询 ERP 产品失败')
+  } finally {
+    loadingErpProducts.value = false
+  }
+}
+
+/** 切换 ERP 来源或主动更新筛选时，从第一页重新浏览。 */
+function resetErpProductSearch() {
+  void searchErpProductsForImport(1)
+}
+
+function toggleErpProduct(product: ErpProduct) {
+  const index = selectedErpImageUrls.value.indexOf(product.image_url)
+  if (index >= 0) {
+    selectedErpImageUrls.value.splice(index, 1)
+    return
+  }
+  if (selectedErpImageUrls.value.length >= erpImportLimit.value) {
+    ElMessage.warning(`本次最多选择 ${erpImportLimit.value} 张图片`)
+    return
+  }
+  selectedErpImageUrls.value.push(product.image_url)
+}
+
+const selectedErpProducts = computed(() => erpProducts.value.filter(
+  product => selectedErpImageUrls.value.includes(product.image_url),
+))
+
+async function importSelectedErpProducts() {
+  if (!selectedErpSource.value || selectedErpProducts.value.length === 0) return
+  importingErpProducts.value = true
+  try {
+    const result = await importErpProductImages(selectedErpSource.value, selectedErpProducts.value)
+    const suffix = result.failed_count > 0 ? `，${result.failed_count} 张失败` : ''
+    ElMessage.success(`已导入 ${result.imported_count} 张，复用 ${result.reused_count} 张${suffix}`)
+    if (result.errors.length > 0) ElMessage.warning(result.errors[0])
+    selectedErpImageUrls.value = []
+    showErpImport.value = false
+    await load()
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '批量导入 ERP 产品图片失败')
+  } finally {
+    importingErpProducts.value = false
+  }
+}
+
 async function confirmDelete(asset: Asset) {
   try {
     await ElMessageBox.confirm(`确定删除「${asset.filename}」？`, '删除确认', {
@@ -118,6 +229,7 @@ async function confirmDelete(asset: Asset) {
       type: 'warning',
     })
     await client.delete(`/assets/${asset.id}`)
+    selectedAssetIds.value = selectedAssetIds.value.filter(id => id !== asset.id)
     ElMessage.success('已删除')
     if (selectedAsset.value?.id === asset.id) {
       selectedAsset.value = null
@@ -126,6 +238,59 @@ async function confirmDelete(asset: Asset) {
     await load()
   } catch {
     // cancelled
+  }
+}
+
+/** 切换素材多选状态，卡片其他区域仍保留点击预览的原有行为。 */
+function toggleAssetSelection(assetId: number) {
+  const selectedIndex = selectedAssetIds.value.indexOf(assetId)
+  if (selectedIndex >= 0) {
+    selectedAssetIds.value.splice(selectedIndex, 1)
+  } else {
+    selectedAssetIds.value.push(assetId)
+  }
+}
+
+/**
+ * 删除用户明确勾选的本地素材。
+ *
+ * 批量接口会对每个素材独立处理，失败项保留在选中状态，便于用户针对性重试。
+ */
+async function confirmBatchDelete() {
+  if (selectedAssetIds.value.length === 0) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除已选的 ${selectedAssetIds.value.length} 个素材吗？该操作会同时删除本地素材库和对象存储文件。`,
+      '批量删除确认',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return
+  }
+
+  deletingAssets.value = true
+  try {
+    const res = await client.post('/assets/bulk-delete', { asset_ids: selectedAssetIds.value })
+    const result = res.data.data || res.data
+    const failedIds: number[] = [...(result.failed_ids || []), ...(result.not_found_ids || [])]
+    if (selectedAsset.value && !failedIds.includes(selectedAsset.value.id)) {
+      selectedAsset.value = null
+      showPreview.value = false
+    }
+    await load()
+    // 列表刷新会清空旧勾选；仅恢复本页仍可见的失败项，避免误选其他筛选结果。
+    selectedAssetIds.value = assets.value
+      .filter(asset => failedIds.includes(asset.id))
+      .map(asset => asset.id)
+    if (failedIds.length > 0) {
+      ElMessage.warning(`已删除 ${result.deleted_count} 个素材，${failedIds.length} 个未删除，请重试`)
+    } else {
+      ElMessage.success(`已删除 ${result.deleted_count} 个素材`)
+    }
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '批量删除素材失败')
+  } finally {
+    deletingAssets.value = false
   }
 }
 
@@ -225,20 +390,28 @@ onMounted(load)
         <h1>素材库</h1>
         <p class="lead">管理图片、视频、文档等素材，可在内容生成时直接引用。</p>
       </div>
-      <el-button type="primary" @click="showUpload = true">上传素材</el-button>
+      <div class="asset-actions">
+        <el-button type="danger" plain :loading="deletingAssets" :disabled="selectedAssetCount === 0" @click="confirmBatchDelete">
+          删除已选（{{ selectedAssetCount }}）
+        </el-button>
+        <el-button @click="openErpImport">从 ERP 产品库导入</el-button>
+        <el-button type="primary" @click="showUpload = true">上传素材</el-button>
+      </div>
     </div>
 
     <!-- Filter -->
     <div class="filter-bar">
       <el-radio-group v-model="filterSource" @change="load" style="margin-right: 16px">
-        <el-radio-button value="">全部</el-radio-button>
+        <el-radio-button value="all">全部</el-radio-button>
         <el-radio-button value="uploaded">上传的</el-radio-button>
         <el-radio-button value="generated">自动归档</el-radio-button>
+        <el-radio-button value="erp">ERP 导入</el-radio-button>
       </el-radio-group>
       <el-select v-model="filterType" @change="load" style="width: 160px">
         <el-option v-for="opt in assetTypeOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
       </el-select>
       <span class="asset-count">{{ total }} 个素材</span>
+      <el-checkbox v-if="assets.length > 0" v-model="allVisibleAssetsSelected" class="select-all-assets">全选当前列表</el-checkbox>
     </div>
 
     <div v-if="loading" class="loading-section">
@@ -253,6 +426,9 @@ onMounted(load)
 
     <div v-else class="asset-grid">
       <div v-for="asset in assets" :key="asset.id" class="asset-card" @click="previewAsset(asset)">
+        <div class="asset-select" @click.stop>
+          <el-checkbox :model-value="selectedAssetIds.includes(asset.id)" @change="toggleAssetSelection(asset.id)" />
+        </div>
         <div v-if="asset.asset_type === 'image' && asset.preview_url" class="asset-thumb">
           <img :src="asset.preview_url" :alt="asset.filename" class="thumb-img" loading="lazy" />
         </div>
@@ -260,7 +436,7 @@ onMounted(load)
           <span class="file-icon">{{ asset.asset_type === 'video' ? '🎬' : '📄' }}</span>
         </div>
         <div class="asset-info">
-          <strong class="asset-name" :title="asset.filename">{{ asset.filename }}</strong>
+          <strong class="asset-name" :title="asset.original_filename || asset.filename">{{ asset.original_filename || asset.filename }}</strong>
           <div class="asset-meta">
             <span>{{ assetTypeNames[asset.asset_type] || asset.asset_type }}</span>
             <span>{{ formatSize(asset.file_size) }}</span>
@@ -289,7 +465,7 @@ onMounted(load)
           <p>暂不支持在线预览</p>
         </div>
         <el-descriptions :column="1" border size="small" class="preview-meta">
-          <el-descriptions-item label="文件名">{{ selectedAsset.filename }}</el-descriptions-item>
+          <el-descriptions-item label="文件名">{{ selectedAsset.original_filename || selectedAsset.filename }}</el-descriptions-item>
           <el-descriptions-item label="类型">{{ selectedAsset.mime_type }}</el-descriptions-item>
           <el-descriptions-item label="大小">{{ formatSize(selectedAsset.file_size) }}</el-descriptions-item>
           <el-descriptions-item v-if="selectedAsset.width && selectedAsset.height" label="尺寸">
@@ -422,6 +598,44 @@ onMounted(load)
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- ERP 导入是素材库管理动作，不与文章编辑时的配图选择混在一起。 -->
+    <el-dialog v-model="showErpImport" title="从 ERP 产品库导入" width="900px" top="5vh">
+      <el-form inline class="erp-import-filters">
+        <el-form-item label="品牌"><el-select v-model="selectedErpSource" style="width:160px" @change="resetErpProductSearch"><el-option v-for="source in erpSources" :key="source.key" :label="source.name" :value="source.key" /></el-select></el-form-item>
+        <el-form-item label="产品型号"><el-input v-model="erpModelFilter" clearable placeholder="可选" @keyup.enter="searchErpProductsForImport" /></el-form-item>
+        <el-form-item label="系列"><el-input v-model="erpSeriesFilter" clearable placeholder="可选" @keyup.enter="searchErpProductsForImport" /></el-form-item>
+        <el-form-item><el-button type="primary" :loading="loadingErpProducts" @click="resetErpProductSearch">查询</el-button></el-form-item>
+      </el-form>
+      <div class="erp-import-toolbar">
+        <span>本次导入上限</span>
+        <el-input-number v-model="erpImportLimit" :min="1" :max="20" :step="1" controls-position="right" />
+        <span class="form-hint">已选 {{ selectedErpImageUrls.length }} / {{ erpImportLimit }}，系统最多允许 20 张</span>
+      </div>
+      <div v-if="loadingErpProducts" class="loading-section"><el-skeleton :rows="3" animated /></div>
+      <div v-else-if="erpProducts.length === 0" class="empty-state"><el-empty description="未查询到带报价图片的产品" /></div>
+      <div v-else class="erp-import-grid">
+        <button v-for="product in erpProducts" :key="product.image_url" type="button" class="erp-import-card" :class="{ selected: selectedErpImageUrls.includes(product.image_url) }" @click="toggleErpProduct(product)">
+          <img :src="product.image_url" :alt="product.name" loading="lazy" />
+          <strong>{{ product.name }}</strong>
+          <span>{{ product.series.join(' / ') || product.categories.join(' / ') || '未分类' }}</span>
+          <i v-if="selectedErpImageUrls.includes(product.image_url)">已选择</i>
+        </button>
+      </div>
+      <div v-if="erpProductTotal > erpPageSize" class="erp-pagination">
+        <el-pagination
+          v-model:current-page="erpPageNo"
+          :page-size="erpPageSize"
+          :total="erpProductTotal"
+          layout="prev, pager, next, jumper, total"
+          @current-change="searchErpProductsForImport"
+        />
+      </div>
+      <template #footer>
+        <el-button @click="showErpImport = false">取消</el-button>
+        <el-button type="primary" :loading="importingErpProducts" :disabled="selectedErpProducts.length === 0" @click="importSelectedErpProducts">导入 {{ selectedErpProducts.length }} 张到本地素材库</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -436,6 +650,8 @@ onMounted(load)
   justify-content: space-between;
   margin-bottom: 28px;
 }
+
+.asset-actions { display: flex; gap: 8px; }
 
 .eyebrow {
   font-size: 11px;
@@ -468,6 +684,11 @@ onMounted(load)
   font-size: 12px;
 }
 
+.select-all-assets {
+  margin-left: auto;
+  color: #606266;
+}
+
 .loading-section {
   padding: 40px 0;
 }
@@ -494,6 +715,19 @@ onMounted(load)
 
 .asset-card:hover {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+.asset-select {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  left: 8px;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.9);
 }
 
 .asset-thumb {
@@ -650,4 +884,16 @@ onMounted(load)
   color: #909399;
   margin-top: 2px;
 }
+
+.erp-import-filters { display: flex; flex-wrap: wrap; align-items: center; }
+.erp-import-toolbar { display: flex; align-items: center; gap: 10px; margin: 8px 0 14px; }
+.erp-import-toolbar .form-hint { margin: 0; }
+.erp-import-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; max-height: 480px; overflow-y: auto; }
+.erp-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+.erp-import-card { position: relative; display: grid; gap: 6px; padding: 8px; overflow: hidden; text-align: left; color: #606266; background: #fff; border: 1px solid #dcdfe6; border-radius: 6px; cursor: pointer; }
+.erp-import-card:hover, .erp-import-card.selected { border-color: #409eff; background: #ecf5ff; }
+.erp-import-card img { width: 100%; height: 125px; object-fit: cover; border-radius: 4px; background: #f5f7fa; }
+.erp-import-card strong { overflow: hidden; color: #303133; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.erp-import-card span { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.erp-import-card i { position: absolute; top: 8px; right: 8px; padding: 3px 6px; color: #fff; font-size: 11px; font-style: normal; background: #409eff; border-radius: 3px; }
 </style>

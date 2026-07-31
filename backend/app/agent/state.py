@@ -19,7 +19,7 @@ class ArticleGenState(TypedDict):
     user_id: int
     topic: str
     style: Optional[str]
-    image_source: str  # "local" or "pexels"
+    image_source: str  # "local" or "DASHSCOPE"
 
     # --- Title ---
     title_options: List[TitleOption]

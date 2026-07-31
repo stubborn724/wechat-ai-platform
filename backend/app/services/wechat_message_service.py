@@ -77,6 +77,9 @@ class WeChatMessageService:
         return await self._send(openid, body)
 
     async def _send(self, openid: str, body: dict) -> dict:
+        from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+        ensure_direct_wechat_api_allowed("客服消息发送")
+
         url = f"{_BASE}/cgi-bin/message/custom/send?access_token={self.access_token}"
         body["touser"] = openid
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -94,6 +97,9 @@ class WeChatMessageService:
 
 
 async def _get_service(db: Session, account_id: int, tenant_id: int = 0) -> WeChatMessageService:
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("客服消息发送")
+
     from app.models.mysql_models import AccountCredential, WeChatAccount
     import httpx
 

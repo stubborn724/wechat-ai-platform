@@ -28,6 +28,9 @@ def _get_decrypted_secret(cred: AccountCredential) -> str:
 
 async def get_valid_token(db: Session, account_id: int) -> str:
     """通过 AppID + AppSecret 获取 access_token"""
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("access_token 获取")
+
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
         WeChatAccount.deleted_at.is_(None),
@@ -64,6 +67,9 @@ async def get_valid_token(db: Session, account_id: int) -> str:
 def get_valid_token_sync(db: Session, account_id: int) -> str:
     """同步版本的 get_valid_token"""
     import requests as _req
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+
+    ensure_direct_wechat_api_allowed("access_token 获取")
 
     account = db.query(WeChatAccount).filter(
         WeChatAccount.id == account_id,
@@ -83,7 +89,7 @@ def get_valid_token_sync(db: Session, account_id: int) -> str:
         params={
             "grant_type": "client_credential",
             "appid": account.app_id,
-            "secret": cred.encrypted_secret,
+            "secret": _get_decrypted_secret(cred),
         },
         timeout=15,
     )

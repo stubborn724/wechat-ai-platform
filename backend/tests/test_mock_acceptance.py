@@ -30,26 +30,37 @@ class TestMockAcceptance:
     def _verify_delivery_db_state(self, db, delivery_id, expected_status,
                                    expected_text_status, expected_qr_status):
         """验证数据库中的 delivery 状态（refresh 确保读取最新数据）"""
-        db.expire_all()
-        d = db.query(ContactDelivery).filter(ContactDelivery.id == delivery_id).first()
-        assert d is not None, f"Delivery {delivery_id} not found"
-        print(f"\n[DEBUG] delivery {delivery_id}: status={d.status} text={d.text_status} qr={d.qr_status} "
-              f"eligibility_snapshot={bool(d.eligibility_snapshot)} package_snapshot={bool(d.package_snapshot)}")
-        assert d.status == expected_status, \
-            f"Expected status={expected_status}, got {d.status}"
-        assert d.text_status == expected_text_status, \
-            f"Expected text_status={expected_text_status}, got {d.text_status}"
-        assert d.qr_status == expected_qr_status, \
-            f"Expected qr_status={expected_qr_status}, got {d.qr_status}"
-        return d
+        from app.database import MysqlSessionLocal
+
+        verify_db = MysqlSessionLocal()
+        try:
+            d = verify_db.query(ContactDelivery).filter(ContactDelivery.id == delivery_id).first()
+            assert d is not None, f"Delivery {delivery_id} not found"
+            print(f"\n[DEBUG] delivery {delivery_id}: status={d.status} text={d.text_status} qr={d.qr_status} "
+                  f"eligibility_snapshot={bool(d.eligibility_snapshot)} package_snapshot={bool(d.package_snapshot)}")
+            assert d.status == expected_status, \
+                f"Expected status={expected_status}, got {d.status}"
+            assert d.text_status == expected_text_status, \
+                f"Expected text_status={expected_text_status}, got {d.text_status}"
+            assert d.qr_status == expected_qr_status, \
+                f"Expected qr_status={expected_qr_status}, got {d.qr_status}"
+            return d
+        finally:
+            verify_db.close()
 
     def _verify_attempts(self, db, delivery_id):
         """验证 attempt 记录存在"""
-        attempts = db.query(ContactDeliveryAttempt).filter(
-            ContactDeliveryAttempt.delivery_id == delivery_id
-        ).all()
-        assert len(attempts) > 0, "No attempt records found"
-        return attempts
+        from app.database import MysqlSessionLocal
+
+        verify_db = MysqlSessionLocal()
+        try:
+            attempts = verify_db.query(ContactDeliveryAttempt).filter(
+                ContactDeliveryAttempt.delivery_id == delivery_id
+            ).all()
+            assert len(attempts) > 0, "No attempt records found"
+            return attempts
+        finally:
+            verify_db.close()
 
     async def test_scenario_1_full_success(self, db, test_tenant, test_account, test_user):
         """链路1: text success + qr success → 全部成功"""
@@ -84,12 +95,18 @@ class TestMockAcceptance:
         assert len(attempts) >= 2  # text + qr
 
         # 验证 API 查询
-        data = get_delivery(db, test_tenant.id, delivery_id)
-        assert data["status"] == "success"
-        assert data["text_status"] == "success"
-        assert data["qr_status"] == "success"
-        assert data["attempts"] is not None
-        assert len(data["attempts"]) >= 2
+        from app.database import MysqlSessionLocal
+
+        verify_db = MysqlSessionLocal()
+        try:
+            data = get_delivery(verify_db, test_tenant.id, delivery_id)
+            assert data["status"] == "success"
+            assert data["text_status"] == "success"
+            assert data["qr_status"] == "success"
+            assert data["attempts"] is not None
+            assert len(data["attempts"]) >= 2
+        finally:
+            verify_db.close()
 
     async def test_scenario_2_qr_failure_then_retry(self, db, test_tenant, test_account, test_user):
         """链路2: text success + qr failed → 重试 qr → qr success → 全部成功"""

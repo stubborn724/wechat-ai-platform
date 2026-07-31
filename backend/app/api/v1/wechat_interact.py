@@ -744,9 +744,24 @@ async def _do_sync(tenant_id: int, account_id: int, scope: str, article_id: int 
                         db.commit()
 
                     # 创建线索
+                    from app.models.mysql_models import CommentLead
+                    from app.services.comment_auto_conversion_service import process_comment_leads_auto_conversion
                     from app.services.wechat_lead_service import create_leads_from_comments
                     created = create_leads_from_comments(db, tenant_id, account_id, new_ids)
                     total_new_leads += created
+
+                    new_lead_ids = [
+                        row[0]
+                        for row in db.query(CommentLead.id)
+                        .filter(
+                            CommentLead.tenant_id == tenant_id,
+                            CommentLead.account_id == account_id,
+                            CommentLead.comment_id.in_(new_ids),
+                        )
+                        .all()
+                    ]
+                    if new_lead_ids:
+                        await process_comment_leads_auto_conversion(db, tenant_id, new_lead_ids)
 
                 synced_articles += 1
             except Exception as exc:
@@ -756,8 +771,10 @@ async def _do_sync(tenant_id: int, account_id: int, scope: str, article_id: int 
         # 回填：给已有评论但缺少 lead 的记录创建线索
         backfilled = _backfill_leads(db, tenant_id, account_id)
         if backfilled:
-            total_new_leads += backfilled
-            logger.info("Backfilled %d leads for account %d", backfilled, account_id)
+            total_new_leads += len(backfilled)
+            from app.services.comment_auto_conversion_service import process_comment_leads_auto_conversion
+            await process_comment_leads_auto_conversion(db, tenant_id, backfilled)
+            logger.info("Backfilled %d leads for account %d", len(backfilled), account_id)
 
         return {
             "synced_articles": synced_articles,
@@ -768,8 +785,8 @@ async def _do_sync(tenant_id: int, account_id: int, scope: str, article_id: int 
         db.close()
 
 
-def _backfill_leads(db, tenant_id: int, account_id: int) -> int:
-    """为已有评论但缺少 CommentLead 的记录创建线索"""
+def _backfill_leads(db, tenant_id: int, account_id: int) -> list[int]:
+    """为已有评论但缺少 CommentLead 的记录创建线索，并返回新建 lead ID 列表。"""
     from app.models.mysql_models import CommentLead, WeChatComment
 
     # 找没有对应 lead 的评论（不限 openid，无 openid 的标注为 failed）
@@ -789,9 +806,9 @@ def _backfill_leads(db, tenant_id: int, account_id: int) -> int:
     )
     ids = [row[0] for row in comment_ids]
     if not ids:
-        return 0
+        return []
 
-    created = 0
+    created: list[int] = []
     for cid in ids:
         comment = db.query(WeChatComment).filter(WeChatComment.id == cid).first()
         if not comment:
@@ -805,7 +822,8 @@ def _backfill_leads(db, tenant_id: int, account_id: int) -> int:
             status="failed" if not has_openid else "pending_reply",
         )
         db.add(lead)
-        created += 1
+        db.flush()
+        created.append(lead.id)
 
     db.commit()
     return created
@@ -863,6 +881,9 @@ async def probe_wechat(
 
     key = derive_key(settings.credential_key)
     app_secret = decrypt_secret(cred.encrypted_secret, key)
+
+    from app.services.wechat_gateway_policy import ensure_direct_wechat_api_allowed
+    ensure_direct_wechat_api_allowed("微信互动调试")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         token_resp = await client.get(
