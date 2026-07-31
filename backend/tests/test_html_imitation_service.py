@@ -68,6 +68,27 @@ def test_analyze_html_for_imitation_excludes_entire_reference_contact_section():
     assert "source-qrcode.png" not in blueprint.html_template
 
 
+def test_contact_region_detection_handles_nested_text_blocks_without_name_error():
+    """没有联系卡 class 时也应按最外层文字块过滤联系区域，不得调用缺失辅助函数。"""
+    reference_html = """
+    <article>
+      <p>正文内容</p>
+      <div>
+        <p><span>联系我们</span></p>
+        <p><strong>参考电话：18682130473</strong></p>
+        <img src="https://example.com/source-qrcode.png" alt="二维码" />
+      </div>
+    </article>
+    """
+
+    blueprint = analyze_html_for_imitation(reference_html)
+
+    assert [slot.original_text for slot in blueprint.text_slots] == ["正文内容"]
+    assert "联系我们" not in blueprint.html_template
+    assert "18682130473" not in blueprint.html_template
+    assert "source-qrcode.png" not in blueprint.html_template
+
+
 def test_render_html_imitation_appends_only_configured_footer_after_reference_contact_removal():
     """固定页脚必须独立追加在末尾，不能复用参考联系方式卡片的样式或文字。"""
     blueprint = analyze_html_for_imitation(REFERENCE_HTML_WITH_CONTACT_SECTION)

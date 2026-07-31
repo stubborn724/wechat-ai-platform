@@ -2,7 +2,7 @@
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TitleOption(BaseModel):
@@ -116,6 +116,8 @@ class ArticleState(BaseModel):
     image_requirements: List[ImageRequirement] = []
     images: List[ImageResult] = []
     full_content: Optional[str] = None
+    # HTML 槽位图片数量由定时任务注入；默认值确保旧入口继续最多生成五张。
+    max_generated_images: int = Field(default=5, ge=1, le=30)
     enabled_image_methods: Optional[List[str]] = None
     error: Optional[str] = None
     # Knowledge base integration

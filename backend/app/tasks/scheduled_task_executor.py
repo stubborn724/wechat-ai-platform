@@ -377,6 +377,8 @@ def _scheduled_article(
             style=task.style or "default",
             enabled_image_methods=task.enabled_image_methods or ["DASHSCOPE"],
             footer_template=task.footer_template,
+            # 旧任务或迁移前对象没有该字段时回退到五张，避免改变既有成本策略。
+            max_generated_images=max(1, min(getattr(task, "html_image_count", 5) or 5, 30)),
         )
         # ERP 路径中，投喂源只仿写文章结构与文案；产品图片和知识库背景是唯一
         # 视觉输入。该显式状态会传到 HTML 仿写 Agent，避免它再分析原文章图片。

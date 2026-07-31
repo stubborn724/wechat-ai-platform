@@ -329,6 +329,21 @@ def _has_assigned_text_slot_ancestor(tag: Tag) -> bool:
     )
 
 
+def _has_text_block_ancestor(tag: Tag) -> bool:
+    """判断文字节点是否已经被更外层文字标签覆盖。
+
+    联系卡检测需要统计最外层的文字块；如果同时统计 ``p`` 里的 ``span`` 或
+    ``strong``，一个联系方式会被重复计数，导致普通正文容器被误判为联系卡。
+    这里复用 HTML 仿写允许生成的文字标签集合，只保留每条文字分支最外层节点，
+    同时兼容公众号常见的块级标签嵌套行内样式结构。
+    """
+
+    return any(
+        isinstance(parent, Tag) and parent.name in _TEXT_TAG_NAMES
+        for parent in tag.parents
+    )
+
+
 def _contains_text_slot_marker(tag: Tag) -> bool:
     """判断节点是否已被外层混合结构转换为叶文本槽位。"""
 

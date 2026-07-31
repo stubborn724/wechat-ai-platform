@@ -114,8 +114,11 @@ class Article(MysqlBase):
     sub_title = Column(String(255), nullable=True)
     title_options = Column(JSON, nullable=True)
     outline = Column(JSON, nullable=True)
-    content = Column(Text, nullable=True)
-    full_content = Column(Text, nullable=True)
+    # 公众号 HTML 会携带大量内联样式、节点属性和图片 URL，普通 TEXT 的 64 KiB
+    # 上限不足以覆盖 19 张图的版式文章；两个字段必须保持同一容量，避免先写入
+    # content 成功、再写入 full_content 失败，造成文章状态与发布流程不一致。
+    content = Column(MEDIUMTEXT, nullable=True)
+    full_content = Column(MEDIUMTEXT, nullable=True)
     cover_image = Column(String(512), nullable=True)
     images = Column(JSON, nullable=True)
     footer_template = Column(Text, nullable=True)
@@ -835,6 +838,15 @@ class ScheduledTask(MysqlBase):
     # 内容配置
     article_slots = Column(JSON, nullable=True)
     articles_per_day = Column(Integer, default=1)
+    # HTML 版式任务每篇最多生成的图片数量。默认五张保护历史任务成本，
+    # 只有用户明确配置时才扩大，且最终仍由 HTML 槽位选择器限制在实际图片数内。
+    html_image_count = Column(
+        Integer,
+        nullable=False,
+        default=5,
+        server_default="5",
+        comment="HTML仿写每篇生成图片数量，默认5，范围1-30",
+    )
     public_count = Column(Integer, default=1)
     private_count = Column(Integer, default=0)
 

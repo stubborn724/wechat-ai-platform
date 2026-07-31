@@ -488,7 +488,8 @@ async def agent3_generate_html_imitation_content(state: ArticleState) -> Article
         generated_image_slot_ids, empty_image_slot_ids = select_html_image_slots(
             blueprint,
             excluded_image_slot_ids=excluded_image_slot_ids,
-            max_generated_images=5,
+            # 单个定时任务可提高图片数量；ArticleState 默认值继续提供历史兼容和成本保护。
+            max_generated_images=state.max_generated_images,
         )
         non_generated_image_slot_ids = excluded_image_slot_ids | set(empty_image_slot_ids)
         prompt = _build_html_imitation_prompt(
@@ -972,14 +973,20 @@ async def agent5_generate_images(
         state.error = "No image requirements to process"
         return state
 
-    # 所有生图入口共用五张成本上限。HTML 仿写会提前把多余节点留空，此处再做
-    # 统一兜底，防止 Markdown、结构化文章或旧 LangGraph 节点绕过限制。
-    if len(state.image_requirements) > 5:
+    # 所有生图入口都需要统一成本兜底，但 HTML 定时任务可以显式提高上限。
+    # ArticleState 默认仍为五张，因此旧的 Markdown、结构化文章和历史 LangGraph
+    # 节点不会改变行为；只有明确传入的任务配置才会让 Agent 继续处理更多槽位。
+    configured_limit = max(
+        1,
+        min(getattr(state, "max_generated_images", 5) or 5, 30),
+    )
+    if len(state.image_requirements) > configured_limit:
         logger.info(
-            "图片需求由 %d 张限制为 5 张，额外槽位保持空白",
+            "图片需求由 %d 张限制为 %d 张，额外槽位保持空白",
             len(state.image_requirements),
+            configured_limit,
         )
-        state.image_requirements = list(state.image_requirements[:5])
+        state.image_requirements = list(state.image_requirements[:configured_limit])
 
     # ---- ERP 产品参考图生图 ----
     # 定时任务每天只选择一个产品。每个图片槽位都以同一产品原图为参考生成不同场景，

@@ -21,6 +21,7 @@ interface ScheduledTask {
   publish_times: string[]
   article_slots: ArticleSlot[] | null
   articles_per_day: number
+  html_image_count: number
   public_count: number
   private_count: number
   account_ids: number[] | null
@@ -66,6 +67,7 @@ const form = reactive({
   day_of_week: -1,
   publish_times: ['08:00'] as string[],
   articles_per_day: 1,
+  html_image_count: 5,
   account_ids: [] as number[],
   publish_mode: 'draft',
   image_source: 'DASHSCOPE',
@@ -191,6 +193,7 @@ function resetForm() {
   form.day_of_week = -1
   form.publish_times = ['08:00']
   form.articles_per_day = 1
+  form.html_image_count = 5
   form.account_ids = []
   form.publish_mode = 'draft'
   form.image_source = 'DASHSCOPE'
@@ -223,6 +226,7 @@ async function openEdit(task: ScheduledTask) {
   form.day_of_week = task.day_of_week
   form.publish_times = task.publish_times?.length ? [...task.publish_times] : ['08:00']
   form.articles_per_day = task.articles_per_day
+  form.html_image_count = task.html_image_count || 5
   form.account_ids = task.account_ids || []
   form.publish_mode = task.publish_mode || 'draft'
   form.image_source = task.image_source || 'DASHSCOPE'
@@ -284,6 +288,7 @@ async function save() {
       day_of_week: form.day_of_week,
       publish_times: form.publish_times,
       articles_per_day: form.articles_per_day,
+      html_image_count: form.html_image_count,
       account_ids: form.account_ids.length > 0 ? form.account_ids : null,
       publish_mode: form.publish_mode,
       image_source: form.image_source,
@@ -586,6 +591,11 @@ onMounted(load)
           <el-col :span="8">
             <el-form-item label="每天篇数">
               <el-input-number v-model="form.articles_per_day" :min="1" :max="50" style="width:100%" />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="form.writing_mode === 'feed' && form.content_type === 'article'" :span="8">
+            <el-form-item label="HTML 仿写图片数">
+              <el-input-number v-model="form.html_image_count" :min="1" :max="30" style="width:100%" />
             </el-form-item>
           </el-col>
         </el-row>

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_mysql_db
@@ -44,6 +44,8 @@ class ScheduledTaskCreate(BaseModel):
     publish_times: List[str]
     article_slots: Optional[List[ArticleSlot]] = None
     articles_per_day: int = 1
+    # HTML 版式仿写默认沿用五张图的成本保护；需要更多图片时由单个任务显式提高。
+    html_image_count: int = Field(default=5, ge=1, le=30)
     public_count: int = 1
     private_count: int = 0
     approval_mode: str = "auto"
@@ -70,6 +72,7 @@ class ScheduledTaskUpdate(BaseModel):
     publish_times: Optional[List[str]] = None
     article_slots: Optional[List[ArticleSlot]] = None
     articles_per_day: Optional[int] = None
+    html_image_count: Optional[int] = Field(default=None, ge=1, le=30)
     public_count: Optional[int] = None
     private_count: Optional[int] = None
     approval_mode: Optional[str] = None
@@ -109,6 +112,7 @@ class ScheduledTaskResponse(BaseModel):
     article_slots: Optional[list] = None  # legacy JSON field (read-only)
     slots: List[SlotResponse] = []  # new slot table records
     articles_per_day: int
+    html_image_count: int = 5
     public_count: int
     private_count: int
     approval_mode: str
@@ -195,6 +199,10 @@ def create_scheduled_task(
         name=req.name,
         writing_mode="feed" if (req.feed_source_ids or req.feed_source_id) else "kb" if req.knowledge_base_ids else "free",
         feed_source_ids=req.feed_source_ids or ([req.feed_source_id] if req.feed_source_id else None),
+        # 同时保存标量投喂源和具体文章选择，确保定时执行时复用用户明确选定的文章，
+        # 不会因为只保存来源列表而退化为从投喂源随机挑选其他文章。
+        feed_source_id=req.feed_source_id,
+        feed_article_ids=req.feed_article_ids,
         topic=req.topic,
         style=req.style,
         knowledge_base_ids=req.knowledge_base_ids,
@@ -202,6 +210,7 @@ def create_scheduled_task(
         publish_times=req.publish_times,
         article_slots=None,  # migrated to ScheduledTaskSlot table
         articles_per_day=req.articles_per_day,
+        html_image_count=req.html_image_count,
         public_count=req.public_count,
         private_count=req.private_count,
         approval_mode=req.approval_mode,
