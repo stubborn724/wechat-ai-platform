@@ -24,6 +24,15 @@ from app.models.mysql_models import Article, AccountCredential, WeChatAccount
 logger = logging.getLogger(__name__)
 
 
+class WechatPublishAmbiguousError(RuntimeError):
+    """微信公众号请求已发出但响应不明确的异常。
+
+    微信的草稿创建和正式发布接口都可能在服务端已经产生副作用后断开连接。
+    这类错误不能按普通网络超时自动重试，否则同一文章可能再次进入草稿箱或被
+    重复发布；定时任务会持久化该状态并要求人工核验公众号后台。
+    """
+
+
 class _IPv4Adapter(HTTPAdapter):
     """强制使用 IPv4 的 HTTP 适配器，解决 IPv6 导致微信 IP 白名单不匹配的问题"""
 
@@ -452,8 +461,15 @@ class WechatPublisher:
         headers = {'Content-Type': 'application/json; charset=utf-8'}
         logger.info("请求数据大小: %d bytes（含 thumb_media_id=%s）", len(json_data), bool(thumb_media_id))
 
-        response = self._make_request('POST', url, data=json_data, headers=headers)
-        result = response.json()
+        try:
+            # 请求成功后即可能已经写入草稿；连接或响应解析在这里失败时，结果
+            # 无法判定，必须抛出专用异常阻止定时任务盲目重投。
+            response = self._make_request('POST', url, data=json_data, headers=headers)
+            result = response.json()
+        except (requests.exceptions.RequestException, TimeoutError, OSError, ValueError) as exc:
+            raise WechatPublishAmbiguousError(
+                "微信草稿请求已发出，但响应结果无法确认"
+            ) from exc
         logger.info("微信 API 返回: %s", json.dumps(result, ensure_ascii=False))
 
         if "errcode" in result and result["errcode"] != 0:
@@ -493,8 +509,15 @@ class WechatPublisher:
         url = f"https://api.weixin.qq.com/cgi-bin/freepublish/submit?access_token={self.access_token}"
         body = {"media_id": media_id}
         headers = {"Content-Type": "application/json"}
-        response = self._make_request("POST", url, data=json.dumps(body), headers=headers)
-        result = response.json()
+        try:
+            # 草稿已经拿到 media_id，正式发布请求一旦发出后失去响应，不能安全地
+            # 再次提交同一个业务文章；调用方会把该账号标记为 ambiguous。
+            response = self._make_request("POST", url, data=json.dumps(body), headers=headers)
+            result = response.json()
+        except (requests.exceptions.RequestException, TimeoutError, OSError, ValueError) as exc:
+            raise WechatPublishAmbiguousError(
+                f"微信正式发布请求已发出，但响应结果无法确认(media_id={media_id})"
+            ) from exc
 
         if "errcode" in result and result["errcode"] != 0:
             errcode = result["errcode"]

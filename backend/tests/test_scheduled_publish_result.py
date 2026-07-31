@@ -33,6 +33,221 @@ def test_publish_to_wechat_raises_when_draft_save_fails(monkeypatch):
         )
 
 
+def test_publish_to_wechat_rejects_partial_direct_publish(monkeypatch):
+    """直接发布只保存草稿但提交失败时，不能把文章误标为已发布。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    monkeypatch.setattr(
+        wechat_publisher,
+        "publish_article",
+        lambda *args, **kwargs: {
+            "media_id": "draft-1",
+            "publish_id": None,
+            "draft_saved": True,
+            "publish_error": "微信接口暂时不可用",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="正式发布失败"):
+        _publish_to_wechat(
+            db=SimpleNamespace(),
+            article=SimpleNamespace(id=21),
+            account_ids=[103],
+            publish_mode="direct",
+            task=SimpleNamespace(tenant_id=107, created_by=9),
+        )
+
+
+def test_publish_to_wechat_persists_delivery_identifiers(monkeypatch):
+    """成功交付的微信标识必须回写文章，供重复消息做幂等判断。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    monkeypatch.setattr(
+        wechat_publisher,
+        "publish_article",
+        lambda *args, **kwargs: {
+            "media_id": "draft-2",
+            "publish_id": "publish-2",
+            "draft_saved": True,
+        },
+    )
+    article = SimpleNamespace(id=23, publish_id=None, msg_data_id=None, wechat_account_id=None)
+
+    _publish_to_wechat(
+        db=SimpleNamespace(),
+        article=article,
+        account_ids=[103],
+        publish_mode="direct",
+        task=SimpleNamespace(tenant_id=107, created_by=9),
+    )
+
+    assert article.publish_id == "publish-2"
+    assert article.wechat_account_id == 103
+
+
+def test_publish_to_wechat_rejects_unknown_mode_before_external_call(monkeypatch):
+    """非法发布模式必须在调用微信前失败，避免错误配置产生外部副作用。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    calls = []
+
+    def unexpected_publish(*args, **kwargs):
+        """记录不应发生的外部调用。"""
+        calls.append((args, kwargs))
+        return {"media_id": "unexpected"}
+
+    monkeypatch.setattr(wechat_publisher, "publish_article", unexpected_publish)
+
+    with pytest.raises(ValueError, match="不支持的定时任务发布模式"):
+        _publish_to_wechat(
+            db=SimpleNamespace(),
+            article=SimpleNamespace(id=24),
+            account_ids=[103],
+            publish_mode="invalid",
+            task=SimpleNamespace(tenant_id=107, created_by=9),
+        )
+
+    assert calls == []
+
+
+def test_publish_to_wechat_records_each_account_and_skips_completed_delivery(monkeypatch):
+    """重试同一篇文章时只应发布尚未成功的公众号，避免多账号重复交付。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    calls = []
+
+    def publish_for_account(*args, **kwargs):
+        """为每个账号返回独立草稿标识，模拟多账号发布。"""
+        account_id = args[2]
+        calls.append(account_id)
+        return {"media_id": f"draft-{account_id}"}
+
+    monkeypatch.setattr(wechat_publisher, "publish_article", publish_for_account)
+
+    class FakeDb:
+        """只记录账号级结果写入所需的提交动作。"""
+
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    db = FakeDb()
+    run = SimpleNamespace(
+        id=45,
+        delivery_results={
+            "24:103": {
+                "status": "success",
+                "mode": "draft",
+                "media_id": "draft-existing",
+            }
+        },
+    )
+    article = SimpleNamespace(
+        id=24,
+        publish_id=None,
+        msg_data_id=None,
+        wechat_account_id=None,
+    )
+
+    _publish_to_wechat(
+        db=db,
+        article=article,
+        account_ids=[103, 104],
+        publish_mode="draft",
+        task=SimpleNamespace(tenant_id=107, created_by=9),
+        run=run,
+    )
+
+    assert calls == [104]
+    assert run.delivery_results["24:104"] == {
+        "status": "success",
+        "mode": "draft",
+        "media_id": "draft-104",
+    }
+    assert article.wechat_account_id == 104
+    assert db.commits == 1
+
+
+def test_partial_direct_publish_is_recorded_before_error(monkeypatch):
+    """直接发布只拿到草稿 ID 时要保存部分结果，方便人工处理而非盲目重投。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    monkeypatch.setattr(
+        wechat_publisher,
+        "publish_article",
+        lambda *args, **kwargs: {
+            "media_id": "draft-partial",
+            "publish_id": None,
+            "draft_saved": True,
+            "publish_error": "正式发布接口失败",
+        },
+    )
+
+    class FakeDb:
+        """记录部分成功状态是否先于异常落库。"""
+
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    run = SimpleNamespace(id=45, delivery_results={})
+    with pytest.raises(RuntimeError, match="正式发布失败"):
+        _publish_to_wechat(
+            db=FakeDb(),
+            article=SimpleNamespace(id=25, publish_id=None, msg_data_id=None),
+            account_ids=[103],
+            publish_mode="direct",
+            task=SimpleNamespace(tenant_id=107, created_by=9),
+            run=run,
+        )
+
+    assert run.delivery_results["25:103"] == {
+        "status": "partial",
+        "mode": "direct",
+        "media_id": "draft-partial",
+        "error": "正式发布接口失败",
+    }
+
+
+def test_scheduled_media_article_is_bound_before_publish(monkeypatch):
+    """纯图片和视频共用的文章落库辅助方法必须先绑定运行记录。"""
+    from app.tasks import scheduled_task_executor as executor
+
+    events = []
+
+    class FakeDb:
+        """模拟文章创建流程的最小数据库接口。"""
+
+        def add(self, article):
+            events.append("add")
+
+        def flush(self):
+            events.append("flush")
+
+        def commit(self):
+            events.append("commit")
+
+    monkeypatch.setattr(
+        executor,
+        "_bind_scheduled_run_article",
+        lambda db, run_id, article_id: events.append(("bind", run_id, article_id)),
+    )
+    article = SimpleNamespace(id=26)
+
+    executor._persist_scheduled_article(FakeDb(), article, run_id=45)
+
+    assert events == ["add", "flush", ("bind", 45, 26), "commit"]
+
+
 def test_publish_success_is_not_overridden_by_console_encoding(monkeypatch):
     """外部交付成功后，控制台编码问题不能反向把任务标记为失败。"""
     import builtins

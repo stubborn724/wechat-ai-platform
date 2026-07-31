@@ -5,7 +5,7 @@ import html
 import logging
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
@@ -14,6 +14,447 @@ from app.schemas.article import ImageResult
 from app.services.scheduled_erp_image_policy import find_due_schedule_times
 
 logger = logging.getLogger(__name__)
+
+# 定时文章的生成和发布依赖多个外部服务。重试间隔采用显式有限序列，既给上游
+# 足够恢复时间，也避免配置错误或永久故障造成无限调用和重复发布。
+SCHEDULED_TASK_RETRY_DELAYS = (120, 300, 900)
+SCHEDULED_TASK_MAX_ATTEMPTS = len(SCHEDULED_TASK_RETRY_DELAYS) + 1
+# HTML 仿写可能包含多轮正文生成和最多 20 张图。保护窗口必须大于正常长任务，
+# 否则 Beat 会把仍在工作的 Worker 误判为丢失并启动并发副本；真正的失败重试仍
+# 使用下方 2/5/15 分钟序列，二者职责不能混用。
+SCHEDULED_RUN_STALE_SECONDS = 30 * 60
+
+
+def get_scheduled_retry_delay(attempt_number: int) -> int:
+    """按当前失败前的尝试次数取得下一次重试等待秒数。
+
+    ``attempt_number`` 从 1 开始，超过配置序列时使用最后一个等待值；真正是否
+    还能重试由 ``mark_scheduled_run_retry`` 的总次数判断，二者职责分开便于测试。
+    """
+
+    normalized_attempt = max(int(attempt_number or 1), 1)
+    index = min(normalized_attempt - 1, len(SCHEDULED_TASK_RETRY_DELAYS) - 1)
+    return SCHEDULED_TASK_RETRY_DELAYS[index]
+
+
+def _iter_exception_chain(error: BaseException):
+    """遍历异常及其 cause/context，识别被业务层包装过的网络错误。"""
+
+    visited: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        yield current
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+        nested_errors = getattr(current, "errors", None)
+        if nested_errors:
+            pending.extend(error for error in nested_errors if isinstance(error, BaseException))
+
+
+def is_retryable_scheduled_error(error: BaseException) -> bool:
+    """判断定时任务异常是否适合自动重试。
+
+    配置、认证、参数和知识库绑定错误重试也不会改变结果，因此直接落失败；
+    网络超时、数据库短暂断连、ERP API 和图片提供商临时故障才进入有限重试。
+    通过异常链判断可以保留发布服务对上游异常的原始分类，而不依赖字符串猜测。
+    """
+
+    try:
+        import httpx
+    except ImportError:
+        httpx = None
+    try:
+        import requests
+    except ImportError:
+        requests = None
+    try:
+        from sqlalchemy.exc import DBAPIError, OperationalError
+    except ImportError:
+        DBAPIError = OperationalError = None
+    try:
+        from app.services.image_generation_models import (
+            ImageErrorCategory,
+            ImageProviderError,
+        )
+    except ImportError:
+        ImageErrorCategory = ImageProviderError = None
+    try:
+        from app.services.image_generation_service import ImageGenerationFallbackError
+    except ImportError:
+        ImageGenerationFallbackError = None
+    try:
+        from app.services.wechat_publisher import WechatPublishAmbiguousError
+    except ImportError:
+        WechatPublishAmbiguousError = None
+
+    retryable_image_categories = set()
+    if ImageErrorCategory is not None:
+        retryable_image_categories = {
+            ImageErrorCategory.TEMPORARY,
+            ImageErrorCategory.RATE_LIMIT,
+            ImageErrorCategory.UPSTREAM,
+            ImageErrorCategory.EMPTY_RESULT,
+            ImageErrorCategory.TRUNCATED_RESPONSE,
+        }
+
+    # 不把所有 OSError 都视为网络故障：磁盘权限、文件不存在等本地错误重试只会
+    # 重复消耗模型和发布配额。HTTP 客户端自己的连接异常已经单独列出。
+    retryable_types = [TimeoutError, ConnectionError]
+    if httpx is not None:
+        retryable_types.extend((httpx.TimeoutException, httpx.NetworkError))
+    if requests is not None:
+        retryable_types.extend((requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+
+    exception_chain = list(_iter_exception_chain(error))
+    # 发布请求已经发出但响应不明确时，微信可能已经产生了外部副作用。即使其
+    # cause 是 requests.ConnectionError，也必须优先停止自动重试，交给人工核验。
+    if (
+        isinstance(WechatPublishAmbiguousError, type)
+        and any(isinstance(current, WechatPublishAmbiguousError) for current in exception_chain)
+    ):
+        return False
+
+    for current in exception_chain:
+        # HTTP 认证、参数和权限错误属于永久失败；只有明确的限流、超时或服务端
+        # 错误才值得再次请求。包装层（例如 ERP 的 ErpProductApiError）会通过
+        # __cause__ 继续遍历到这里，因此不能按业务异常基类整体判定为可重试。
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {408, 425, 429} or (
+            isinstance(status_code, int) and status_code >= 500
+        ):
+            return True
+
+        if isinstance(OperationalError, type) and isinstance(current, OperationalError):
+            return True
+        if (
+            isinstance(DBAPIError, type)
+            and isinstance(current, DBAPIError)
+            and bool(getattr(current, "connection_invalidated", False))
+        ):
+            return True
+        if isinstance(current, tuple(retryable_types)):
+            return True
+        if isinstance(ImageProviderError, type) and isinstance(current, ImageProviderError):
+            return getattr(current, "category", None) in retryable_image_categories
+        if (
+            isinstance(ImageGenerationFallbackError, type)
+            and isinstance(current, ImageGenerationFallbackError)
+        ):
+            return any(is_retryable_scheduled_error(item) for item in current.errors)
+    return False
+
+
+def should_recover_scheduled_run(run: ScheduledTaskRun, *, now: datetime) -> bool:
+    """判断执行记录是否已经超过安全窗口，可以由 Beat 补偿接管。
+
+    ``retrying`` 记录会给 Celery 消息留出一次完整重试窗口，只有消息在下一次
+    重试时间之后仍未回到 Worker 才再次补偿；新鲜的 running 记录绝不能被并发复制。
+    """
+
+    status = str(getattr(run, "status", "") or "").lower()
+    if status == "retrying":
+        next_retry_at = getattr(run, "next_retry_at", None)
+        return bool(
+            next_retry_at
+            and now >= next_retry_at + timedelta(seconds=SCHEDULED_RUN_STALE_SECONDS)
+        )
+    if status == "queued":
+        # ``created_at`` 属于原始计划时段，Worker 丢失后重新入队仍可能是几天后；
+        # 优先使用本次入队写入的 ``next_retry_at``，避免 Beat 刚派发就再次复制。
+        reference_time = (
+            getattr(run, "next_retry_at", None)
+            or getattr(run, "started_at", None)
+            or getattr(run, "created_at", None)
+        )
+    elif status == "running":
+        reference_time = getattr(run, "started_at", None)
+    else:
+        return False
+    return bool(
+        reference_time
+        and now - reference_time >= timedelta(seconds=SCHEDULED_RUN_STALE_SECONDS)
+    )
+
+
+def mark_scheduled_run_retry(
+    db,
+    run: ScheduledTaskRun,
+    error: BaseException,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """把一次异常转换成 retrying 或最终 failed，并持久化下一次时间。
+
+    返回 ``True`` 表示调用方应继续执行 Celery retry；返回 ``False`` 表示错误
+    不可恢复或已经达到总尝试次数。状态先落库再发消息，Worker 重启时不会丢失
+    失败原因和重试边界。
+    """
+
+    now = now or datetime.utcnow()
+    attempt_count = int(getattr(run, "attempt_count", 0) or 0)
+    error_message = str(error)[:4000]
+    if is_retryable_scheduled_error(error) and attempt_count < SCHEDULED_TASK_MAX_ATTEMPTS:
+        delay = get_scheduled_retry_delay(attempt_count)
+        run.status = "retrying"
+        run.error_message = error_message
+        run.next_retry_at = now + timedelta(seconds=delay)
+        run.finished_at = None
+        # Celery retry 会生成下一条消息；清除旧消息 ID，执行入口会为新尝试重新认领。
+        run.celery_task_id = None
+        db.commit()
+        return True
+
+    run.status = "failed"
+    run.error_message = error_message
+    run.next_retry_at = None
+    run.finished_at = now
+    db.commit()
+    return False
+
+
+def is_article_delivery_complete(article, publish_mode: str) -> bool:
+    """判断文章是否已经完成微信交付，供重试入口幂等短路。"""
+
+    status = str(getattr(article, "status", "") or "").lower()
+    if publish_mode == "draft" and status == "draft_saved":
+        return True
+    if publish_mode == "direct" and status == "published":
+        return True
+    # 某些历史发布链路只持久化微信返回 ID；有 ID 就说明外部副作用已经发生，
+    # 不能重新创建文章再发布一次。
+    return bool(
+        getattr(article, "publish_id", None)
+        or getattr(article, "msg_data_id", None)
+    )
+
+
+def _enqueue_scheduled_run(
+    db,
+    task_id: int,
+    run: ScheduledTaskRun,
+    *,
+    reason: str,
+    allow_fresh: bool = False,
+) -> bool:
+    """为初次执行或 Worker 丢失的运行记录预留一次尝试并派发消息。
+
+    先把 ``attempt_count`` 和 ``queued`` 写入数据库，再发送 Celery 消息；如果
+    当前进程在发送后立即崩溃，下一次 Beat 扫描仍能根据记录恢复。消息 ID 最终
+    写回数据库用于识别同一消息的 Worker 丢失重投，避免新旧执行并发生成。
+    ``allow_fresh`` 仅用于新计划时段的第一次派发；恢复路径必须重新检查过期窗口，
+    这样多个 Beat 同时扫描时只有第一个恢复者能够成功入队。
+    """
+
+    now = datetime.utcnow()
+    locked_run = (
+        db.query(ScheduledTaskRun)
+        .filter(ScheduledTaskRun.id == run.id, ScheduledTaskRun.task_id == task_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_run is None:
+        logger.warning("定时任务运行记录不存在 task_id=%s run_id=%s", task_id, run.id)
+        return False
+    run = locked_run
+    if not allow_fresh and not should_recover_scheduled_run(run, now=now):
+        # 多个 Beat 可能同时扫描到同一条过期记录。第一个事务提交后，后续
+        # 进程必须重新检查保护窗口，不能因为旧查询结果继续派发重复消息。
+        return False
+
+    attempt_count = int(getattr(run, "attempt_count", 0) or 0) + 1
+    if attempt_count > SCHEDULED_TASK_MAX_ATTEMPTS:
+        run.status = "failed"
+        run.error_message = "定时任务超过最大尝试次数，已停止自动重试"
+        run.next_retry_at = None
+        run.finished_at = now
+        db.commit()
+        return False
+
+    run.attempt_count = attempt_count
+    run.status = "queued"
+    run.started_at = None
+    run.finished_at = None
+    # queued 状态也需要一个本次派发时间。字段名称沿用已有重试时间字段，避免
+    # 为仅用于恢复保护窗口的时间戳再扩展一列；任务真正被领取后会清空它。
+    run.next_retry_at = now
+    run.celery_task_id = None
+    run.error_message = reason[:4000]
+    db.commit()
+
+    try:
+        async_result = execute_scheduled_article.delay(task_id, run.id)
+    except Exception as exc:
+        # Broker 短暂不可用时也不能把记录留在 queued 假装已经派发；下一次
+        # Beat 会在保护窗口后重新接管这条记录。
+        run.status = "retrying"
+        run.error_message = f"Celery 派发失败：{exc}"[:4000]
+        run.next_retry_at = now + timedelta(seconds=get_scheduled_retry_delay(attempt_count))
+        db.commit()
+        logger.error("定时任务派发失败 task_id=%s run_id=%s: %s", task_id, run.id, exc)
+        return False
+
+    run.celery_task_id = getattr(async_result, "id", None)
+    db.commit()
+    logger.info(
+        "已派发定时任务 task_id=%s run_id=%s attempt=%s reason=%s celery_id=%s",
+        task_id,
+        run.id,
+        run.attempt_count,
+        reason,
+        run.celery_task_id,
+    )
+    return True
+
+
+def _recover_stale_scheduled_runs(db, *, now: datetime | None = None) -> int:
+    """补偿 Worker 中断、Broker 丢消息或进程重启留下的旧运行记录。"""
+
+    now = now or datetime.utcnow()
+    runs = (
+        db.query(ScheduledTaskRun)
+        .filter(ScheduledTaskRun.status.in_(["queued", "running", "retrying"]))
+        .all()
+    )
+    recovered = 0
+    for run in runs:
+        if not should_recover_scheduled_run(run, now=now):
+            continue
+        if int(getattr(run, "attempt_count", 0) or 0) >= SCHEDULED_TASK_MAX_ATTEMPTS:
+            run.status = "failed"
+            run.error_message = "Worker 中断后已达到最大尝试次数，已停止自动重试"
+            run.next_retry_at = None
+            run.finished_at = now
+            db.commit()
+            continue
+
+        reason = f"检测到 {run.status} 运行记录超过 {SCHEDULED_RUN_STALE_SECONDS // 60} 分钟，自动接管"
+        if _enqueue_scheduled_run(db, run.task_id, run, reason=reason):
+            recovered += 1
+    if recovered:
+        logger.warning("已补偿接管 %d 条过期定时任务运行记录", recovered)
+    return recovered
+
+
+def _claim_scheduled_run(
+    db,
+    run: ScheduledTaskRun,
+    *,
+    celery_task_id: str | None,
+    now: datetime | None = None,
+) -> bool:
+    """原子化认领一次执行，区分消息重投和并发重复消息。"""
+
+    now = now or datetime.utcnow()
+    locked_run = (
+        db.query(ScheduledTaskRun)
+        .filter(ScheduledTaskRun.id == run.id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_run is None:
+        return False
+    run = locked_run
+    status = str(getattr(run, "status", "") or "").lower()
+    current_task_id = str(celery_task_id or "").strip() or None
+    recorded_task_id = str(getattr(run, "celery_task_id", "") or "").strip() or None
+
+    # acks_late 重投的是同一个 Celery 消息 ID。原 Worker 已丢失时允许它继续，
+    # 但不同消息不能同时处理一条新鲜 running 记录，否则会重复生成和发布。
+    if status == "running":
+        if recorded_task_id and recorded_task_id == current_task_id:
+            run.started_at = now
+            db.commit()
+            return True
+        if not should_recover_scheduled_run(run, now=now):
+            return False
+
+    attempt_count = int(getattr(run, "attempt_count", 0) or 0)
+    # queued 状态由派发辅助函数预留了尝试次数；执行入口只需认领，不应重复增加。
+    pre_reserved = status == "queued" and attempt_count > 0
+    if not pre_reserved:
+        attempt_count += 1
+    if attempt_count > SCHEDULED_TASK_MAX_ATTEMPTS:
+        run.status = "failed"
+        run.error_message = "定时任务超过最大尝试次数，已停止自动重试"
+        run.next_retry_at = None
+        run.finished_at = now
+        db.commit()
+        return False
+
+    run.attempt_count = attempt_count
+    run.status = "running"
+    run.started_at = now
+    run.next_retry_at = None
+    run.celery_task_id = current_task_id
+    db.commit()
+    return True
+
+
+def _bind_scheduled_run_article(db, run_id: int | None, article_id: int) -> bool:
+    """在文章刚创建后立即绑定运行记录，给发布超时重试提供幂等锚点。
+
+    返回值用于区分“已绑定并提交”和“运行记录不存在”。后者仍由调用方提交
+    新文章，避免文章因为历史数据缺失而只停留在 session 的未提交状态。
+    """
+
+    if run_id is None:
+        return False
+    run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_id).first()
+    if run is None:
+        return False
+    run.article_id = article_id
+    db.commit()
+    return True
+
+
+def _persist_scheduled_article(db, article, run_id: int | None = None) -> None:
+    """持久化纯图片或视频文章，并在发布前建立运行记录关联。
+
+    图文流程在创建 Article 后还要继续写入正文，所以单独保留其流水线；纯图片
+    和视频则可以在生成完成处统一收口。先 flush 得到文章 ID，再绑定运行记录，
+    可让发布阶段异常在下一次有限重试时复用同一篇文章，而不是重复生成素材。
+    """
+
+    db.add(article)
+    db.flush()
+    if not _bind_scheduled_run_article(db, run_id, article.id):
+        # 手动调用或历史运行记录缺失时仍要落库文章；正常定时任务由上面的绑定
+        # 方法完成提交，避免额外事务提交导致状态观察出现短暂空窗。
+        db.commit()
+
+
+def _scheduled_delivery_key(article_id: int, account_id: int) -> str:
+    """构造按文章和公众号隔离的交付键，支持一个运行记录生成多篇文章。"""
+
+    return f"{article_id}:{account_id}"
+
+
+def _is_successful_scheduled_delivery(
+    delivery_results: dict,
+    *,
+    article_id: int,
+    account_id: int,
+    publish_mode: str,
+) -> bool:
+    """判断某篇文章是否已经在指定公众号完成同一种交付。"""
+
+    result = delivery_results.get(_scheduled_delivery_key(article_id, account_id))
+    return bool(
+        isinstance(result, dict)
+        and result.get("status") == "success"
+        and result.get("mode") == publish_mode
+    )
 
 
 def _cleanup_cos_relay_objects(relay_service, object_keys: list[str]) -> None:
@@ -86,6 +527,9 @@ def check_scheduled_tasks():
         import zoneinfo
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
         now_shanghai = datetime.now(shanghai_tz)
+        # 数据库时间统一按 UTC 的无时区值保存；Beat 每分钟先补偿旧运行记录，
+        # 再创建今天的新时段，保证 Worker 重启不会阻塞当天后续时间点。
+        _recover_stale_scheduled_runs(db, now=datetime.utcnow())
         today = now_shanghai.date()
         day_of_week = today.weekday()
         current_hour_min = f"{now_shanghai.hour:02d}:{now_shanghai.minute:02d}"
@@ -138,8 +582,14 @@ def check_scheduled_tasks():
                     continue
 
                 logger.info("Triggering scheduled task %d at %s: %s", task.id, schedule_time, (task.topic or task.name)[:60])
-                execute_scheduled_article.delay(task.id, run.id)
-                triggered += 1
+                if _enqueue_scheduled_run(
+                    db,
+                    task.id,
+                    run,
+                    reason="首次到达计划发布时间，已进入执行队列",
+                    allow_fresh=True,
+                ):
+                    triggered += 1
 
         logger.info("Scheduled tasks: %d due tasks, %d jobs created", len(tasks), triggered)
         return {"tasks_checked": len(tasks), "jobs_created": triggered}
@@ -151,9 +601,14 @@ def check_scheduled_tasks():
         db.close()
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=120)
+@celery_app.task(bind=True, max_retries=len(SCHEDULED_TASK_RETRY_DELAYS), default_retry_delay=120)
 def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
-    """直接调用和创建文章相同的 agent 流水线生成内容并发布。"""
+    """执行定时文章流水线，并把可恢复异常交给 Celery 有限重试。
+
+    旧实现把异常转换成普通返回值，Celery 认为任务成功，导致声明的
+    ``max_retries`` 永远不会生效。这里先持久化运行状态，再调用 ``self.retry``；
+    最后一次或不可恢复错误才落为 failed，Beat 仍可识别 retrying 状态。
+    """
     from app.models.mysql_models import Article, ScheduledTask as ST
     from app.schemas.article import ArticleState, SelectedTitle
     from app.services.article_service import create_article as create_article_record
@@ -175,6 +630,19 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
         task = db.query(ST).filter(ST.id == task_id).first()
         if not task:
             logger.error("Scheduled task %d not found", task_id)
+            if run_id is not None:
+                missing_task_run = db.query(ScheduledTaskRun).filter(
+                    ScheduledTaskRun.id == run_id,
+                    ScheduledTaskRun.task_id == task_id,
+                ).first()
+                if missing_task_run and not is_completed_scheduled_run(missing_task_run):
+                    # 任务配置已被删除属于永久失败。必须立即收口，否则 Beat 会把这条
+                    # 没有业务意义的孤儿记录按 stale queued 反复派发。
+                    mark_scheduled_run_retry(
+                        db,
+                        missing_task_run,
+                        ValueError(f"定时任务 {task_id} 不存在，无法执行"),
+                    )
             return {"error": f"Task {task_id} not found"}
 
         # 任务可能由旧脚本创建而没有 ``created_by``。文章表的 user_id 是强外键，
@@ -204,9 +672,22 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
                     "article_id": run.article_id,
                     "status": "skipped_completed",
                 }
-            run.status = "running"
-            run.started_at = datetime.utcnow()
-            db.commit()
+            if not _claim_scheduled_run(
+                db,
+                run,
+                celery_task_id=getattr(getattr(self, "request", None), "id", None),
+            ):
+                logger.info(
+                    "跳过正在执行的定时任务消息 task_id=%s run_id=%s celery_id=%s",
+                    task_id,
+                    run.id,
+                    getattr(getattr(self, "request", None), "id", None),
+                )
+                return {
+                    "task_id": task_id,
+                    "run_id": run.id,
+                    "status": "already_running",
+                }
 
         # 用户没提供主题时，不给兜底值 — 让具体处理函数自行决定（仿写标题或回退任务名）
         topic = task.topic  # 可能为 None
@@ -220,13 +701,69 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
         print(f"  accounts={account_ids} mode={publish_mode}")
         print(f"{'='*60}")
 
+        # 如果上一次异常发生在微信调用之后、数据库最终状态提交之前，重试必须
+        # 先识别已经交付的文章；否则同一时段会再次保存草稿或直接发布。
+        if run is not None and run.article_id:
+            existing_article = db.query(Article).filter(Article.id == run.article_id).first()
+            if existing_article and is_article_delivery_complete(existing_article, publish_mode):
+                run.status = "completed"
+                run.error_message = None
+                run.next_retry_at = None
+                run.finished_at = datetime.utcnow()
+                db.commit()
+                return {
+                    "task_id": task_id,
+                    "run_id": run.id,
+                    "article_id": existing_article.id,
+                    "status": "skipped_already_delivered",
+                }
+            if (
+                existing_article
+                and existing_article.status == "generated"
+                and (existing_article.full_content or existing_article.content)
+            ):
+                _publish_to_wechat(
+                    db,
+                    existing_article,
+                    account_ids,
+                    publish_mode,
+                    task,
+                    run=run,
+                )
+                _finalize_article_delivery(db, existing_article, publish_mode)
+                article_id = existing_article.id
+            else:
+                # pending 文章没有可复用的外部交付结果，允许重新生成；保留该记录
+                # 供诊断，但不再让它阻塞本次重试。
+                article_id = None
+        else:
+            article_id = None
+
         # ========== 纯图片 ==========
-        if content_type in ("image", "pure_image"):
-            article_id = _scheduled_image(db, task, topic, fallback_topic, account_ids, publish_mode)
+        if article_id is not None:
+            pass
+        elif content_type in ("image", "pure_image"):
+            article_id = _scheduled_image(
+                db,
+                task,
+                topic,
+                fallback_topic,
+                account_ids,
+                publish_mode,
+                run=run,
+            )
 
         # ========== 视频 ==========
         elif content_type == "video":
-            article_id = _scheduled_video(db, task, topic, fallback_topic, account_ids, publish_mode)
+            article_id = _scheduled_video(
+                db,
+                task,
+                topic,
+                fallback_topic,
+                account_ids,
+                publish_mode,
+                run=run,
+            )
 
         # ========== 图文 ==========
         else:
@@ -239,6 +776,7 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
                 publish_mode,
                 run_id,
                 execution_actor_id,
+                run=run,
             )
 
         # 更新定时任务状态（db 可能因之前的异常处于 rollback 状态，捕获处理）
@@ -265,16 +803,35 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
         logger.error("Scheduled task %d failed: %s", task_id, exc)
         import traceback
         traceback.print_exc()
+        should_retry = False
         if run_id is not None:
             try:
+                # 外部服务异常之前可能伴随 SQLAlchemy flush 失败。先回滚当前事务，
+                # 才能查询并更新运行记录；否则 PendingRollbackError 会把失败状态
+                # 也吞掉，Beat 只能看到一条永远 running 的旧记录。
+                db.rollback()
                 run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_id).first()
                 if run:
-                    run.status = "failed"
-                    run.error_message = str(exc)[:4000]
-                    run.finished_at = datetime.utcnow()
-                    db.commit()
+                    should_retry = mark_scheduled_run_retry(db, run, exc)
             except Exception:
                 db.rollback()
+        elif is_retryable_scheduled_error(exc):
+            should_retry = True
+
+        request = getattr(self, "request", None)
+        request_retries = int(getattr(request, "retries", 0) or 0)
+        if should_retry and request_retries < self.max_retries:
+            retry_countdown = get_scheduled_retry_delay(
+                int(getattr(run, "attempt_count", 1) or 1)
+            )
+            logger.warning(
+                "Scheduled task %d will retry in %ss (attempt=%s/%s)",
+                task_id,
+                retry_countdown,
+                getattr(run, "attempt_count", None),
+                SCHEDULED_TASK_MAX_ATTEMPTS,
+            )
+            raise self.retry(exc=exc, countdown=retry_countdown)
         return {"task_id": task_id, "error": str(exc)}
     finally:
         db.close()
@@ -301,6 +858,7 @@ def _scheduled_article(
     publish_mode,
     run_id: int | None = None,
     execution_actor_id: int | None = None,
+    run: ScheduledTaskRun | None = None,
 ):
     """图文类型：和创建文章完全相同的 agent 流水线"""
     from app.schemas.article import ArticleState, SelectedTitle
@@ -366,6 +924,9 @@ def _scheduled_article(
             image_source=task.image_source or "dashscope",
             footer_template=task.footer_template,
         )
+        # 文章创建后立刻绑定 run，而不是等整条流水线结束；如果生成或微信交付
+        # 阶段中断，下一次重试可以复用已生成内容或识别已完成交付。
+        _bind_scheduled_run_article(db, run_id, article.id)
         print(f"  文章创建: task_id={article.task_id}")
 
         # 2. 构建 ArticleState
@@ -773,7 +1334,14 @@ def _scheduled_article(
         print(f"  ✅ 内容生成完成: {title_text[:40]}")
 
         # 7. 发布到微信
-        _publish_to_wechat(db, article, account_ids, publish_mode, task)
+        _publish_to_wechat(
+            db,
+            article,
+            account_ids,
+            publish_mode,
+            task,
+            run=run,
+        )
         _finalize_article_delivery(db, article, publish_mode)
         generated_article_id = article.id
 
@@ -878,8 +1446,17 @@ async def _gen_images_from_references(state, ref_image_urls):
     print(f"  ✅ AI 配图完成: {success}/{len(placeholders)} 张")
 
 
-def _scheduled_image(db, task, topic, fallback_topic, account_ids, publish_mode):
-    """纯图片类型：和创建文章完全相同的图片生成流程"""
+def _scheduled_image(
+    db,
+    task,
+    topic,
+    fallback_topic,
+    account_ids,
+    publish_mode,
+    *,
+    run: ScheduledTaskRun | None = None,
+):
+    """纯图片类型：和创建文章完全相同的图片生成流程。"""
     import asyncio
     import re as _re
     from functools import partial
@@ -1008,11 +1585,16 @@ def _scheduled_image(db, task, topic, fallback_topic, account_ids, publish_mode)
                 status="generated",
                 phase="CONTENT_GENERATED",
             )
-            db.add(article)
-            db.flush()
-            db.commit()
+            _persist_scheduled_article(db, article, run_id=getattr(run, "id", None))
 
-            _publish_to_wechat(db, article, account_ids, publish_mode, task)
+            _publish_to_wechat(
+                db,
+                article,
+                account_ids,
+                publish_mode,
+                task,
+                run=run,
+            )
             _finalize_article_delivery(db, article, publish_mode)
             print(f"  ✅ 纯图片仿写完成: {len(image_urls)} 张图")
             return article.id
@@ -1096,18 +1678,32 @@ def _scheduled_image(db, task, topic, fallback_topic, account_ids, publish_mode)
         status="generated",
         phase="CONTENT_GENERATED",
     )
-    db.add(article)
-    db.flush()
-    db.commit()
+    _persist_scheduled_article(db, article, run_id=getattr(run, "id", None))
 
-    _publish_to_wechat(db, article, account_ids, publish_mode, task)
+    _publish_to_wechat(
+        db,
+        article,
+        account_ids,
+        publish_mode,
+        task,
+        run=run,
+    )
     _finalize_article_delivery(db, article, publish_mode)
     print(f"  ✅ 纯图片完成: {len(image_urls)} 张图")
     return article.id
 
 
-def _scheduled_video(db, task, topic, fallback_topic, account_ids, publish_mode):
-    """视频类型：和创建文章完全相同的视频生成流程"""
+def _scheduled_video(
+    db,
+    task,
+    topic,
+    fallback_topic,
+    account_ids,
+    publish_mode,
+    *,
+    run: ScheduledTaskRun | None = None,
+):
+    """视频类型：和创建文章完全相同的视频生成流程。"""
     import asyncio
     import uuid as _uuid
     from app.models.mysql_models import Article
@@ -1179,37 +1775,140 @@ def _scheduled_video(db, task, topic, fallback_topic, account_ids, publish_mode)
         status="generated",
         phase="CONTENT_GENERATED",
     )
-    db.add(article)
-    db.flush()
-    db.commit()
+    _persist_scheduled_article(db, article, run_id=getattr(run, "id", None))
 
-    _publish_to_wechat(db, article, account_ids, publish_mode, task)
+    _publish_to_wechat(
+        db,
+        article,
+        account_ids,
+        publish_mode,
+        task,
+        run=run,
+    )
     _finalize_article_delivery(db, article, publish_mode)
     print(f"  ✅ 视频完成")
     return article.id
 
 
-def _publish_to_wechat(db, article, account_ids, publish_mode, task):
-    """逐个调用公众号发布接口，任一失败都携带账号 ID 向上抛出。
+def _publish_to_wechat(
+    db,
+    article,
+    account_ids,
+    publish_mode,
+    task,
+    *,
+    run: ScheduledTaskRun | None = None,
+):
+    """逐个调用公众号发布接口，并持久化每个账号的交付结果。
 
     本方法只负责外部交付，不修改文章最终状态；调用方必须在本方法完整返回后调用
-    ``_finalize_article_delivery``。这种顺序保证数据库状态表达真实外部结果。
+    ``_finalize_article_delivery``。账号级结果先提交再处理下一个账号，Worker 在
+    多账号中途失败时，下一次重试只会补发未完成账号，不会重新提交已成功文章。
     """
-    from app.services.wechat_publisher import publish_article
-
+    if publish_mode not in {"draft", "direct"}:
+        # 必须在导入和调用发布服务前校验，避免错误配置先触发真实微信请求。
+        raise ValueError(f"不支持的定时任务发布模式：{publish_mode}")
     if not account_ids:
         raise ValueError("定时任务未配置公众号，无法完成发布")
 
-    for aid in account_ids:
+    from app.services.wechat_publisher import WechatPublishAmbiguousError, publish_article
+
+    delivery_results = dict(getattr(run, "delivery_results", None) or {}) if run else {}
+    pending_account_ids = [
+        aid
+        for aid in account_ids
+        if not _is_successful_scheduled_delivery(
+            delivery_results,
+            article_id=article.id,
+            account_id=aid,
+            publish_mode=publish_mode,
+        )
+    ]
+
+    # 已经存在“请求发出但结果不明确”的记录时，自动重试不能再次调用微信。
+    # 该状态只允许人工核对公众号后台后处理，优先保护“不重复发布”这一外部约束。
+    for aid in pending_account_ids:
+        previous_result = delivery_results.get(_scheduled_delivery_key(article.id, aid))
+        if (
+            isinstance(previous_result, dict)
+            and previous_result.get("mode") == publish_mode
+            and previous_result.get("status") in {"partial", "ambiguous"}
+        ):
+            raise RuntimeError(
+                f"公众号 #{aid} 已存在未确认的微信交付结果，禁止自动重复发布；请先人工核对"
+            )
+
+    for aid in pending_account_ids:
+        delivery_key = _scheduled_delivery_key(article.id, aid)
         try:
-            publish_article(db, article, aid, mode=publish_mode,
-                            tenant_id=task.tenant_id, actor_id=task.created_by or 0)
+            result = publish_article(
+                db,
+                article,
+                aid,
+                mode=publish_mode,
+                tenant_id=task.tenant_id,
+                actor_id=task.created_by or 0,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("公众号发布接口没有返回结构化结果")
+
+            # 直接发布接口可能已经把草稿写入微信，但正式发布请求失败；这种
+            # “部分成功”必须先记录草稿 ID，再上抛给定时任务，禁止盲目重投。
+            if result.get("publish_error"):
+                partial_result = {
+                    "status": "partial",
+                    "mode": publish_mode,
+                    "media_id": str(result.get("media_id") or "").strip(),
+                    "error": str(result["publish_error"])[:2000],
+                }
+                if run is not None:
+                    delivery_results[delivery_key] = partial_result
+                    run.delivery_results = dict(delivery_results)
+                    db.commit()
+                raise RuntimeError(f"正式发布失败：{result['publish_error']}")
+
+            delivery_result = {"status": "success", "mode": publish_mode}
+            if publish_mode == "direct":
+                publish_id = str(result.get("publish_id") or "").strip()
+                if not publish_id:
+                    raise RuntimeError("正式发布失败：微信未返回 publish_id")
+                article.publish_id = publish_id
+                delivery_result["publish_id"] = publish_id
+            else:
+                media_id = str(result.get("media_id") or "").strip()
+                if not media_id:
+                    raise RuntimeError("保存草稿失败：微信未返回 media_id")
+                delivery_result["media_id"] = media_id
+
+            # 这些字段与账号级结果一起提交。若后续账号失败，已成功账号的标识
+            # 和完成状态仍会保留下来，下一次执行可以安全跳过该账号。
+            msg_data_id = str(result.get("msg_data_id") or result.get("msg_id") or "").strip()
+            if msg_data_id:
+                article.msg_data_id = msg_data_id
+                delivery_result["msg_data_id"] = msg_data_id
+            article.wechat_account_id = aid
+            if run is not None:
+                delivery_results[delivery_key] = delivery_result
+                run.delivery_results = dict(delivery_results)
+                db.commit()
             logger.info(
                 "已%s到公众号 #%s",
                 "直接发布" if publish_mode == "direct" else "保存草稿",
                 aid,
             )
         except Exception as e:
+            if (
+                run is not None
+                and isinstance(WechatPublishAmbiguousError, type)
+                and any(isinstance(item, WechatPublishAmbiguousError) for item in _iter_exception_chain(e))
+            ):
+                delivery_results[delivery_key] = {
+                    "status": "ambiguous",
+                    "mode": publish_mode,
+                    "error": str(e)[:2000],
+                }
+                run.delivery_results = dict(delivery_results)
+                db.commit()
             logger.error("发布到公众号 #%s 失败: %s", aid, e)
             raise RuntimeError(f"发布到公众号 #{aid} 失败: {e}") from e
 

@@ -17,6 +17,12 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=True,
     worker_pool="solo",  # Windows compatibility
+    # 定时文章通常包含多次外部 API 调用。延迟确认消息并在 Worker 丢失时让
+    # Broker 重投，避免数据库已经写成 running 但 Celery 消息永久消失。
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    task_track_started=True,
     beat_schedule={
         # Fetch all active feed sources every 30 minutes
         "fetch-feeds-every-30-minutes": {

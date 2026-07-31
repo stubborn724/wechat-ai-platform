@@ -895,7 +895,9 @@ class ScheduledTaskRun(MysqlBase):
     """定时任务单个时间点的执行记录。
 
     任务的 ``last_run_at`` 只能表达最近一次运行，无法区分同日多个发布时间。
-    该表以任务、日期和计划时间唯一化，使多实例轮询下也不会重复创建同一时段任务。
+    该表以任务、日期和计划时间唯一化，使多实例轮询下也不会重复创建同一时段任务；
+    尝试次数和下次重试时间持久化后，Worker 重启也能恢复中断执行，而不是让记录
+    永久停留在 ``running``。
     """
 
     __tablename__ = "scheduled_task_runs"
@@ -904,9 +906,30 @@ class ScheduledTaskRun(MysqlBase):
     task_id = Column(Integer, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     scheduled_date = Column(Date, nullable=False)
     scheduled_time = Column(String(5), nullable=False)
-    status = Column(String(32), nullable=False, default="queued", comment="queued/running/completed/failed")
+    status = Column(
+        String(32),
+        nullable=False,
+        default="queued",
+        comment="queued/running/retrying/completed/failed",
+    )
     article_id = Column(Integer, ForeignKey("articles.id", ondelete="SET NULL"), nullable=True)
     error_message = Column(Text, nullable=True)
+    # 记录实际执行尝试次数，而不是只依赖 Celery 内存中的 retries；这样 Worker
+    # 丢失后由定时补偿重新派发时仍有明确上限，避免数据库状态驱动无限重试。
+    attempt_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="当前执行尝试次数，包含初次执行",
+    )
+    # Celery 重试是异步的，持久化时间便于调度器和前端解释“下一次何时再试”。
+    next_retry_at = Column(DateTime, nullable=True, comment="下一次允许重试的时间")
+    # 用于区分 Worker 丢失后同一消息的安全重投与并发重复消息。
+    celery_task_id = Column(String(255), nullable=True, comment="当前 Celery 消息 ID")
+    # 多公众号发布不能只用 Article.wechat_account_id 覆盖记录；此字段按
+    # ``article_id:account_id`` 保存每个外部交付结果，重试时只补发未成功账号。
+    delivery_results = Column(JSON, nullable=True, comment="按文章和公众号记录外部交付结果")
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
@@ -914,6 +937,7 @@ class ScheduledTaskRun(MysqlBase):
     __table_args__ = (
         UniqueConstraint("task_id", "scheduled_date", "scheduled_time", name="uq_scheduled_task_run_slot"),
         Index("ix_scheduled_task_runs_task_date", "task_id", "scheduled_date"),
+        Index("ix_scheduled_task_runs_recovery", "status", "next_retry_at"),
     )
 
 
