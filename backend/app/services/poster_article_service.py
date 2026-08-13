@@ -515,6 +515,18 @@ def _poster_title_subject(product_name: str) -> str:
     if not normalized:
         return _product_anchor(product_name) or "家居产品"
 
+    # ERP 名称有时会把型号直接粘在中文品类前面，例如
+    # ``FSCJ3012家具单品·家具单品``。先截取型号后的中文片段，避免可读标题
+    # 把内部 SKU 带到公众号；没有匹配时再走下面的通用中文片段策略。
+    suffix_match = re.search(
+        r"(?:[A-Za-z]{2,}\d{3,}|\d{4,})(?P<label>[\u4e00-\u9fff][\u4e00-\u9fff·、]*)",
+        normalized,
+    )
+    if suffix_match:
+        suffix_label = suffix_match.group("label").strip("·、")
+        if suffix_label:
+            return suffix_label.split("·", 1)[0]
+
     segments = [
         segment.strip()
         for segment in re.split(r"[·|｜/:：_\-\s]+", normalized)

@@ -116,6 +116,37 @@ async def test_poster_plan_keeps_product_and_style_body_separated_by_bar():
 
 
 @pytest.mark.asyncio
+async def test_poster_plan_removes_model_prefix_when_model_and_category_are_concatenated():
+    """型号与品类无分隔符粘连时，公众号标题仍只展示可读产品主体。"""
+    from app.services.poster_article_service import generate_poster_plan
+    from app.services.publication_format_service import analyze_publication_format
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【标题要求】公众号标题使用产品名|风格长句格式。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+
+    async def fake_complete(_request):
+        return json.dumps(
+            {
+                "article_title": "东方神韵与当代奢雅，在沉静里修养日常",
+                "posters": [{"copy": "让日常在细节中更从容。", "scene": "客厅空间"}],
+            },
+            ensure_ascii=False,
+        )
+
+    plan = await generate_poster_plan(
+        profile=profile,
+        product_name="FSCJ3012家具单品·家具单品",
+        complete_text=fake_complete,
+    )
+
+    assert plan.article_title.startswith("家具单品|")
+    assert "FSCJ3012" not in plan.article_title
+
+
+@pytest.mark.asyncio
 async def test_programmatic_three_poster_plan_uses_body_copy_for_every_panel_and_filters_model_id():
     """通用三图模板的每一张都应是正文型文案，并过滤产品型号式标题。"""
     from app.services.poster_article_service import generate_poster_plan
