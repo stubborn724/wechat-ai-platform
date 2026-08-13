@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+import sys
 import uuid
 from datetime import datetime, timedelta
 
@@ -15,6 +16,26 @@ from app.services.publish_domain_policy import normalize_publish_domain
 from app.services.scheduled_erp_image_policy import find_due_schedule_times
 
 logger = logging.getLogger(__name__)
+
+
+def configure_safe_console_output() -> None:
+    """为定时任务进程配置安全的控制台输出编码。
+
+    FastAPI 入口已经在 ``app.main`` 中处理过 Windows GBK 控制台问题，但 Celery
+    Worker、本地脚本或测试可以直接导入本模块并执行任务入口。定时任务里包含大量
+    中文和进度符号日志，若 stdout/stderr 仍是 GBK，普通 ``print`` 会抛出
+    ``UnicodeEncodeError`` 并把业务任务误标为失败。这里在任务模块边界统一把
+    不可编码字符替换输出，保证日志永远不能中断文章生成和草稿发布。
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+configure_safe_console_output()
 
 # 定时文章的生成和发布依赖多个外部服务。重试间隔采用显式有限序列，既给上游
 # 足够恢复时间，也避免配置错误或永久故障造成无限调用和重复发布。

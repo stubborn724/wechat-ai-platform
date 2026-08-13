@@ -1198,7 +1198,6 @@ async def agent5_generate_images(
         from app.services.image_generation_models import ImageGenerationRequest
         from app.services.image_generation_service import image_generation_service
 
-        results: List[ImageResult] = []
         # 只有定时 ERP 路径启用产品-场景策略。普通参考图仿写可能也带有
         # reference_image_url，但没有该显式标识时必须保持历史提示词行为。
         is_erp_generation = bool(
@@ -1213,7 +1212,19 @@ async def agent5_generate_images(
             if is_erp_generation
             else None
         )
-        for req in state.image_requirements:
+        parallel_limit = 2 if is_erp_generation else 3
+        semaphore = asyncio.Semaphore(parallel_limit)
+        total_requirements = len(state.image_requirements)
+
+        async def _generate_reference_image_for_requirement(req: ImageRequirement) -> ImageResult:
+            """生成单个参考图槽位，并把异常边界限制在槽位级别。
+
+            ERP 定时文章的总耗时主要由多张图生图串行等待累加而成。这里把“提示词
+            合成、最多一次质量重试、结果封装”收敛为单槽位任务，再由外层
+            ``asyncio.gather`` 保持输入顺序返回；这样既能并行等待外部图片接口，
+            也不会因为先完成的槽位提前写入而破坏 HTML 原位回填。
+            """
+
             slot_prompt = (req.prompt or "").strip()
             if state.reference_html and not slot_prompt:
                 # HTML ERP 路径的背景规则只由槽位内容 Agent 编译一次。此处若允许
@@ -1272,38 +1283,52 @@ async def agent5_generate_images(
             generated = None
             final_prompt = prompt
             quality_report = None
-            for attempt in range(2 if is_erp_generation else 1):
-                generated = await image_generation_service.generate(
-                    ImageGenerationRequest(
-                        prompt=final_prompt,
-                        tenant_id=state.tenant_id,
-                        reference_image_bytes=state.reference_image_bytes,
-                        reference_content_type=state.reference_content_type,
-                        reference_image_url=state.reference_image_url,
-                        size="1024*1365",
-                        no_text=True,
-                    )
-                )
-                url = str(getattr(generated, "url", "") or "").strip()
-                if not url:
-                    # 图生图是定时任务的硬依赖，少一张会造成正文槽位和素材库记录错位；
-                    # 不允许把空 URL 静默带到发布阶段伪装成成功文章。
-                    raise RuntimeError(f"图生图失败：第 {req.position} 张图片未返回有效地址")
-
-                if not is_erp_generation:
-                    break
-
-                quality_report = await inspect_generated_image_url(url)
-                if quality_report.is_usable:
-                    break
-                logger.warning(
-                    "ERP 图生图结果信息不足 position=%s attempt=%d reason=%s",
+            async with semaphore:
+                slot_started_at = asyncio.get_running_loop().time()
+                logger.info(
+                    "开始生成参考图槽位 task_id=%s position=%s placeholder=%s",
+                    state.task_id,
                     req.position,
-                    attempt + 1,
-                    quality_report.reason,
+                    req.placeholder_id,
                 )
-                if attempt == 0:
-                    final_prompt = append_low_information_retry_instruction(final_prompt)
+                for attempt in range(2 if is_erp_generation else 1):
+                    generated = await image_generation_service.generate(
+                        ImageGenerationRequest(
+                            prompt=final_prompt,
+                            tenant_id=state.tenant_id,
+                            reference_image_bytes=state.reference_image_bytes,
+                            reference_content_type=state.reference_content_type,
+                            reference_image_url=state.reference_image_url,
+                            size="1024*1365",
+                            no_text=True,
+                        )
+                    )
+                    url = str(getattr(generated, "url", "") or "").strip()
+                    if not url:
+                        # 图生图是定时任务的硬依赖，少一张会造成正文槽位和素材库记录错位；
+                        # 不允许把空 URL 静默带到发布阶段伪装成成功文章。
+                        raise RuntimeError(f"图生图失败：第 {req.position} 张图片未返回有效地址")
+
+                    if not is_erp_generation:
+                        break
+
+                    quality_report = await inspect_generated_image_url(url)
+                    if quality_report.is_usable:
+                        break
+                    logger.warning(
+                        "ERP 图生图结果信息不足 position=%s attempt=%d reason=%s",
+                        req.position,
+                        attempt + 1,
+                        quality_report.reason,
+                    )
+                    if attempt == 0:
+                        final_prompt = append_low_information_retry_instruction(final_prompt)
+                logger.info(
+                    "参考图槽位生成结束 task_id=%s position=%s elapsed=%.2fs",
+                    state.task_id,
+                    req.position,
+                    asyncio.get_running_loop().time() - slot_started_at,
+                )
 
             if is_erp_generation and (
                 generated is None
@@ -1316,7 +1341,7 @@ async def agent5_generate_images(
                 )
 
             url = str(getattr(generated, "url", "") or "").strip()
-            results.append(ImageResult(
+            return ImageResult(
                 position=req.position,
                 url=url,
                 method=(
@@ -1328,7 +1353,25 @@ async def agent5_generate_images(
                 section_title=req.section_title,
                 description=final_prompt,
                 placeholder_id=req.placeholder_id,
-            ))
+            )
+
+        logger.info(
+            "参考图生图并发启动 task_id=%s count=%d concurrency=%d",
+            state.task_id,
+            total_requirements,
+            parallel_limit,
+        )
+        started_at = asyncio.get_running_loop().time()
+        results = await asyncio.gather(*[
+            _generate_reference_image_for_requirement(req)
+            for req in state.image_requirements
+        ])
+        logger.info(
+            "参考图生图并发完成 task_id=%s count=%d elapsed=%.2fs",
+            state.task_id,
+            len(results),
+            asyncio.get_running_loop().time() - started_at,
+        )
         state.images = results
         return state
 

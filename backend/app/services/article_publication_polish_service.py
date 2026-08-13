@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import asyncio
 from html import escape
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -465,6 +466,7 @@ async def normalize_final_article_images_with_attribution(
     url_mapping: dict[str, str] = {}
     body_image_urls: list[str] = []
     continuous_archived_urls: dict[int, str] = {}
+    archive_requests: dict[str, dict[str, Any]] = {}
 
     # 程序叠字海报在这里批处理：同一容器内的多个 img 只是同一张母版的逻辑
     # 切片，必须先下载主视觉一次，再按文案顺序切出独立归档对象。普通文章、旧
@@ -523,6 +525,7 @@ async def normalize_final_article_images_with_attribution(
             archived_url = storage_service.get_url(asset.storage_key)
             continuous_archived_urls[id(node)] = archived_url
 
+    body_images = []
     for image in soup.find_all("img"):
         source_url = str(image.get("src", "") or "").strip()
         if not source_url:
@@ -537,10 +540,44 @@ async def normalize_final_article_images_with_attribution(
 
         # 同一图片可能同时作为封面、首图或被响应式容器重复引用，只归档一次，
         # 避免重复下载、重复计费和双重叠加署名。
-        attributed_url = url_mapping.get(source_url)
-        if attributed_url is None:
-            poster_copy = str(image.get("data-poster-copy", "") or "").strip() or None
-            poster_kind = str(image.get("data-poster-kind", "content") or "content").strip()
+        body_images.append((image, source_url))
+        if source_url not in archive_requests:
+            archive_requests[source_url] = {
+                "poster_copy": str(image.get("data-poster-copy", "") or "").strip() or None,
+                "poster_kind": str(image.get("data-poster-kind", "content") or "content").strip(),
+            }
+
+    if archive_requests:
+        archive_started_at = asyncio.get_running_loop().time()
+        logger.info(
+            "开始并发归档正文图片 tenant_id=%s count=%d",
+            tenant_id,
+            len(archive_requests),
+        )
+
+        async def _download_body_image(source_url: str) -> tuple[str, bytes, str]:
+            """并发下载单张正文图片，返回源地址、字节和 MIME 类型。
+
+            图片下载是发布前最容易被外部网络拖慢的阶段，且各图片之间没有依赖。
+            数据库写入不在这里执行，避免同一个 SQLAlchemy Session 被多个协程
+            交错使用；后续归档仍按稳定顺序逐张入库。
+            """
+
+            image_bytes, content_type = await download_image_bytes(source_url)
+            return source_url, image_bytes, content_type
+
+        downloaded_items = await asyncio.gather(*[
+            _download_body_image(source_url)
+            for source_url in archive_requests
+        ])
+        downloaded_images = {
+            source_url: (image_bytes, content_type)
+            for source_url, image_bytes, content_type in downloaded_items
+        }
+
+        archived_pairs = []
+        for source_url, options in archive_requests.items():
+            image_bytes, image_content_type = downloaded_images[source_url]
             asset = await save_image_to_asset_library(
                 db,
                 tenant_id,
@@ -553,16 +590,26 @@ async def normalize_final_article_images_with_attribution(
                 watermark_font_size=effective_watermark_font_size,
                 watermark_enabled=effective_watermark_enabled,
                 task_watermark_config=normalized_task_watermark_config,
-                poster_copy=poster_copy,
-                poster_kind=poster_kind,
+                poster_copy=options["poster_copy"],
+                poster_kind=options["poster_kind"],
+                image_bytes=image_bytes,
+                image_content_type=image_content_type,
             )
             if not asset or not asset.storage_key:
                 raise ArticleImageNormalizationError(
                     f"正文图片无法归档署名，已停止发布：{source_url[:160]}"
                 )
-            attributed_url = storage_service.get_url(asset.storage_key)
-            url_mapping[source_url] = attributed_url
+            archived_pairs.append((source_url, storage_service.get_url(asset.storage_key)))
+        url_mapping.update(dict(archived_pairs))
+        logger.info(
+            "正文图片并发归档完成 tenant_id=%s count=%d elapsed=%.2fs",
+            tenant_id,
+            len(archived_pairs),
+            asyncio.get_running_loop().time() - archive_started_at,
+        )
 
+    for image, source_url in body_images:
+        attributed_url = url_mapping[source_url]
         image["src"] = attributed_url
         body_image_urls.append(attributed_url)
 

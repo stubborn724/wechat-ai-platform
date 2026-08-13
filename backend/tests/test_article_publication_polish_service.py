@@ -6,6 +6,7 @@
 
 from io import BytesIO
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -300,6 +301,10 @@ async def test_normalize_final_article_images_archives_every_body_image_but_keep
         assert kwargs["article_image_attribution"].lines[0] == "绣蔓家具 TEL:18682130473"
         return SimpleNamespace(storage_key=f"assets/107/{len(archived_urls)}.jpg")
 
+    async def fake_download(image_url):
+        return f"bytes:{image_url}".encode(), "image/jpeg"
+
+    monkeypatch.setattr(polish, "download_image_bytes", fake_download)
     monkeypatch.setattr(
         "app.services.asset_archive_service.save_image_to_asset_library",
         fake_archive,
@@ -337,6 +342,98 @@ async def test_normalize_final_article_images_archives_every_body_image_but_keep
 
 
 @pytest.mark.asyncio
+async def test_normalize_final_article_images_archives_body_images_concurrently_in_dom_order(monkeypatch):
+    """最终正文图片归档应并发等待慢网络，并按 DOM 顺序回填结果。
+
+    图片归档包含下载、压缩、水印和上传，真实环境中每张图都可能等待网络。优化后
+    允许并发等待这些 I/O，但正文顺序必须仍以 HTML DOM 为准，避免封面和正文图
+    出现错位。
+    """
+
+    from app.services import article_publication_polish_service as polish
+
+    active_downloads = 0
+    max_active_downloads = 0
+    archived_payloads = []
+    delays = {
+        "https://videos.tpkcur.xyz/slow.png": 0.09,
+        "https://videos.tpkcur.xyz/fast.png": 0.03,
+        "https://videos.tpkcur.xyz/mid.png": 0.06,
+    }
+
+    async def fake_download(image_url):
+        nonlocal active_downloads, max_active_downloads
+        active_downloads += 1
+        max_active_downloads = max(max_active_downloads, active_downloads)
+        try:
+            await asyncio.sleep(delays[image_url])
+            return f"bytes:{image_url}".encode(), "image/png"
+        finally:
+            active_downloads -= 1
+
+    async def fake_archive(db, tenant_id, image_url, **kwargs):
+        archived_payloads.append((image_url, kwargs["image_bytes"], kwargs["image_content_type"]))
+        order = {
+            "https://videos.tpkcur.xyz/slow.png": "1",
+            "https://videos.tpkcur.xyz/fast.png": "2",
+            "https://videos.tpkcur.xyz/mid.png": "3",
+        }[image_url]
+        return SimpleNamespace(storage_key=f"assets/107/{order}.jpg")
+
+    monkeypatch.setattr(polish, "download_image_bytes", fake_download)
+    monkeypatch.setattr(
+        "app.services.asset_archive_service.save_image_to_asset_library",
+        fake_archive,
+    )
+    monkeypatch.setattr(
+        "app.services.storage_service.storage_service.get_url",
+        lambda key: f"http://localhost:9002/wechat-assets/{key}",
+    )
+
+    started_at = time.perf_counter()
+    normalized = await polish.normalize_final_article_images_with_attribution(
+        db=SimpleNamespace(),
+        content=(
+            '<article>'
+            '<img src="https://videos.tpkcur.xyz/slow.png"/>'
+            '<img src="https://videos.tpkcur.xyz/fast.png"/>'
+            '<img src="https://videos.tpkcur.xyz/mid.png"/>'
+            '</article>'
+        ),
+        tenant_id=107,
+        product_name="异形茶几",
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert max_active_downloads == 3
+    assert elapsed < 0.14
+    assert archived_payloads == [
+        (
+            "https://videos.tpkcur.xyz/slow.png",
+            b"bytes:https://videos.tpkcur.xyz/slow.png",
+            "image/png",
+        ),
+        (
+            "https://videos.tpkcur.xyz/fast.png",
+            b"bytes:https://videos.tpkcur.xyz/fast.png",
+            "image/png",
+        ),
+        (
+            "https://videos.tpkcur.xyz/mid.png",
+            b"bytes:https://videos.tpkcur.xyz/mid.png",
+            "image/png",
+        ),
+    ]
+    assert normalized.body_image_urls == (
+        "http://localhost:9002/wechat-assets/assets/107/1.jpg",
+        "http://localhost:9002/wechat-assets/assets/107/2.jpg",
+        "http://localhost:9002/wechat-assets/assets/107/3.jpg",
+    )
+    assert normalized.content.index("assets/107/1.jpg") < normalized.content.index("assets/107/2.jpg")
+    assert normalized.content.index("assets/107/2.jpg") < normalized.content.index("assets/107/3.jpg")
+
+
+@pytest.mark.asyncio
 async def test_normalize_final_article_images_passes_fixed_size_policy_to_archive(monkeypatch):
     """ERP 定时归档必须把固定画布和 24px 水印策略传到素材归档层。"""
     from app.services import article_publication_polish_service as polish
@@ -347,6 +444,11 @@ async def test_normalize_final_article_images_passes_fixed_size_policy_to_archiv
         captured.append(kwargs)
         return SimpleNamespace(storage_key="assets/107/fixed.png")
 
+    monkeypatch.setattr(
+        polish,
+        "download_image_bytes",
+        lambda image_url: asyncio.sleep(0, result=(b"image-bytes", "image/jpeg")),
+    )
     monkeypatch.setattr(
         "app.services.asset_archive_service.save_image_to_asset_library",
         fake_archive,
@@ -380,6 +482,11 @@ async def test_normalize_final_article_images_passes_task_watermark_switch_to_ar
         captured.append(kwargs)
         return SimpleNamespace(storage_key="assets/107/no-global-watermark.jpg")
 
+    monkeypatch.setattr(
+        polish,
+        "download_image_bytes",
+        lambda image_url: asyncio.sleep(0, result=(b"image-bytes", "image/jpeg")),
+    )
     monkeypatch.setattr(
         "app.services.asset_archive_service.save_image_to_asset_library",
         fake_archive,
@@ -469,6 +576,11 @@ async def test_normalize_final_article_images_refuses_to_publish_when_a_body_ima
     async def failing_archive(*_args, **_kwargs):
         return None
 
+    monkeypatch.setattr(
+        polish,
+        "download_image_bytes",
+        lambda image_url: asyncio.sleep(0, result=(b"image-bytes", "image/jpeg")),
+    )
     monkeypatch.setattr(
         "app.services.asset_archive_service.save_image_to_asset_library",
         failing_archive,

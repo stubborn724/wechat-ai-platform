@@ -1,6 +1,7 @@
 """微信发布前本地图片 COS 中转测试。"""
 
 import base64
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -193,6 +194,76 @@ def test_local_image_uses_detected_mime_when_storage_extension_is_wrong():
     )
 
     assert relay.stage_calls[0]["content_type"] == "image/jpeg"
+
+
+def test_local_images_are_staged_with_bounded_parallelism_and_dom_replacements():
+    """多张本地正文图应并发暂存到 COS，同时保持 HTML 替换结果准确。"""
+    from app.services.wechat_relay_image_service import WeChatRelayImageService
+
+    local_urls = [
+        "http://localhost:9002/wechat-assets/assets/107/slow.png",
+        "http://localhost:9002/wechat-assets/assets/107/fast.png",
+        "http://localhost:9002/wechat-assets/assets/107/mid.png",
+    ]
+    html = "".join(f'<img src="{url}">' for url in local_urls)
+
+    class FakeStorage:
+        """用不同下载延迟模拟 MinIO I/O，并记录并发峰值。"""
+
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.delays = {
+                "assets/107/slow.png": 0.09,
+                "assets/107/fast.png": 0.03,
+                "assets/107/mid.png": 0.06,
+            }
+
+        def download_bytes(self, object_key):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(self.delays[object_key])
+                return object_key.encode("utf-8")
+            finally:
+                self.active -= 1
+
+    class FakeRelay:
+        """返回与 run_id 相关的签名地址，验证每张图独立替换。"""
+
+        def stage_bytes(self, **kwargs):
+            object_name = kwargs["data"].decode("utf-8").rsplit("/", 1)[-1]
+            return SimpleNamespace(
+                object_key=f"temporary/107/wechat-27/{object_name}",
+                signed_url=f"https://cos.example.com/{object_name}",
+            )
+
+    storage = FakeStorage()
+    service = WeChatRelayImageService(
+        storage=storage,
+        relay=FakeRelay(),
+        minio_public_endpoint="http://localhost:9002",
+        minio_bucket="wechat-assets",
+    )
+
+    started_at = time.perf_counter()
+    result = service.prepare(
+        html=html,
+        cover_image_url=local_urls[0],
+        tenant_id=107,
+        article_id=27,
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert storage.max_active >= 2
+    assert elapsed < 0.16
+    assert result.html.index("https://cos.example.com/slow.png") < result.html.index(
+        "https://cos.example.com/fast.png"
+    )
+    assert result.html.index("https://cos.example.com/fast.png") < result.html.index(
+        "https://cos.example.com/mid.png"
+    )
+    assert result.cover_image_url == "https://cos.example.com/slow.png"
 
 
 def test_relay_publish_cleans_staged_images_when_request_fails(monkeypatch):

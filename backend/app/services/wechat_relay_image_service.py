@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import mimetypes
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from collections.abc import Iterable
@@ -98,12 +100,20 @@ class WeChatRelayImageService:
 
         replacements: dict[str, str] = {}
         object_keys: list[str] = []
-        try:
-            for image_url in dict.fromkeys(candidate_urls):
-                storage_key = self._extract_local_storage_key(image_url)
-                if not storage_key:
-                    continue
+        local_items = []
+        for image_url in dict.fromkeys(candidate_urls):
+            storage_key = self._extract_local_storage_key(image_url)
+            if storage_key:
+                local_items.append((image_url, storage_key))
 
+        try:
+            def _stage_local_image(image_url: str, storage_key: str):
+                """下载并暂存单张本地图片，返回原 URL 与 COS 结果。
+
+                微信发布前正文图只需要临时公网化，多个对象之间没有顺序依赖。使用
+                线程池并发等待 MinIO 下载和 COS 上传，可以减少草稿发布前的尾部
+                延迟；替换 HTML 时仍按 ``replacements`` 映射执行，不受完成顺序影响。
+                """
                 image_bytes = self.storage.download_bytes(storage_key)
                 content_type = self._detect_image_content_type(image_bytes, storage_key)
                 relay_object = self.relay.stage_bytes(
@@ -112,8 +122,32 @@ class WeChatRelayImageService:
                     tenant_id=tenant_id,
                     run_id=f"wechat-{article_id}",
                 )
-                replacements[image_url] = relay_object.signed_url
-                object_keys.append(relay_object.object_key)
+                return image_url, relay_object
+
+            if local_items:
+                started_at = time.perf_counter()
+                max_workers = min(4, len(local_items))
+                logger.info(
+                    "开始并发准备微信中转图片 article_id=%s count=%d concurrency=%d",
+                    article_id,
+                    len(local_items),
+                    max_workers,
+                )
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [
+                        executor.submit(_stage_local_image, image_url, storage_key)
+                        for image_url, storage_key in local_items
+                    ]
+                    for future in as_completed(futures):
+                        image_url, relay_object = future.result()
+                        replacements[image_url] = relay_object.signed_url
+                        object_keys.append(relay_object.object_key)
+                logger.info(
+                    "微信中转图片准备完成 article_id=%s count=%d elapsed=%.2fs",
+                    article_id,
+                    len(object_keys),
+                    time.perf_counter() - started_at,
+                )
         except Exception:
             # 准备阶段未返回对象键时调用方无法清理，因此这里回收部分成功对象。
             self.cleanup(object_keys)

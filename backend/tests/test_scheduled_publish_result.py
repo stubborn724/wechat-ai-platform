@@ -373,6 +373,30 @@ def test_publish_success_is_not_overridden_by_console_encoding(monkeypatch):
     )
 
 
+def test_scheduled_executor_configures_console_output_for_windows_gbk(monkeypatch):
+    """定时任务模块本身也必须修正输出编码，直接执行 Worker 入口时不能依赖 FastAPI。"""
+    from app.tasks import scheduled_task_executor
+
+    class FakeStream:
+        """模拟 Windows GBK stdout/stderr，并记录 reconfigure 调用参数。"""
+
+        def __init__(self):
+            self.calls = []
+
+        def reconfigure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    stdout = FakeStream()
+    stderr = FakeStream()
+    monkeypatch.setattr(scheduled_task_executor.sys, "stdout", stdout)
+    monkeypatch.setattr(scheduled_task_executor.sys, "stderr", stderr)
+
+    scheduled_task_executor.configure_safe_console_output()
+
+    assert stdout.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert stderr.calls == [{"encoding": "utf-8", "errors": "replace"}]
+
+
 def test_generated_image_is_preferred_over_footer_as_cover():
     """文章封面应优先使用本次生成图，不能误选 HTML 末尾的页脚图片。"""
     from app.tasks.scheduled_task_executor import _select_article_cover
