@@ -77,10 +77,44 @@ services:
       MYSQL_PORT: "3306"
       PG_HOST: postgres
       MINIO_ENDPOINT: minio:9000
-      MINIO_PUBLIC_ENDPOINT: http://minio:9000
+      # 公共地址用于文章归档和历史 URL 识别，内部下载仍使用 MINIO_ENDPOINT。
+      # 不能覆盖根目录 .env 中的公网/宿主机地址，否则发布 Worker 会漏掉旧图片。
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9002}
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-    command: celery -A app.celery_app worker --loglevel=info --pool=solo
+    # 普通 Worker 消费默认队列；定时文章由下方专用 Worker 消费，避免长任务
+    # 占住唯一执行槽后导致其他消息长期排队。
+    command: celery -A app.celery_app worker --loglevel=info --pool=solo --queues=celery --hostname=default@%h
+    volumes:
+      - ./backend:/app
+
+  celery-scheduled-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: wechat-celery-scheduled-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - mysql
+      - postgres
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      PG_HOST: postgres
+      MINIO_ENDPOINT: minio:9000
+      # 与普通 Worker 使用同一套公网地址和凭证，保证定时任务迁移后文章图片
+      # 的归档、发布和重试行为保持一致。
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9002}
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    # 只消费 scheduled 队列。单独容器保留 solo 模式，避免在现有 Python 任务
+    # 中引入进程共享状态问题，同时实现与普通 Worker 的并行执行。
+    command: celery -A app.celery_app worker --loglevel=info --pool=solo --queues=scheduled --hostname=scheduled@%h
     volumes:
       - ./backend:/app
 
@@ -103,7 +137,8 @@ services:
       MYSQL_PORT: "3306"
       PG_HOST: postgres
       MINIO_ENDPOINT: minio:9000
-      MINIO_PUBLIC_ENDPOINT: http://minio:9000
+      # Beat 只负责调度，但保持与 Worker 相同的 URL 解析配置，避免环境漂移。
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9002}
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/1
     command: celery -A app.celery_app beat --loglevel=info

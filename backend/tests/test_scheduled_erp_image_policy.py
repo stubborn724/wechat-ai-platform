@@ -96,6 +96,29 @@ def test_scheduled_erp_config_allows_entire_source_without_category():
     assert config.commodity_category is None
 
 
+def test_scheduled_erp_config_can_share_three_day_scope_between_brand_tasks():
+    """公域和私域任务可声明同一品牌范围，避免两条任务重复选品。"""
+    from app.services.scheduled_erp_image_service import (
+        parse_scheduled_erp_image_config,
+        resolve_erp_selection_scope,
+    )
+
+    config = parse_scheduled_erp_image_config({
+        "source_key": "zhongxiwujie",
+        "selection_scope": "brand:zhongxiwujie",
+        "repeat_after_days": 3,
+        "image_count": 1,
+    })
+
+    assert config is not None
+    assert config.selection_scope == "brand:zhongxiwujie"
+    assert resolve_erp_selection_scope(config, task_id=101) == "brand:zhongxiwujie"
+    assert resolve_erp_selection_scope(
+        parse_scheduled_erp_image_config({"source_key": "xiuman"}),
+        task_id=11,
+    ) == "task:11"
+
+
 @pytest.mark.asyncio
 async def test_prepared_erp_image_contains_cos_reference_url(monkeypatch):
     """归档后的 ERP 图片必须经 COS 中转，万相不能继续读取本地 MinIO 地址。"""
@@ -152,7 +175,11 @@ async def test_prepared_erp_image_contains_cos_reference_url(monkeypatch):
 
     fake_db = FakeDb()
     fake_relay = FakeRelay()
-    monkeypatch.setattr(service_module, "_recent_erp_image_urls", lambda *args: set())
+    monkeypatch.setattr(
+        service_module,
+        "_recent_erp_image_urls",
+        lambda *args, **kwargs: set(),
+    )
     monkeypatch.setattr(service_module, "_load_category_products", fake_load_products)
     monkeypatch.setattr(service_module, "_import_product_image", fake_import_product_image)
     monkeypatch.setattr(
@@ -175,7 +202,11 @@ async def test_prepared_erp_image_contains_cos_reference_url(monkeypatch):
         task_id=4,
         tenant_id=107,
         run_id=6,
-        config=service_module.ScheduledErpImageConfig(source_key="xiuman", image_count=1),
+        config=service_module.ScheduledErpImageConfig(
+            source_key="xiuman",
+            image_count=1,
+            selection_scope="brand:xiuman-test",
+        ),
         requested_count=1,
         relay_service=fake_relay,
     )
@@ -191,4 +222,5 @@ async def test_prepared_erp_image_contains_cos_reference_url(monkeypatch):
         "tenant_id": 107,
         "run_id": 6,
     }]
+    assert fake_db.added[0].selection_scope == "brand:xiuman-test"
     assert fake_db.flushed is True

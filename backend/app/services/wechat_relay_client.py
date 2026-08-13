@@ -17,6 +17,8 @@ from typing import Callable, Optional
 
 import requests
 
+from app.services.publish_domain_policy import map_relay_publish_mode
+
 
 class WeChatRelayClient:
     """固定 IP 微信中转站 HTTP 客户端。
@@ -72,6 +74,7 @@ class WeChatRelayClient:
         request_id: str,
         tenant_id: Optional[str],
         publish_mode: str,
+        publish_domain: str = "public",
         confirm_publish: bool,
         title: str,
         digest: str,
@@ -85,10 +88,14 @@ class WeChatRelayClient:
         """通过中转站创建微信草稿或提交发布。
 
         `publish_mode` 使用当前系统已有语义：`draft` 表示保存草稿，
-        `direct` 表示直接提交公域发布。这里统一映射到中转站协议，避免上层
-        业务代码感知两套枚举。
+        `direct` 表示真实发布；`publish_domain` 再决定真实发布走公域发布还是
+        私域粉丝群发。这里统一映射到中转站协议，避免上层业务代码感知两套枚举。
         """
-        relay_publish_mode = self._map_publish_mode(publish_mode, confirm_publish)
+        relay_publish_mode = self._map_publish_mode(
+            publish_mode,
+            confirm_publish,
+            publish_domain,
+        )
         body = {
             "wechatCredential": {
                 "appId": app_id,
@@ -114,19 +121,22 @@ class WeChatRelayClient:
         result = self._post_json(self.PUBLISH_PATH, raw_body)
         return self._normalize_publish_result(result)
 
-    def _map_publish_mode(self, publish_mode: str, confirm_publish: bool) -> str:
+    def _map_publish_mode(
+        self,
+        publish_mode: str,
+        confirm_publish: bool,
+        publish_domain: str = "public",
+    ) -> str:
         """把本系统发布枚举转换为中转站发布枚举。
 
         direct 发布属于真实微信副作用，必须显式确认；这里在客户端侧提前拦截，
         让错误发生在调用微信之前，减少误发风险。
         """
-        if publish_mode == "draft":
-            return "draft_only"
-        if publish_mode == "direct":
-            if not confirm_publish:
-                raise ValueError("direct publish requires confirm_publish=True")
-            return "public_publish"
-        raise ValueError(f"Unsupported publish mode: {publish_mode}")
+        return map_relay_publish_mode(
+            publish_mode,
+            publish_domain,
+            confirm_publish,
+        )
 
     def _post_json(self, path_with_query: str, raw_body: bytes) -> dict:
         """发送已序列化 JSON。

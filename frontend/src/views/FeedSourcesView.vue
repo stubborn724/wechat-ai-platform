@@ -104,8 +104,17 @@ function openForm() {
 async function create() {
   saving.value = true
   try {
-    await client.post('/feed-sources', form)
-    ElMessage.success('投喂源创建成功')
+    const { data } = await client.post('/feed-sources', form)
+    const initialFetch = data?.initial_fetch
+    if (initialFetch?.format_profiles_created > 0) {
+      ElMessage.success(
+        `投喂源已创建，已导入 ${initialFetch.articles_saved || 0} 篇文章并自动分析 ${initialFetch.format_profiles_created} 个格式模板`,
+      )
+    } else if (initialFetch?.format_profile_errors?.length) {
+      ElMessage.warning('投喂源已创建，但部分文章格式分析失败，可稍后重新分析')
+    } else {
+      ElMessage.success('投喂源已创建，首次抓取已启动')
+    }
     showForm.value = false
     await load()
   } catch (err: any) {
@@ -131,7 +140,9 @@ async function triggerFetch(source: FeedSource) {
     const res = await client.post(`/feed-sources/${source.id}/fetch`)
     fetchResult.value = res.data
     showFetchResult.value = true
-    ElMessage.success('抓取成功')
+    ElMessage.success(
+      `抓取成功，自动分析 ${res.data?.format_profiles_created || 0} 个格式模板`,
+    )
     await load()
   } catch (err: any) {
     ElMessage.error(err?.response?.data?.detail || '抓取失败')
@@ -235,6 +246,23 @@ function renderMarkdown(md: string): string {
   return sanitizeHtml(blocks)
 }
 
+/**
+ * 链接导入后后端已经自动完成格式分析；这里保留重新分析入口，供源文章版式发生
+ * 变化或用户需要生成新模板版本时使用。后续定时任务不会重复解析原始 HTML。
+ */
+async function analyzeArticleFormat(article: FeedSourceArticle) {
+  if (!selectedSource.value) return
+  try {
+    const { data } = await client.post(
+      `/feed-sources/${selectedSource.value.id}/articles/${article.id}/format-profiles`,
+    )
+    const label = data.render_mode === 'poster_gallery' ? '无缝海报' : 'HTML 槽位'
+    ElMessage.success(`已生成${label}格式模板 v${data.version}`)
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || '格式模板分析失败')
+  }
+}
+
 function renderFeedArticle(article: FeedSourceArticle): string {
   // 抓取源保存了原始 HTML 时优先展示它，便于用户判断后续仿写会继承的真实版式。
   if (article.body_html?.trim()) return sanitizeHtml(article.body_html)
@@ -324,6 +352,7 @@ onMounted(load)
         <el-form-item label="Feed URL(可选)">
           <el-input v-model="form.feed_url" placeholder="RSS链接（如有）" />
         </el-form-item>
+        <span class="form-hint">导入后自动分析格式：后续定时任务只需选择投喂源，系统会自动匹配 HTML 或无缝海报模板。</span>
       </el-form>
       <template #footer>
         <el-button @click="showForm = false">取消</el-button>
@@ -346,17 +375,20 @@ onMounted(load)
       <el-table v-else :data="articles" stripe style="width: 100%">
         <el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip />
         <el-table-column prop="word_count" label="字数" width="80" />
-        <el-table-column label="已分析" width="80">
+        <el-table-column label="处理状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="row.is_analyzed ? 'success' : 'info'" size="small">
-              {{ row.is_analyzed ? '是' : '否' }}
+            <el-tag :type="row.format_profile_id ? 'success' : row.is_analyzed ? 'success' : 'info'" size="small">
+              {{ row.format_profile_id ? '格式已分析' : row.is_analyzed ? '风格已分析' : '待分析' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="80">
+        <el-table-column label="操作" width="330">
           <template #default="{ row }">
             <el-button size="small" link type="primary" @click="previewArticle = row; showPreview = true">
               预览
+            </el-button>
+            <el-button size="small" link type="success" @click="analyzeArticleFormat(row)">
+              重新分析格式
             </el-button>
           </template>
         </el-table-column>

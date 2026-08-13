@@ -39,3 +39,32 @@ def test_rejects_untrusted_host_with_benchmark_dns(monkeypatch):
 
     with pytest.raises(ValueError, match="resolves to internal IP"):
         url_safety.validate_url("https://untrusted.example.com/image.png")
+
+
+def test_allows_wechat_article_host_with_benchmark_dns(monkeypatch):
+    """公众号文章域名的 HTTPS 默认端口可兼容当前网络的基准网段映射。"""
+    from app.services import url_safety
+
+    monkeypatch.setattr(url_safety, "_resolve_dns", lambda host: ["198.18.0.12"])
+
+    url_safety.validate_url("https://mp.weixin.qq.com/s/example-article")
+
+
+def test_rejects_wechat_article_host_without_https(monkeypatch):
+    """微信域名的兼容例外不能降低协议要求。"""
+    from app.services import url_safety
+
+    monkeypatch.setattr(url_safety, "_resolve_dns", lambda host: ["198.18.0.12"])
+
+    with pytest.raises(ValueError, match="resolves to internal IP"):
+        url_safety.validate_url("http://mp.weixin.qq.com/s/example-article")
+
+
+def test_rejects_wechat_article_host_with_non_default_port(monkeypatch):
+    """微信域名的兼容例外不能放开非默认服务端口。"""
+    from app.services import url_safety
+
+    monkeypatch.setattr(url_safety, "_resolve_dns", lambda host: ["198.18.0.12"])
+
+    with pytest.raises(ValueError, match="resolves to internal IP"):
+        url_safety.validate_url("https://mp.weixin.qq.com:9443/s/example-article")

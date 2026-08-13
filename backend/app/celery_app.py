@@ -17,6 +17,27 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=True,
     worker_pool="solo",  # Windows compatibility
+    # 定时文章会占用 Worker 较长时间，单独路由到 scheduled 队列后由专用
+    # Worker 消费，避免图片生成阻塞普通队列和其他定时检查任务。
+    task_routes={
+        "app.tasks.scheduled_task_executor.execute_scheduled_article": {
+            "queue": "scheduled",
+        },
+    },
+    # 生产者与 Redis 的连接短暂抖动时，Celery 发布动作自动重试；数据库中的
+    # queued 记录仍是最终兜底，Beat 会在消息长期未被认领时再次补投。
+    task_publish_retry=True,
+    task_publish_retry_policy={
+        "max_retries": 5,
+        "interval_start": 0.5,
+        "interval_step": 1,
+        "interval_max": 5,
+    },
+    # 图片任务可能超过 Redis 默认的可见性时间。消息只有在 Worker 确认后才会
+    # 移除，延长可见性窗口可以避免正常长任务被 Redis 提前重复投递。
+    broker_transport_options={
+        "visibility_timeout": 2 * 60 * 60,
+    },
     # 定时文章通常包含多次外部 API 调用。延迟确认消息并在 Worker 丢失时让
     # Broker 重投，避免数据库已经写成 running 但 Celery 消息永久消失。
     task_acks_late=True,
@@ -38,6 +59,12 @@ celery_app.conf.update(
         "poll-queued-jobs-every-minute": {
             "task": "app.tasks.job_tasks.poll_queued_jobs",
             "schedule": 60.0,
+        },
+        # TaGeAI 状态回调采用 outbox；高频轻量轮询让 Gateway 无需等待分钟级补偿，失败仍由
+        # outbox 保存事件并进行有限指数退避。
+        "deliver-tageai-callback-outbox-every-15-seconds": {
+            "task": "app.tasks.job_tasks.deliver_tageai_callback_outbox",
+            "schedule": 15.0,
         },
         # Clean up old unused assets daily
         "cleanup-old-assets-daily": {

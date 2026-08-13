@@ -3,13 +3,50 @@
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
-from app.models.mysql_models import ContentJob, ContentVersion, Article, PublishAttempt
-from app.services.job_queue_service import process_job_batch, transition_job
+from app.models.mysql_models import Article, ContentJob, ContentVersion, PublishAttempt, TageAiPublishCandidate
+from app.services.job_queue_service import (
+    JobCancellationRequested,
+    claim_dispatched_job_for_execution,
+    claim_queued_job_for_dispatch,
+    process_job_batch,
+    raise_if_job_cancellation_requested,
+    recover_stale_dispatch_claims,
+    release_dispatch_claim,
+    transition_job,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class ContentGenerationFailed(RuntimeError):
+    """内容任务没有可投递正文时的受控失败。
+
+    该异常与模型网络异常不同：版本记录可能已经写入审计库，但正文为空时绝不能继续创建
+    草稿或自动批准任务。调用方需要将 ContentJob 收敛为明确失败，而不是让 Celery 重试时
+    产生重复投递副作用。
+    """
+
+
+def require_deliverable_versions(versions):
+    """验证本次生成的全部版本都具备可保存的正文。
+
+    生成流水线会保留失败版本用于审计。投递边界不能把这类空正文静默跳过后仍将整个任务
+    视为成功，否则 Gateway 会长期等待草稿终态。批量任务任一版本为空时统一失败，要求
+    调用方显式重试或人工处理，避免只投递部分文章却报告整批已完成。
+    """
+
+    invalid_versions = [
+        version for version in versions
+        if not isinstance(getattr(version, "body_markdown", None), str)
+        or not version.body_markdown.strip()
+    ]
+    if not versions or invalid_versions:
+        raise ContentGenerationFailed("文章生成失败，未得到可保存的正文")
+    return versions
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -25,25 +62,50 @@ def process_content_job(self, job_id: int):
         if not job:
             return {"error": f"Job {job_id} not found"}
 
-        if job.status != "queued":
-            return {"error": f"Job {job_id} is not in queued state (status={job.status})"}
+        if job.status in {"cancel_requested", "cancelled"}:
+            # 已排队但尚未取走的 Celery 消息仍可能启动。此时把取消请求确认成终态并返回
+            # 正常结果，而不是进入异常重试或把任务重新送回生成链路。
+            if job.status == "cancel_requested":
+                job.status = "cancelled"
+                db.commit()
+            return {"job_id": job_id, "status": "cancelled"}
 
-        # 非文章类型转派到对应处理任务
+        # 兼容历史调用方误把图片/视频 ID 投到文章 Worker。必须在领取前转发，让实际的
+        # 图片/视频 Worker 自己执行条件领取；否则这里先改成 generating 会使下游 Worker
+        # 误判任务已被执行而直接退出。
         ct = job.content_type or "article"
         if ct in ("image", "pure_image"):
             from app.tasks.content_tasks import process_image_job
             db.close()
             return process_image_job.delay(job_id)
-        elif ct == "video":
+        if ct == "video":
             from app.tasks.content_tasks import process_video_job
             db.close()
             return process_video_job.delay(job_id)
 
+        # Broker 重投、Worker 重启和历史入口都可能产生重复消息。只有成功执行条件更新的
+        # Worker 可以进入生成流程，其余副本读取当前事实后结束，绝不能再次调用模型或投递公众号。
+        job = claim_dispatched_job_for_execution(db, job_id)
+        if not job:
+            current = db.query(ContentJob).filter(ContentJob.id == job_id).first()
+            return {"job_id": job_id, "status": current.status if current else "missing", "ignored": True}
+
+        if job.content_type == "article_publish_existing":
+            # 正式发布不能再次进入模型生成流水线。候选在平台事务中已被唯一占用，这里
+            # 只读取它冻结的 ContentVersion/Article，并把真实微信投递结果写回同一篇文章。
+            return _publish_preview_candidate_article(db, job)
+
         # 文章类型：运行原有生成流水线
-        versions = process_job_batch(db, job)
+        versions = require_deliverable_versions(process_job_batch(db, job))
+
+        # 生成已经返回，但投递会触发真实草稿或发布副作用；取消优先在这里停止，不能
+        # 让已生成的正文穿过到发布器。
+        raise_if_job_cancellation_requested(db, job_id)
 
         # Create Article records from ContentVersions
         _save_versions_as_articles_and_drafts(db, job, versions)
+
+        raise_if_job_cancellation_requested(db, job_id)
 
         # Determine post-generation flow
         if job.approval_mode == "auto":
@@ -62,6 +124,33 @@ def process_content_job(self, job_id: int):
             "status": job.status,
         }
 
+    except ContentGenerationFailed as exc:
+        # ``process_job_batch`` 已可能提交失败版本作为审计记录；这里不能再抛给 Celery
+        # 自动重试，否则同一草稿请求会在缺少正文的情况下反复创建副作用。将任务标为
+        # FAILED 后由外部 Invocation 如实投影错误，等待用户显式决定后续操作。
+        db.rollback()
+        current_job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
+        if current_job:
+            current_job.status = "failed"
+            current_job.error_code = "CONTENT_GENERATION_FAILED"
+            current_job.error_message = str(exc)[:500]
+            db.commit()
+        logger.error("Job %d stopped before delivery: %s", job_id, exc)
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error_code": "CONTENT_GENERATION_FAILED",
+        }
+    except JobCancellationRequested:
+        # 取消不是失败。先回滚当前 Worker 尚未提交的版本、文章和投递尝试，再读取
+        # 持久化任务把 cancel_requested 确认成 cancelled，确保任何后续查询都看到终态。
+        db.rollback()
+        current_job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
+        if current_job and current_job.status in {"cancel_requested", "cancelled"}:
+            current_job.status = "cancelled"
+            db.commit()
+        logger.info("Job %d stopped after cancellation request", job_id)
+        return {"job_id": job_id, "status": "cancelled"}
     except Exception as exc:
         logger.error("Job %d processing failed: %s", job_id, exc)
         try:
@@ -75,9 +164,10 @@ def process_content_job(self, job_id: int):
 
 @celery_app.task
 def poll_queued_jobs():
-    """Beat task: Look for queued jobs and dispatch them to the proper worker by content_type."""
+    """Beat 以原子领取方式补投队列任务，避免多个 Beat 重复派发同一任务。"""
     db = MysqlSessionLocal()
     try:
+        recovered = recover_stale_dispatch_claims(db)
         jobs = (
             db.query(ContentJob)
             .filter(ContentJob.status == "queued")
@@ -85,20 +175,45 @@ def poll_queued_jobs():
             .limit(5)
             .all()
         )
+        dispatched = 0
         for job in jobs:
+            # ORM 查询只能得到候选，不能作为派发凭据。条件更新成功才代表当前 Beat 获得了
+            # 领取权；并发 Beat 会在这里自然分叉，避免向 Celery 发送重复消息。
+            claimed = claim_queued_job_for_dispatch(db, job.id)
+            if not claimed:
+                continue
             ct = job.content_type or "article"
-            if ct in ("image", "pure_image"):
-                from app.tasks.content_tasks import process_image_job
-                process_image_job.delay(job.id)
-            elif ct == "video":
-                from app.tasks.content_tasks import process_video_job
-                process_video_job.delay(job.id)
-            else:
-                process_content_job.delay(job.id)
-            logger.info("Dispatched job %d (%s) to worker", job.id, ct)
-        return {"dispatched": len(jobs)}
+            try:
+                if ct in ("image", "pure_image"):
+                    from app.tasks.content_tasks import process_image_job
+                    process_image_job.delay(job.id)
+                elif ct == "video":
+                    from app.tasks.content_tasks import process_video_job
+                    process_video_job.delay(job.id)
+                else:
+                    process_content_job.delay(job.id)
+                dispatched += 1
+                logger.info("Dispatched claimed job %d (%s) to worker", job.id, ct)
+            except Exception:
+                # Broker 发布失败时释放仍未被 Worker 领取的状态；若消息其实已经抵达且 Worker
+                # 已切到 generating，条件释放会返回 False 而不会覆盖真实执行状态。
+                release_dispatch_claim(db, job.id)
+                logger.exception("Failed to dispatch claimed job %d (%s)", job.id, ct)
+        return {"dispatched": dispatched, "recovered": recovered}
     finally:
         db.close()
+
+
+@celery_app.task
+def deliver_tageai_callback_outbox():
+    """根据真实任务状态生成并投递 TaGeAI 回调，失败事件由 outbox 有限重试。"""
+
+    from app.integrations.tageai.callback_delivery import deliver_due_callback_events
+    from app.integrations.tageai.service import enqueue_current_callback_snapshots
+
+    snapshots_created = enqueue_current_callback_snapshots()
+    delivery = deliver_due_callback_events()
+    return {"snapshots_created": snapshots_created, **delivery}
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
@@ -214,6 +329,9 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
     publish_mode = config.get("publish_mode", "draft")
 
     for v in versions:
+        # 投递前必须读取最新取消标志。文章对象即使已经创建，也不能继续调用草稿箱或
+        # 直接发布 API；外层 Worker 会回滚本次未提交对象并确认取消终态。
+        raise_if_job_cancellation_requested(db, job.id)
         if not v.body_markdown:
             logger.warning("ContentVersion %d has no body, skipping article creation", v.id)
             continue
@@ -264,15 +382,25 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
             content=body,
             full_content=body,
             cover_image=cover_url,
-            status="draft_saved",
-            phase="DRAFT_SAVED",
+            # 正文已经生成不等于已投递；只有发布器返回可验证结果后才能进入草稿或
+            # 发布状态，避免异常分支把未保存文章伪装成草稿成功。
+            status="generated",
+            phase="CONTENT_GENERATED",
         )
         db.add(article)
         db.flush()
         v.article_id = article.id
 
+        if publish_mode == "preview":
+            # 预览只负责把可读文章和不可变版本落库。不能创建 PublishAttempt，也不能调用
+            # 草稿或正式发布 API，否则用户看到预览前就已经产生了公众号侧副作用。
+            continue
+
         # Create PublishAttempt for each account
         for aid in account_ids:
+            # 多账号投递时每个账号都重新检查，避免第一个投递期间产生的取消请求继续
+            # 落到后续公众号账号。
+            raise_if_job_cancellation_requested(db, job.id)
             attempt = PublishAttempt(
                 tenant_id=job.tenant_id,
                 job_id=job.id,
@@ -301,41 +429,113 @@ def _save_versions_as_articles_and_drafts(db, job: ContentJob, versions):
                         "publish_mode": publish_mode,
                     }
                     pub_result = adapter.publish(db, article_data, aid, tenant_id=job.tenant_id)
-                    media_id = pub_result.get("media_id", "")
-                    if media_id:
-                        article.publish_id = str(media_id)
-                        attempt.platform_media_id = str(media_id)
-                    attempt.status = "success"
                 elif publish_mode == "direct":
                     from app.services.wechat_publisher import publish_article
                     pub_result = publish_article(db, article, aid, mode="direct", tenant_id=job.tenant_id, actor_id=job.created_by or 0)
-                    logger.info("Article %d published directly to account %s, publish_id=%s",
-                                article.id, aid, pub_result.get("publish_id", ""))
-                    article.status = "publishing"
-                    article.phase = "PUBLISHING"
-                    if pub_result.get("publish_id"):
-                        article.publish_id = str(pub_result["publish_id"])
-                    elif pub_result.get("media_id"):
-                        article.publish_id = str(pub_result["media_id"])
-                    attempt.status = "publishing"
-                    attempt.platform_media_id = article.publish_id
                 else:
                     from app.services.wechat_publisher import save_article_as_draft
                     draft_result = save_article_as_draft(db, article, aid, tenant_id=job.tenant_id, actor_id=job.created_by or 0)
-                    media_id = draft_result.get("media_id", "")
-                    logger.info("Article %d saved as WeChat draft via account %s, media_id=%s",
-                                article.id, aid, media_id)
-                    if media_id:
-                        article.publish_id = str(media_id)
-                        attempt.platform_media_id = str(media_id)
-                    attempt.status = "success"
+                    pub_result = draft_result
+
+                from app.services.publish_delivery_state_service import (
+                    apply_publish_delivery_outcome,
+                    resolve_publish_delivery_outcome,
+                )
+
+                outcome = resolve_publish_delivery_outcome(publish_mode, pub_result)
+                apply_publish_delivery_outcome(article, attempt, outcome)
+                logger.info(
+                    "Article %d delivery finished for account %s: article_status=%s phase=%s",
+                    article.id,
+                    aid,
+                    outcome.article_status,
+                    outcome.article_phase,
+                )
             except Exception as pub_err:
                 logger.warning("Publish to account %s for article %d failed: %s", aid, article.id, pub_err)
-                attempt.status = "failed"
-                attempt.error_message = str(pub_err)[:500]
-                article.error_message = str(pub_err)[:500]
+                from app.services.publish_delivery_state_service import (
+                    apply_publish_delivery_outcome,
+                    failure_publish_delivery_outcome,
+                )
+
+                outcome = failure_publish_delivery_outcome(publish_mode, str(pub_err)[:500])
+                apply_publish_delivery_outcome(article, attempt, outcome)
 
         db.commit()
+
+
+def _publish_preview_candidate_article(db, job: ContentJob):
+    """将已被用户确认的预览版本正式投递到其原始公众号。
+
+    函数不接受正文、主题或账号列表，所有业务事实都来自创建发布任务时冻结的候选。这样
+    即使桌面端或模型在确认后携带了不同参数，也无法改变实际发布的文章版本或目标账号。
+    """
+
+    config = job.generation_config or {}
+    candidate_id = str(config.get("tageai_publish_candidate_id") or "").strip()
+    if not candidate_id:
+        raise ContentGenerationFailed("正式发布任务缺少预览候选")
+    candidate = db.query(TageAiPublishCandidate).filter(
+        TageAiPublishCandidate.candidate_id == candidate_id,
+        TageAiPublishCandidate.tenant_id == job.tenant_id,
+    ).first()
+    if candidate is None or candidate.status not in {"RESERVED", "PUBLISHING"}:
+        raise ContentGenerationFailed("发布候选已失效或未被确认")
+    if candidate.account_id != job.account_id:
+        raise ContentGenerationFailed("发布候选与任务公众号不匹配")
+
+    version = db.query(ContentVersion).filter(
+        ContentVersion.id == candidate.source_content_version_id,
+        ContentVersion.tenant_id == job.tenant_id,
+        ContentVersion.article_id == candidate.article_id,
+    ).first()
+    article = db.query(Article).filter(
+        Article.id == candidate.article_id,
+        Article.tenant_id == job.tenant_id,
+    ).first()
+    if version is None or article is None or not str(article.content or "").strip():
+        raise ContentGenerationFailed("发布候选关联的预览文章不可用")
+
+    attempt = PublishAttempt(
+        tenant_id=job.tenant_id,
+        job_id=job.id,
+        account_id=job.account_id,
+        idempotency_key=f"tageai-candidate-{candidate.id}",
+        mode="direct",
+        status="pending",
+    )
+    db.add(attempt)
+    db.flush()
+    candidate.status = "PUBLISHING"
+    try:
+        from app.services.publish_delivery_state_service import apply_publish_delivery_outcome, resolve_publish_delivery_outcome
+        from app.services.wechat_publisher import publish_article
+
+        result = publish_article(
+            db,
+            article,
+            job.account_id,
+            mode="direct",
+            tenant_id=job.tenant_id,
+            actor_id=job.created_by or 0,
+        )
+        outcome = resolve_publish_delivery_outcome("direct", result)
+        apply_publish_delivery_outcome(article, attempt, outcome)
+        candidate.status = "PUBLISHED" if outcome.article_status == "published" else "PUBLISHING"
+        transition_job(db, job.id, "approve")
+        db.commit()
+        return {"job_id": job.id, "status": job.status, "article_id": article.id}
+    except Exception as exc:
+        from app.services.publish_delivery_state_service import apply_publish_delivery_outcome, failure_publish_delivery_outcome
+
+        outcome = failure_publish_delivery_outcome("direct", str(exc)[:500])
+        apply_publish_delivery_outcome(article, attempt, outcome)
+        candidate.status = "FAILED"
+        job.status = "failed"
+        job.error_code = "PUBLISH_SUBMISSION_FAILED"
+        job.error_message = str(exc)[:500]
+        db.commit()
+        return {"job_id": job.id, "status": "failed", "error_code": job.error_code}
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=30)
@@ -345,14 +545,63 @@ def poll_publishing_articles(self):
     try:
         from app.services.wechat_gateway_policy import is_wechat_relay_enabled
         if is_wechat_relay_enabled():
-            logger.info("Skip publish polling: relay mode requires relay freepublish/get endpoint")
+            from app.config import settings
+            from app.services.publish_delivery_state_service import expire_unresolved_relay_publish
+
+            relay_articles = (
+                db.query(Article)
+                .filter(
+                    Article.status == "publishing",
+                    Article.phase == "RELAY_PUBLISHING",
+                )
+                .all()
+            )
+            failed_unresolved = 0
+            now = datetime.now(timezone.utc)
+            for article in relay_articles:
+                # Article 不直接保存 ContentJob 外键，必须经 ContentVersion 反查任务。
+                # 不能使用 article.task_id：它是展示用的字符串而不是 content_jobs.id。
+                version = (
+                    db.query(ContentVersion)
+                    .filter(
+                        ContentVersion.tenant_id == article.tenant_id,
+                        ContentVersion.article_id == article.id,
+                    )
+                    .order_by(ContentVersion.id.desc())
+                    .first()
+                )
+                attempts = []
+                if version:
+                    attempts = (
+                        db.query(PublishAttempt)
+                        .filter(
+                            PublishAttempt.tenant_id == article.tenant_id,
+                            PublishAttempt.job_id == version.job_id,
+                        )
+                        .all()
+                    )
+                if expire_unresolved_relay_publish(
+                    article,
+                    attempts,
+                    now=now,
+                    timeout_seconds=settings.wechat_relay_publish_status_timeout_seconds,
+                ):
+                    failed_unresolved += 1
+            if failed_unresolved:
+                db.commit()
+                logger.warning(
+                    "Relay publish status unavailable for %d article(s); marked as failed for manual verification",
+                    failed_unresolved,
+                )
             return {
-                "polled": 0,
-                "skipped": True,
-                "reason": "relay mode requires relay freepublish/get endpoint",
+                "polled": len(relay_articles),
+                "failed_unresolved": failed_unresolved,
+                "reason": "relay mode has no final publish-status endpoint",
             }
 
-        from app.models.mysql_models import Article, AccountCredential, WeChatAccount
+        # Article 已在模块级导入；这里仅补充直连轮询专属的账号与凭据模型，避免
+        # 局部导入遮蔽 relay 分支提前使用的 Article 名称。
+        from app.models.mysql_models import AccountCredential, WeChatAccount
 
         articles = (
             db.query(Article)

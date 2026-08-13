@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Date, Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint, func, Float
+from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Date, Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint, func, Float
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import relationship
 from app.database import MysqlBase
@@ -124,6 +124,11 @@ class Article(MysqlBase):
     footer_template = Column(Text, nullable=True)
     msg_data_id = Column(String(128), nullable=True, comment="微信发布后返回的 msg_data_id")
     publish_id = Column(String(128), nullable=True, comment="微信发布任务 ID")
+    publish_domain = Column(
+        String(32),
+        nullable=True,
+        comment="实际交付域：public=公域，private=私域；历史文章为空",
+    )
     status = Column(String(64), nullable=False, default="pending")
     phase = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
@@ -334,6 +339,136 @@ class ContentJob(MysqlBase):
     )
 
 
+class TageAiIntegrationInvocation(MysqlBase):
+    """TaGeAI 服务间调用的持久化关联记录。
+
+    该表不复制文章正文或公众号凭据，只保存 Gateway 调用身份、受控输入摘要和内部
+    ContentJob 的关联。状态对外展示时应以 ContentJob、Article、PublishAttempt 的真实事实
+    为准；本表中的状态字段只承担接收回调和故障诊断的持久化投影职责。
+    """
+
+    __tablename__ = "tageai_integration_invocations"
+
+    # 该表已在生产及本地联调库中使用 BIGINT 主键，关联表必须保持同一类型才能创建外键。
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    invocation_id = Column(String(128), nullable=False, unique=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    # 服务端验签后得到的连接绑定。它与 tenant_id 一起冻结，避免后续配置变更导致历史
+    # 调用无法追溯到原始服务账号或被错误归入其他企业。
+    tenant_binding_id = Column(String(128), nullable=False)
+    content_job_id = Column(Integer, ForeignKey("content_jobs.id"), nullable=False, unique=True)
+    operation = Column(String(32), nullable=False)
+    delivery_mode = Column(String(32), nullable=False)
+    target_account_ref = Column(String(255), nullable=True)
+    execution_id = Column(String(128), nullable=False, index=True)
+    input_data = Column(JSON, nullable=False)
+    # Idempotency-Key 与规范化载荷摘要必须成对保存：相同键相同摘要可安全重放，不同摘要
+    # 必须拒绝，不能把“生成 A”错误复用成“发布 B”。
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    external_job_id = Column(String(128), nullable=False, unique=True)
+    status = Column(String(64), nullable=False, default="ACCEPTED")
+    phase = Column(String(64), nullable=False, default="QUEUED")
+    progress = Column(Integer, nullable=False, default=0)
+    result_data = Column(JSON, nullable=True)
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    retryable = Column(Boolean, nullable=False, default=False)
+    callback_event_ids = Column(JSON, nullable=False, default=list)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_tageai_invocation_tenant_status", "tenant_id", "status"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_tageai_invocation_tenant_idempotency"),
+    )
+
+
+class TageAiIntegrationCallbackEvent(MysqlBase):
+    """TaGeAI 回调事件去重事实表。
+
+    回调事件可能因 HTTP 超时或平台重试被多次发送。独立表使用数据库唯一约束保存 event_id，
+    不再依赖 Invocation 上有长度上限的 JSON 数组，重启和并发 Worker 下仍可稳定幂等。
+    """
+
+    __tablename__ = "tageai_integration_callback_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    invocation_id = Column(Integer, ForeignKey("tageai_integration_invocations.id"), nullable=False, index=True)
+    event_id = Column(String(128), nullable=False, unique=True)
+    payload_hash = Column(String(64), nullable=False)
+    received_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("invocation_id", "event_id", name="uq_tageai_callback_invocation_event"),
+        Index("ix_tageai_callback_event_tenant_received", "tenant_id", "received_at"),
+    )
+
+
+class TageAiIntegrationCallbackOutbox(MysqlBase):
+    """待投递到 TaGeAI Gateway 的状态回调 outbox。
+
+    内容任务、公众号投递与 HTTP 回调处在不同进程和故障域中。状态快照先与 Invocation
+    同事务写入本表，Celery 再异步签名投递；即使 Gateway 暂时不可达也不会丢失完成、失败
+    或取消事实，后续可重试并由 Gateway 的轮询补偿共同收敛。
+    """
+
+    __tablename__ = "tageai_integration_callback_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    invocation_id = Column(Integer, ForeignKey("tageai_integration_invocations.id"), nullable=False, index=True)
+    event_id = Column(String(128), nullable=False, unique=True)
+    snapshot_hash = Column(String(64), nullable=False)
+    payload = Column(JSON, nullable=False)
+    status = Column(String(32), nullable=False, default="PENDING")
+    attempt_count = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    last_error = Column(Text, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("invocation_id", "snapshot_hash", name="uq_tageai_callback_outbox_snapshot"),
+        Index("ix_tageai_callback_outbox_due", "status", "next_attempt_at"),
+    )
+
+
+class TageAiPublishCandidate(MysqlBase):
+    """已生成文章的一次性正式发布候选。
+
+    候选由预览调用在文章和内容版本真实落库后创建，发布调用只能引用这条记录而不能
+    重新提交主题生成。该表把“用户确认的是哪一版文章”持久化为可审计事实，同时通过
+    租户、公众号、版本、过期时间和状态五个边界阻断跨账号、跨租户或重复发布。
+    """
+
+    __tablename__ = "tageai_publish_candidates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    candidate_id = Column(String(96), nullable=False, unique=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    # 与 TageAiIntegrationInvocation.id 保持 BIGINT 一致，避免 MySQL 拒绝创建候选表外键。
+    source_invocation_id = Column(BigInteger, ForeignKey("tageai_integration_invocations.id"), nullable=False, unique=True)
+    source_content_job_id = Column(Integer, ForeignKey("content_jobs.id"), nullable=False)
+    source_content_version_id = Column(Integer, ForeignKey("content_versions.id"), nullable=False)
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=False)
+    account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=False)
+    target_account_ref = Column(String(255), nullable=False)
+    status = Column(String(32), nullable=False, default="READY")
+    expires_at = Column(DateTime, nullable=False, index=True)
+    publish_invocation_id = Column(String(128), nullable=True, unique=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_tageai_publish_candidate_tenant_status", "tenant_id", "status"),
+    )
+
+
 class ContentVersion(MysqlBase):
     __tablename__ = "content_versions"
 
@@ -486,6 +621,38 @@ class FeedSourceArticle(MysqlBase):
     __table_args__ = (
         Index("ix_feed_articles_source", "feed_source_id"),
         Index("ix_feed_articles_tenant", "tenant_id"),
+    )
+
+
+class ArticleFormatProfile(MysqlBase):
+    """从投喂文章一次性提取的可复用发布格式模板。
+
+    模板与投喂文章分表保存，避免把分析结果混入文章 ``analysis`` 字段后被风格分析、
+    抓取更新覆盖。任务仅引用不可变版本；更新模板会创建新版本，已运行任务不变。
+    """
+
+    __tablename__ = "article_format_profiles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    source_article_id = Column(
+        Integer,
+        ForeignKey("feed_source_articles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    name = Column(String(255), nullable=False)
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    # html_slots=按原 DOM 回填；poster_gallery=连续图片流，新增格式仅需扩展渲染器。
+    render_mode = Column(String(32), nullable=False)
+    template_payload = Column(JSON, nullable=False)
+    title_policy = Column(JSON, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_article_format_profiles_tenant", "tenant_id"),
+        Index("ix_article_format_profiles_article", "source_article_id"),
     )
 
 
@@ -827,6 +994,39 @@ class ScheduledTask(MysqlBase):
     feed_source_ids = Column(JSON, nullable=True)
     feed_source_id = Column(Integer, ForeignKey("feed_sources.id"), nullable=True, comment="具体选中的投喂源（用于选文章）")
     feed_article_ids = Column(JSON, nullable=True, comment="选中投喂源中的具体文章 ID 列表")
+    # 未绑定格式模板时完整保留历史执行路径。自动模式只在新建任务开启，历史正式
+    # 任务由迁移开关保护，因此不会改变已经上线的 ERP 仿写任务。
+    format_profile_id = Column(
+        Integer,
+        ForeignKey("article_format_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="任务显式绑定的投喂文章格式模板版本",
+    )
+    # 历史任务由迁移脚本设为 False；新建任务显式设为 True。不能仅凭
+    # format_profile_id 是否为空判断是否允许自动切换，否则正式 ERP 任务会被污染。
+    format_profile_auto_bind_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="0",
+        comment="是否允许投喂源自动绑定格式模板，新任务开启，历史任务关闭",
+    )
+    # 模板轮换仅对明确启用的任务生效。空值保持现有单模板路径，避免历史任务因
+    # 模型字段新增而改变输出。JSON 内保存顺序、轮换依据和连续使用次数。
+    template_rotation_config = Column(
+        JSON,
+        nullable=True,
+        comment="来源模板轮换配置；为空时禁用轮换",
+    )
+    # 每次轮换配置改变时递增。运行记录冻结该版本，防止修改列表顺序后影响已排队
+    # 或正在重试的时段；默认零对历史任务保持无轮换语义。
+    template_rotation_version = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="来源模板轮换配置版本",
+    )
 
     # 知识库
     knowledge_base_ids = Column(JSON, nullable=True)
@@ -855,12 +1055,31 @@ class ScheduledTask(MysqlBase):
     account_id = Column(Integer, ForeignKey("wechat_accounts.id"), nullable=True)
     account_ids = Column(JSON, nullable=True, comment="多选公众号 ID 列表，优先级高于 account_id")
     publish_mode = Column(String(32), default="draft", comment="draft=存草稿箱, direct=直接发布")
+    publish_domain = Column(
+        String(32),
+        nullable=False,
+        default="public",
+        server_default="public",
+        comment="direct 发布域：public=公域，private=私域",
+    )
     image_source = Column(String(64), default="dashscope", comment="图片来源: dashscope/local")
     footer_template = Column(Text, nullable=True)
     content_type = Column(String(32), default="article", comment="article/image/video")
+    # 版式必须是任务级显式配置。standard 保持历史任务行为，只有用户明确选择
+    # seamless_poster 时才允许知识库中的纯海报规则切换生成链路。
+    layout_mode = Column(
+        String(32),
+        nullable=False,
+        default="standard",
+        server_default="standard",
+        comment="文章版式: standard=历史默认, seamless_poster=无缝海报",
+    )
     # 配图方式列表（JSON 数组）
     enabled_image_methods = Column(JSON, nullable=True, comment="配图方式列表")
     enable_watermark = Column(Boolean, default=False, comment="是否启用图片水印")
+    # 任务明确保存时的水印快照。为空表示继续沿用租户全局配置；非空时即使
+    # enabled=false 也必须覆盖全局配置，避免任务之间互相污染。
+    watermark_config = Column(JSON, nullable=True, comment="任务级水印配置快照")
     # ERP 分类配图策略。使用 JSON 是为了让旧任务保持兼容，并允许后续扩展筛选条件。
     erp_image_config = Column(JSON, nullable=True, comment="ERP 分类随机配图与防重配置")
 
@@ -906,6 +1125,26 @@ class ScheduledTaskRun(MysqlBase):
     task_id = Column(Integer, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     scheduled_date = Column(Date, nullable=False)
     scheduled_time = Column(String(5), nullable=False)
+    publish_domain = Column(
+        String(32),
+        nullable=False,
+        default="public",
+        server_default="public",
+        comment="本次时段锁定的发布域：public=公域，private=私域",
+    )
+    # 时段创建时冻结实际格式模板。轮换任务的重试必须复用这个 ID，不能按任务
+    # 当前配置重新计算，否则列表编辑、Worker 重启或并发排队都会打乱轮换顺序。
+    format_profile_id = Column(
+        Integer,
+        ForeignKey("article_format_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="本次时段冻结的来源格式模板；为空时沿用任务模板",
+    )
+    template_rotation_version = Column(
+        Integer,
+        nullable=True,
+        comment="创建本次时段时使用的模板轮换配置版本",
+    )
     status = Column(
         String(32),
         nullable=False,
@@ -956,10 +1195,16 @@ class ScheduledTaskErpImageUsage(MysqlBase):
     asset_id = Column(Integer, ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
     erp_image_url = Column(String(2048), nullable=False)
     product_name = Column(String(255), nullable=False)
+    selection_scope = Column(
+        String(128),
+        nullable=True,
+        comment="ERP 防重范围；为空时兼容旧任务按 task_id 防重",
+    )
     used_at = Column(DateTime, server_default=func.now(), nullable=False)
 
     __table_args__ = (
         Index("ix_scheduled_task_erp_image_window", "task_id", "used_at"),
+        Index("ix_scheduled_erp_image_scope_window", "selection_scope", "used_at"),
     )
 
 

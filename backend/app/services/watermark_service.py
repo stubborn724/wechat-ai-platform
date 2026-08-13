@@ -25,6 +25,8 @@ class WatermarkService:
         image_data: bytes,
         watermark_config: dict,
         content_type: str = "image/jpeg",
+        *,
+        required: bool = False,
     ) -> bytes:
         """对图片叠加水印，返回处理后的图片字节。
 
@@ -33,12 +35,15 @@ class WatermarkService:
                    "position": "bottom-right", "opacity": 0.5, "scale": 0.15}
           - text: {"type": "text", "content": "xxx", "font_size": 24,
                    "color": "#FFFFFF", "position": "bottom-right"}
+        ``required`` 仅由已锁定水印快照的定时发布链路使用。普通素材库的历史
+        配置仍允许 Logo 临时不可用时保留原图；但定时任务已经明确承诺水印时，
+        必须抛出异常阻止无标识图片继续发布。
         """
         mode = watermark_config.get("type", "logo")
         img = Image.open(io.BytesIO(image_data)).convert("RGBA")
 
         if mode == "logo":
-            img = self._apply_logo_watermark(img, watermark_config)
+            img = self._apply_logo_watermark(img, watermark_config, required=required)
         elif mode == "text":
             img = self._apply_text_watermark(img, watermark_config)
 
@@ -55,13 +60,17 @@ class WatermarkService:
         self,
         img: Image.Image,
         config: dict,
+        *,
+        required: bool = False,
     ) -> Image.Image:
-        """叠加 Logo 图片水印"""
+        """叠加 Logo 图片水印，并按调用方要求决定是否允许降级。"""
         from app.services.storage_service import storage_service
 
         image_key = config.get("image_key", "")
         if not image_key:
             logger.warning("Logo watermark: no image_key configured")
+            if required:
+                raise ValueError("必需 Logo 水印缺少 image_key")
             return img
 
         # 从缓存或 MinIO 加载 Logo
@@ -73,6 +82,8 @@ class WatermarkService:
                 self._logo_cache[image_key] = logo
             except Exception as exc:
                 logger.warning("Failed to load logo image '%s': %s", image_key, exc)
+                if required:
+                    raise RuntimeError(f"必需 Logo 水印加载失败: {image_key}") from exc
                 return img
 
         # 缩放 Logo 到图片尺寸的 scale 比例

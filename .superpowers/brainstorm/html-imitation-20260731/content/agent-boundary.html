@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>HTML 版式仿写的 Agent 边界</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px; background: #f6f7f8; color: #1d232a; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    main { max-width: 1120px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .intro { margin: 0 0 28px; color: #5b6570; }
+    .flow { display: grid; grid-template-columns: 1fr 52px 1fr 52px 1fr; align-items: stretch; gap: 10px; }
+    .box { border: 1px solid #d7dde3; border-radius: 8px; background: #fff; padding: 20px; min-height: 310px; }
+    .box h2 { margin: 0 0 16px; font-size: 19px; }
+    .keep { border-top: 4px solid #0f766e; }
+    .new { border-top: 4px solid #b45309; }
+    .program { border-top: 4px solid #2563eb; }
+    .arrow { display: flex; align-items: center; justify-content: center; color: #8b96a3; font-size: 30px; }
+    .item { margin: 10px 0; padding: 10px 12px; border-radius: 5px; background: #f2f5f7; }
+    .item strong { display: block; font-size: 14px; }
+    .item span { display: block; margin-top: 3px; font-size: 13px; color: #59636f; }
+    .warn { background: #fff7ed; }
+    .good { background: #ecfdf5; }
+    .summary { margin-top: 26px; padding: 18px 20px; border-left: 4px solid #0f766e; background: #ecfdf5; }
+    .summary strong { font-size: 17px; }
+    @media (max-width: 780px) { body { padding: 18px; } .flow { grid-template-columns: 1fr; } .arrow { transform: rotate(90deg); min-height: 32px; } .box { min-height: 0; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>HTML 版式仿写：复用内容分析，新增确定性版式解析</h1>
+    <p class="intro">同一个 Agent 负责理解文章“怎么写”；程序负责保留页面“怎么排”。版式变化不等于要新增一个 Agent。</p>
+    <div class="flow">
+      <section class="box keep">
+        <h2>保留：原有结构分析 Agent</h2>
+        <div class="item"><strong>输入</strong><span>Markdown / 纯文本</span></div>
+        <div class="item"><strong>输出</strong><span>标题模式、开头钩子、段落节奏、内容章节、语气</span></div>
+        <div class="item good"><strong>职责稳定</strong><span>无论科技、家居、商业文章，都分析内容组织规律</span></div>
+      </section>
+      <div class="arrow">→</div>
+      <section class="box program">
+        <h2>新增：HTML 版式蓝图服务</h2>
+        <div class="item"><strong>输入</strong><span>抓取到的 body_html</span></div>
+        <div class="item"><strong>输出</strong><span>不可变 DOM 模板 + 文本槽位 + 图片槽位</span></div>
+        <div class="item good"><strong>不依赖样式种类</strong><span>边框卡片、角标、黑底小标题、留白、字体和图片位置都原样保留</span></div>
+      </section>
+      <div class="arrow">→</div>
+      <section class="box new">
+        <h2>避免：每种版式一个 Agent</h2>
+        <div class="item warn"><strong>问题</strong><span>“豪宅卡片 Agent”“黑色章节标题 Agent”会随样式数量无限膨胀</span></div>
+        <div class="item warn"><strong>后果</strong><span>提示词、路由、测试和发布链路重复维护，且新样式总会漏掉</span></div>
+        <div class="item"><strong>正确扩展点</strong><span>必要时增强通用槽位识别规则，而不是按视觉风格分叉</span></div>
+      </section>
+    </div>
+    <div class="summary"><strong>建议方案：</strong>保留现有格式分析 Agent，给它增加可选的 <code>layout_profile</code> 摘要；真正的 HTML 样式复刻由通用 DOM 蓝图服务完成。原有文章仍走现有 Markdown 仿写路径，因此不会被破坏。</div>
+  </main>
+</body>
+</html>

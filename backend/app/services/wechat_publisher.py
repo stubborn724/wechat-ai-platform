@@ -17,6 +17,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.encryption_service import derive_key, decrypt_secret
+from app.services.publish_domain_policy import (
+    PRIVATE_PUBLISH_DOMAIN,
+    normalize_publish_domain,
+)
 from app.services.url_safety import validate_url
 
 from app.models.mysql_models import Article, AccountCredential, WeChatAccount
@@ -610,6 +614,7 @@ def _build_relay_publish_request_id(
     account_id: int,
     article_id: int,
     mode: str,
+    publish_domain: str = "public",
     html: str,
     cover_image_url: str,
 ) -> str:
@@ -625,11 +630,13 @@ def _build_relay_publish_request_id(
         separators=(",", ":"),
     ).encode("utf-8")
     body_digest = hashlib.sha256(digest_source).hexdigest()[:16]
-    return f"article-{tenant_id}-{account_id}-{article_id}-{mode}-{body_digest}"
+    domain = normalize_publish_domain(publish_domain)
+    return f"article-{tenant_id}-{account_id}-{article_id}-{mode}-{domain}-{body_digest}"
 
 
 def _publish_article_via_relay(db: Session, article: Article, account_id: int,
-                               mode: str, tenant_id: int, actor_id: int) -> dict:
+                               mode: str, tenant_id: int, actor_id: int,
+                               publish_domain: str = "public") -> dict:
     """通过固定 IP 中转站发布文章。
 
     中转站负责访问微信官方 API，因此本机后端不会再触发微信 IP 白名单校验。
@@ -641,6 +648,7 @@ def _publish_article_via_relay(db: Session, article: Article, account_id: int,
     from app.services.wechat_relay_image_service import WeChatRelayImageService
 
     require_relay_publish_config()
+    normalized_domain = normalize_publish_domain(publish_domain)
     publisher = _get_publisher_for_account(
         db, account_id, tenant_id, actor_id=actor_id,
     )
@@ -674,6 +682,7 @@ def _publish_article_via_relay(db: Session, article: Article, account_id: int,
             account_id=account_id,
             article_id=article.id,
             mode=mode,
+            publish_domain=normalized_domain,
             html=prepared_images.html,
             cover_image_url=prepared_images.cover_image_url,
         )
@@ -688,6 +697,7 @@ def _publish_article_via_relay(db: Session, article: Article, account_id: int,
             request_id=request_id,
             tenant_id=str(tenant_id) if tenant_id else None,
             publish_mode=mode,
+            publish_domain=normalized_domain,
             confirm_publish=(mode == "direct"),
             title=title.strip()[:64],
             digest=(summary or "").strip()[:120],
@@ -704,7 +714,8 @@ def _publish_article_via_relay(db: Session, article: Article, account_id: int,
 
 def publish_article(db: Session, article: Article, account_id: int,
                     mode: str = "draft", tenant_id: int = 0,
-                    actor_id: int = 0) -> dict:
+                    actor_id: int = 0,
+                    publish_domain: str = "public") -> dict:
     """发布文章到微信公众号
 
     Args:
@@ -712,11 +723,13 @@ def publish_article(db: Session, article: Article, account_id: int,
         article: 文章对象
         account_id: 公众号 ID
         mode: 发布模式 — "draft" 保存草稿箱, "direct" 直接发布
+        publish_domain: 交付域 — "public" 公域发布, "private" 私域粉丝群发
         actor_id: 操作者用户 ID（用于审计日志）
 
     Returns:
         包含发布结果的 dict
     """
+    normalized_domain = normalize_publish_domain(publish_domain)
     if tenant_id == 0:
         tenant_id = article.tenant_id or 0
     from app.services.wechat_gateway_policy import is_wechat_relay_enabled
@@ -724,7 +737,13 @@ def publish_article(db: Session, article: Article, account_id: int,
         return _publish_article_via_relay(
             db, article, account_id, mode=mode,
             tenant_id=tenant_id, actor_id=actor_id,
+            publish_domain=normalized_domain,
         )
+
+    # 老的本机直连通道没有粉丝群发协议。私域请求不能静默降级为公域，
+    # 否则用户选择的交付范围会被改变；启用中转站后才允许执行私域群发。
+    if mode == "direct" and normalized_domain == PRIVATE_PUBLISH_DOMAIN:
+        raise RuntimeError("私域发布必须启用微信中转站通道")
 
     publisher = _get_publisher_for_account(db, account_id, tenant_id, actor_id=actor_id)
     content = article.full_content or article.content or ""

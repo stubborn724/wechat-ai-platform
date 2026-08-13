@@ -9,7 +9,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +28,42 @@ def test_build_article_image_attribution_uses_single_normalized_brand_contact():
     )
 
     assert attribution.lines == ("绣蔓家具 TEL:18682130473",)
+
+
+def test_article_attribution_font_size_is_small_enough_for_1024px_images():
+    """1024px 文章图的动态水印应控制在约 3% 比例，不能再按 6% 放大。"""
+    from app.services.article_publication_polish_service import (
+        calculate_article_attribution_font_size,
+    )
+
+    font_size = calculate_article_attribution_font_size(1024)
+
+    assert 24 <= font_size <= 36
+    assert font_size < 1024 * 0.04
+
+
+def test_article_attribution_accepts_fixed_24px_font_for_scheduled_images():
+    """定时 ERP 图片使用固定画布时，水印字号必须可以明确锁定为 24px。"""
+    from app.services.article_publication_polish_service import (
+        apply_article_image_attribution_to_bytes,
+        build_article_image_attribution,
+    )
+
+    original_image = Image.new("RGB", (1024, 1365), "#d9d9d9")
+    original_buffer = BytesIO()
+    original_image.save(original_buffer, format="PNG")
+
+    attributed_bytes = apply_article_image_attribution_to_bytes(
+        original_buffer.getvalue(),
+        attribution=build_article_image_attribution(
+            product_name="异形茶几",
+            brand_contact="绣蔓家具TEL:18682130473",
+        ),
+        content_type="image/png",
+        font_size=24,
+    )
+
+    assert attributed_bytes
 
 
 def test_apply_article_image_attribution_places_single_line_at_bottom_right_without_footer_band():
@@ -62,6 +98,97 @@ def test_apply_article_image_attribution_places_single_line_at_bottom_right_with
         for x in range(400, 640)
         for y in range(400, 480)
     )
+
+
+def test_apply_article_image_attribution_supports_task_snapshot_bottom_left_position():
+    """任务级水印位置必须生效，不能把所有新公众号都固定到右下角。"""
+    from app.services.article_publication_polish_service import (
+        ArticleImageAttribution,
+        apply_article_image_attribution_to_bytes,
+    )
+
+    background = (217, 217, 217)
+    original_image = Image.new("RGB", (1024, 768), background)
+    original_buffer = BytesIO()
+    original_image.save(original_buffer, format="PNG")
+
+    attributed_bytes = apply_article_image_attribution_to_bytes(
+        original_buffer.getvalue(),
+        attribution=ArticleImageAttribution(
+            lines=("中西无界 TEL:18138381749",),
+            position="bottom-left",
+            margin=40,
+        ),
+        content_type="image/png",
+        font_size=24,
+    )
+
+    attributed_image = Image.open(BytesIO(attributed_bytes)).convert("RGB")
+    assert any(
+        attributed_image.getpixel((x, y)) != background
+        for x in range(0, 360)
+        for y in range(600, 768)
+    )
+    assert all(
+        attributed_image.getpixel((x, y)) == background
+        for x in range(600, 1024)
+        for y in range(600, 768)
+    )
+
+
+def test_apply_article_image_attribution_keeps_wechat_preview_text_readable():
+    """公众号缩放正文图后，水印仍需接近示例的可读比例，而不能只剩细小灰点。
+
+    这里用纯色底图测量实际绘制像素的包围盒：要求文字保持单行、位于底部偏右，
+    并占据足够的横向比例。这个断言能捕获字体回退为默认小位图、字号上限过低
+    等肉眼难以通过普通单元测试发现的问题。
+    """
+    from app.services.article_publication_polish_service import (
+        apply_article_image_attribution_to_bytes,
+        build_article_image_attribution,
+    )
+
+    background = (217, 217, 217)
+    original_image = Image.new("RGB", (1024, 768), background)
+    original_buffer = BytesIO()
+    original_image.save(original_buffer, format="PNG")
+
+    attributed_bytes = apply_article_image_attribution_to_bytes(
+        original_buffer.getvalue(),
+        attribution=build_article_image_attribution(
+            product_name="维多利亚餐桌",
+            brand_contact="绣蔓家具TEL:18682130473",
+        ),
+        content_type="image/png",
+    )
+
+    attributed_image = Image.open(BytesIO(attributed_bytes)).convert("RGB")
+    diff = ImageChops.difference(attributed_image, original_image)
+    bbox = diff.getbbox()
+
+    assert bbox is not None
+    changed_width = bbox[2] - bbox[0]
+    changed_height = bbox[3] - bbox[1]
+    assert changed_width >= int(original_image.width * 0.5)
+    assert changed_height <= int(original_image.height * 0.15)
+    assert bbox[0] >= int(original_image.width * 0.2)
+    assert bbox[1] >= int(original_image.height * 0.75)
+
+
+def test_load_font_fallback_honors_requested_size(monkeypatch):
+    """容器暂时缺少字体时，回退字体也不能无视请求字号退化成 10px 默认字。
+
+    生产镜像会提供完整中文字体；这个测试额外约束异常环境的降级行为，避免字体
+    路径变化后再次出现“代码设置大字号、图片实际仍很小”的静默回归。
+    """
+    import app.services.article_publication_polish_service as polish
+
+    monkeypatch.setattr(polish, "_CJK_FONT_PATHS", ())
+    font = polish._load_font(60)
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    bbox = probe.textbbox((0, 0), "绣蔓家具 TEL:18682130473", font=font)
+
+    assert bbox[3] - bbox[1] >= 40
 
 
 def test_apply_article_image_attribution_handles_narrow_images_without_truncation_loop():
@@ -206,6 +333,131 @@ async def test_normalize_final_article_images_archives_every_body_image_but_keep
     assert normalized.body_image_urls == (
         "http://localhost:9002/wechat-assets/assets/107/1.jpg",
         "http://localhost:9002/wechat-assets/assets/107/2.jpg",
+    )
+
+
+@pytest.mark.asyncio
+async def test_normalize_final_article_images_passes_fixed_size_policy_to_archive(monkeypatch):
+    """ERP 定时归档必须把固定画布和 24px 水印策略传到素材归档层。"""
+    from app.services import article_publication_polish_service as polish
+
+    captured = []
+
+    async def fake_archive(db, tenant_id, image_url, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(storage_key="assets/107/fixed.png")
+
+    monkeypatch.setattr(
+        "app.services.asset_archive_service.save_image_to_asset_library",
+        fake_archive,
+    )
+    monkeypatch.setattr(
+        "app.services.storage_service.storage_service.get_url",
+        lambda key: f"http://localhost:9002/wechat-assets/{key}",
+    )
+
+    await polish.normalize_final_article_images_with_attribution(
+        db=SimpleNamespace(),
+        content='<article><img src="https://videos.tpkcur.xyz/a.png"/></article>',
+        tenant_id=107,
+        product_name="异形茶几",
+        target_size=(1024, 1365),
+        watermark_font_size=24,
+    )
+
+    assert captured[0]["target_size"] == (1024, 1365)
+    assert captured[0]["watermark_font_size"] == 24
+
+
+@pytest.mark.asyncio
+async def test_normalize_final_article_images_passes_task_watermark_switch_to_archive(monkeypatch):
+    """定时任务的水印开关必须传到归档层，避免界面勾选与实际图片不一致。"""
+    from app.services import article_publication_polish_service as polish
+
+    captured = []
+
+    async def fake_archive(db, tenant_id, image_url, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(storage_key="assets/107/no-global-watermark.jpg")
+
+    monkeypatch.setattr(
+        "app.services.asset_archive_service.save_image_to_asset_library",
+        fake_archive,
+    )
+    monkeypatch.setattr(
+        "app.services.storage_service.storage_service.get_url",
+        lambda key: f"http://localhost:9002/wechat-assets/{key}",
+    )
+
+    await polish.normalize_final_article_images_with_attribution(
+        db=SimpleNamespace(),
+        content='<article><img src="https://videos.tpkcur.xyz/a.png"/></article>',
+        tenant_id=107,
+        product_name="异形茶几",
+        watermark_enabled=False,
+    )
+
+    assert captured[0]["watermark_enabled"] is False
+    assert captured[0]["article_image_attribution"] is None
+
+
+@pytest.mark.asyncio
+async def test_normalize_seamless_poster_archives_three_slices_from_three_views(monkeypatch):
+    """连续海报应下载三种机位，合成后仍按 HTML 图片顺序逐张归档。"""
+    from app.services import article_publication_polish_service as polish
+
+    captured = []
+
+    async def fake_archive(db, tenant_id, image_url, **kwargs):
+        captured.append((image_url, kwargs))
+        return SimpleNamespace(storage_key=f"assets/107/poster-{len(captured)}.png")
+
+    monkeypatch.setattr(
+        "app.services.asset_archive_service.save_image_to_asset_library",
+        fake_archive,
+    )
+    monkeypatch.setattr(
+        "app.services.storage_service.storage_service.get_url",
+        lambda key: f"http://localhost:9002/wechat-assets/{key}",
+    )
+    monkeypatch.setattr(
+        polish,
+        "build_continuous_poster_slices",
+        lambda *_args, **_kwargs: (b"slice-1", b"slice-2", b"slice-3"),
+    )
+    async def fake_download(url, *_args, **_kwargs):
+        return f"image:{url}".encode(), "image/png"
+
+    monkeypatch.setattr(polish, "download_image_bytes", fake_download)
+
+    normalized = await polish.normalize_final_article_images_with_attribution(
+        db=SimpleNamespace(),
+        content=(
+            '<div data-ai-layout="seamless-poster">'
+            '<img src="https://provider.example.com/view-1.png" data-poster-copy="第一段" data-poster-kind="title"/>'
+            '<img src="https://provider.example.com/view-2.png" data-poster-copy="第二段" data-poster-kind="content"/>'
+            '<img src="https://provider.example.com/view-3.png" data-poster-copy="第三段" data-poster-kind="content"/>'
+            '</div>'
+        ),
+        tenant_id=107,
+        product_name="现代餐桌",
+    )
+
+    assert [item[0] for item in captured] == [
+        "https://provider.example.com/view-1.png",
+        "https://provider.example.com/view-2.png",
+        "https://provider.example.com/view-3.png",
+    ]
+    assert [item[1]["image_bytes"] for item in captured] == [b"slice-1", b"slice-2", b"slice-3"]
+    assert [item[1]["poster_copy"] for item in captured] == [None, None, None]
+    # 三张切片只是同一幅海报的文件载体，水印只落最后一段，避免上一张底部的
+    # 联系方式在下一张顶部紧贴出现，破坏连续阅读。
+    assert [item[1]["watermark_enabled"] for item in captured] == [False, False, None]
+    assert [item[1]["article_image_attribution"] for item in captured[:2]] == [None, None]
+    assert normalized.body_image_urls == (
+        "http://localhost:9002/wechat-assets/assets/107/poster-1.png",
+        "http://localhost:9002/wechat-assets/assets/107/poster-2.png",
+        "http://localhost:9002/wechat-assets/assets/107/poster-3.png",
     )
 
 

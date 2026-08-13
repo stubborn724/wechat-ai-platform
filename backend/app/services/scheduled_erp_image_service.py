@@ -44,6 +44,9 @@ class ScheduledErpImageConfig:
     commodity_category: Optional[str] = None
     repeat_after_days: int = 3
     image_count: int = 8
+    # 为空时保持历史“按任务防重”；新增品牌可填 brand:<source_key>，让公域和
+    # 私域两条任务共享同一个窗口，确保同一品牌三天内不重复选品。
+    selection_scope: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -75,18 +78,38 @@ def parse_scheduled_erp_image_config(raw_config: object) -> ScheduledErpImageCon
     category = str(raw_config.get("commodity_category") or "").strip() or None
     repeat_after_days = int(raw_config.get("repeat_after_days") or 3)
     image_count = int(raw_config.get("image_count") or 8)
+    selection_scope = str(raw_config.get("selection_scope") or "").strip() or None
     if not source_key:
         raise ErpImageSelectionError("ERP 图片配置必须指定来源")
     if not 1 <= repeat_after_days <= 30:
         raise ErpImageSelectionError("ERP 图片防重天数必须在 1 到 30 天之间")
     if not 1 <= image_count <= 20:
         raise ErpImageSelectionError("每篇文章的 ERP 图片数量必须在 1 到 20 张之间")
+    if selection_scope and len(selection_scope) > 128:
+        raise ErpImageSelectionError("ERP 图片防重范围不能超过 128 个字符")
     return ScheduledErpImageConfig(
         source_key=source_key,
         commodity_category=category,
         repeat_after_days=repeat_after_days,
         image_count=image_count,
+        selection_scope=selection_scope,
     )
+
+
+def resolve_erp_selection_scope(
+    config: ScheduledErpImageConfig | None,
+    *,
+    task_id: int,
+) -> str:
+    """解析 ERP 防重范围，并为旧任务保留原有任务级语义。
+
+    旧绣蔓任务的历史记录没有品牌范围字段，继续使用 ``task:<id>`` 查询可以保证
+    它们不会因新增跨任务防重能力而改变选品结果。只有显式声明范围的新任务才会
+    共享历史窗口。
+    """
+
+    configured_scope = str(getattr(config, "selection_scope", None) or "").strip()
+    return configured_scope or f"task:{int(task_id)}"
 
 
 async def prepare_erp_images_for_scheduled_run(
@@ -105,7 +128,13 @@ async def prepare_erp_images_for_scheduled_run(
     COS 对象；全部成功后的正常清理由任务编排层在文章槽位 ``finally`` 中完成。
     """
     count = max(1, min(requested_count, config.image_count))
-    recent_urls = _recent_erp_image_urls(db, task_id, config.repeat_after_days)
+    selection_scope = resolve_erp_selection_scope(config, task_id=task_id)
+    recent_urls = _recent_erp_image_urls(
+        db,
+        task_id,
+        config.repeat_after_days,
+        selection_scope=selection_scope,
+    )
     products = await _load_category_products(config, recent_urls, count)
     relay = relay_service or CosImageRelayService()
     prepared_images: list[PreparedErpImage] = []
@@ -146,6 +175,7 @@ async def prepare_erp_images_for_scheduled_run(
                 asset_id=asset.id,
                 erp_image_url=product.image_url,
                 product_name=product.name,
+                selection_scope=selection_scope,
             ))
     except Exception:
         # 调用方尚未拿到准备结果时无法负责清理，因此由本服务回收部分成功对象。
@@ -160,17 +190,25 @@ async def prepare_erp_images_for_scheduled_run(
     return prepared_images
 
 
-def _recent_erp_image_urls(db: Session, task_id: int, repeat_after_days: int) -> set[str]:
-    """查询窗口期已用 ERP 图片，防重范围仅限当前定时任务。"""
+def _recent_erp_image_urls(
+    db: Session,
+    task_id: int,
+    repeat_after_days: int,
+    *,
+    selection_scope: str | None = None,
+) -> set[str]:
+    """查询窗口期已用 ERP 图片，兼容旧任务并支持品牌共享范围。"""
     cutoff = datetime.utcnow() - timedelta(days=repeat_after_days)
-    rows = (
-        db.query(ScheduledTaskErpImageUsage.erp_image_url)
-        .filter(
-            ScheduledTaskErpImageUsage.task_id == task_id,
-            ScheduledTaskErpImageUsage.used_at >= cutoff,
-        )
-        .all()
+    query = db.query(ScheduledTaskErpImageUsage.erp_image_url).filter(
+        ScheduledTaskErpImageUsage.used_at >= cutoff,
     )
+    if selection_scope and not selection_scope.startswith("task:"):
+        query = query.filter(ScheduledTaskErpImageUsage.selection_scope == selection_scope)
+    else:
+        # 老记录 selection_scope 为空，按任务 ID 查询才能保持绣蔓正式任务的历史
+        # 选品行为不变；新任务若未声明共享范围也自然落入同一兼容分支。
+        query = query.filter(ScheduledTaskErpImageUsage.task_id == task_id)
+    rows = query.all()
     return {str(row[0]).strip() for row in rows if row[0]}
 
 

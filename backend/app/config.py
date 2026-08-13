@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     wechat_relay_base_url: str = ""
     wechat_relay_app_id: str = "relay_client"
     wechat_relay_secret: str = ""
+    # 中转站目前没有最终发布状态查询接口。超过该时限仍未确认的 relay 发布会明确
+    # 收敛为可人工核验的失败，防止任务无限停留在 publishing。
+    wechat_relay_publish_status_timeout_seconds: int = 900
+
+    # 内容 Worker 每个长耗时阶段都会写入心跳。图片生成可能在正文完成后串行执行多次，
+    # 本地联调窗口必须覆盖完整素材链路；超过 45 分钟仍没有新心跳才判定为 Worker 重启、
+    # 旧版本进程或消息丢失后的遗留任务，避免 Gateway 和桌面端永久显示“正在生成”。
+    tageai_generation_heartbeat_timeout_seconds: int = 2700
 
     # ERP 产品素材源。配置为 JSON 数组，密钥仅允许保存在后端 .env 中，
     # 浏览器和文章任务参数都不能携带 ERP 应用凭证。
@@ -86,7 +94,8 @@ class Settings(BaseSettings):
     text_generation_base_url: str = ""
     text_generation_api_key: str = ""
     text_generation_model: str = "gpt-5-mini"
-    text_generation_timeout_seconds: int = 180
+    # 正文提供商包含主备切换，本地验收允许单篇正文最多等待 15 分钟。
+    text_generation_timeout_seconds: int = 900
 
     # AI 图片生成使用独立于正文大模型的提供商配置。业务层只识别统一图片生成
     # 服务，主备提供商及模型由这里选择，避免每个 Agent 各自硬编码模型地址。
@@ -107,7 +116,8 @@ class Settings(BaseSettings):
     image_generation_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_generation_ark_api_key: str = ""
     image_generation_ark_model: str = "doubao-seedream-4-0-250828"
-    image_generation_timeout_seconds: int = 240
+    # 图片服务偶发排队且一篇文章可能请求多张图片；单次图片请求最多等待 30 分钟。
+    image_generation_timeout_seconds: int = 1800
     # 旧万相适配器仅用于兼容历史部署；新部署默认以方舟 Seedream 作为最终兜底。
     image_generation_fallback_provider: str = "volcengine_ark"
     image_generation_max_response_bytes: int = 20 * 1024 * 1024
@@ -123,6 +133,11 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "wechat-assets"
     minio_use_ssl: bool = False
+    # 发布 Worker 可能运行在 Docker 内，而历史文章地址可能由宿主机生成。
+    # 这些地址都指向同一个 MinIO 桶；中转服务只把它们解析成对象键，不会把
+    # 地址直接交给外部服务访问。默认保留本机常用端口，生产环境可通过环境变量
+    # 增加旧域名或迁移前的访问入口，避免历史文章因部署拓扑变化无法发布。
+    minio_url_aliases: str = "http://localhost:9002,http://127.0.0.1:9002"
 
     # CORS
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
@@ -130,6 +145,11 @@ class Settings(BaseSettings):
     # Celery
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/1"
+
+    # TaGeAI Integration API 配置
+    # tageai_integration_clients 可以是单个 dict 或 list[dict]
+    # 每个 client 包含: client_id, signing_secret, tenant_binding_id, tenant_id
+    tageai_integration_clients: dict | list[dict] | str = ""
 
     model_config = SettingsConfigDict(
         env_file=(str(ENV_FILE), str(BACKEND_ENV_FILE)),

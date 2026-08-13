@@ -80,3 +80,63 @@ async def test_reference_generation_fails_when_required_image_is_missing(monkeyp
 
     with pytest.raises(ImageProviderError, match="图片结果为空"):
         await article_agent_service.agent5_generate_images(state)
+
+
+@pytest.mark.asyncio
+async def test_reference_generation_retries_when_generated_image_is_low_information(monkeypatch):
+    """ERP 图生图返回空白结果时应补强场景要求并重试，而不是直接发布空白图。"""
+    from app.services import article_agent_service
+    from app.services import image_generation_service as service_module
+    from app.services.image_generation_models import GeneratedImage
+    from app.services.scheduled_image_quality_service import ImageQualityReport
+    from app.schemas.article import ArticleState, ImageRequirement
+
+    generated_prompts = []
+
+    async def fake_generate(request):
+        generated_prompts.append(request.prompt)
+        return GeneratedImage(
+            f"https://generated.example/{len(generated_prompts)}.png",
+            "openai_compatible",
+            "gpt-image-2",
+        )
+
+    reports = iter([
+        ImageQualityReport(False, "低信息量：图片接近纯色"),
+        ImageQualityReport(True, "图片包含足够视觉信息"),
+    ])
+
+    async def fake_inspect_image_url(url):
+        return next(reports)
+
+    monkeypatch.setattr(service_module.image_generation_service, "generate", fake_generate)
+    monkeypatch.setattr(
+        article_agent_service,
+        "inspect_generated_image_url",
+        fake_inspect_image_url,
+        raising=False,
+    )
+
+    state = ArticleState(
+        task_id="task-1",
+        topic="家具",
+        product_name="实木餐桌",
+        reference_html="<article></article>",
+        reference_image_url="https://cos.example.com/reference.jpg",
+        skip_reference_image_understanding=True,
+        image_prompt_context="现代室内场景，暖色自然光",
+        image_requirements=[ImageRequirement(
+            position=1,
+            type="inline",
+            keywords="实木餐桌",
+            prompt="客厅空间中的实木餐桌",
+            image_source="DASHSCOPE",
+        )],
+    )
+
+    result = await article_agent_service.agent5_generate_images(state)
+
+    assert len(generated_prompts) == 2
+    assert "真实空间层次" in generated_prompts[0]
+    assert "上一次生成结果信息量不足" in generated_prompts[1]
+    assert result.images[0].url.endswith("/2.png")

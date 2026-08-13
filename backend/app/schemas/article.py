@@ -116,8 +116,9 @@ class ArticleState(BaseModel):
     image_requirements: List[ImageRequirement] = []
     images: List[ImageResult] = []
     full_content: Optional[str] = None
-    # HTML 槽位图片数量由定时任务注入；默认值确保旧入口继续最多生成五张。
-    max_generated_images: int = Field(default=5, ge=1, le=30)
+    # HTML 槽位图片数量由定时任务注入；0 不是缺省值，而是用户明确要求纯文字文章。
+    # 允许该值进入状态对象，才能让队列、图片 Agent 和封面生成共同遵守同一冻结预算。
+    max_generated_images: int = Field(default=5, ge=0, le=30)
     enabled_image_methods: Optional[List[str]] = None
     error: Optional[str] = None
     # Knowledge base integration
@@ -127,8 +128,18 @@ class ArticleState(BaseModel):
     source_feed_id: Optional[int] = None
     feed_article_ids: Optional[List[int]] = None
     reference_articles: Optional[List[str]] = None  # full article content for imitation
+    # TaGeAI 的强制标题必须在标题 Agent 前被消费，不能被模型候选结果覆盖。
+    title_override: Optional[str] = None
+    # TaGeAI 传入的正文硬性约束由大纲和正文 Agent 共同读取，确保不会停留在任务 JSON。
+    content_constraints: List[str] = Field(default_factory=list)
     # HTML 仿写优先使用原始网页结构；Markdown 仅保留给旧流程兼容。
     reference_html: Optional[str] = None
+    # 新格式模板任务由程序从持久化 JSON 恢复蓝图，避免每次运行重新解析或把原始
+    # HTML 送给模型。为空时完整保留 reference_html 的历史行为。
+    format_profile_payload: Optional[dict] = None
+    # 模板定义标题应写入公众号元标题还是视觉标题槽位；模型只返回文字，程序负责
+    # 定位与回填，避免标题逻辑污染 HTML 结构。
+    format_profile_title_policy: Optional[dict] = None
     # ERP 产品图生图的投喂源只负责文字与 DOM 结构。开启后保留原图片槽位位置，
     # 但不读取参考图片视觉特征，避免背景规则被外部文章图片污染。
     skip_reference_image_understanding: bool = False
@@ -154,3 +165,6 @@ class ArticleState(BaseModel):
     # ERP 定时任务本次选中的唯一产品名称。标题、正文和图片 Agent 共用该字段，
     # 避免各阶段根据不同关键词猜测产品而导致标题与图片主体不一致。
     product_name: Optional[str] = None
+    # ERP 产品对应的空间规则快照。由定时任务在选定产品后程序化生成，避免每个
+    # 图片槽位再次调用模型判断“餐桌应该放餐厅还是客厅”，也让重试使用同一规则。
+    product_scene_profile: Optional[dict] = None

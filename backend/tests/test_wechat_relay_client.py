@@ -185,6 +185,47 @@ def test_relay_client_maps_direct_publish_to_public_publish_with_confirm_gate():
     assert result["relay_status"] == "PUBLIC_PUBLISH_SUBMITTED"
 
 
+def test_relay_client_maps_private_direct_publish_to_follower_push():
+    """私域直接发布必须调用中转站的粉丝群发模式并返回 msg_id。"""
+    from app.services.wechat_relay_client import WeChatRelayClient
+
+    session = _FakeSession({
+        "success": True,
+        "status": "FOLLOWER_PUSH_SENT",
+        "wechatArticleId": "msg-id-001",
+        "wechatUrl": "",
+        "message": "sent",
+    })
+    client = WeChatRelayClient(
+        base_url="http://relay.example.com",
+        relay_app_id="relay_client",
+        relay_secret="relay_secret",
+        session=session,
+        nonce_factory=lambda: "nonce-private-001",
+        timestamp_factory=lambda: "1760000002",
+    )
+
+    result = client.publish_article(
+        app_id="wx_app",
+        app_secret="wx_secret",
+        request_id="tenant-article-1-private",
+        tenant_id="tenant-1",
+        publish_mode="direct",
+        publish_domain="private",
+        confirm_publish=True,
+        title="文章标题",
+        digest="摘要",
+        html="<p>正文</p>",
+        cover_image_url="https://assets.example.com/cover.png",
+    )
+
+    body = json.loads(session.calls[0]["data"].decode("utf-8"))
+    assert body["publishPayload"]["publishMode"] == "follower_push"
+    assert body["publishPayload"]["confirmPublish"] is True
+    assert result["msg_id"] == "msg-id-001"
+    assert result["relay_status"] == "FOLLOWER_PUSH_SENT"
+
+
 def test_relay_client_keeps_author_empty_when_business_does_not_configure_one():
     """系统不得再给客户公众号自动写入“AI 运营平台”作者字段。"""
     from app.services.wechat_relay_client import WeChatRelayClient

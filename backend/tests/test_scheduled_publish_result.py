@@ -87,6 +87,105 @@ def test_publish_to_wechat_persists_delivery_identifiers(monkeypatch):
     assert article.wechat_account_id == 103
 
 
+def test_publish_to_wechat_propagates_private_domain_and_persists_msg_id(monkeypatch):
+    """定时任务私域交付必须传递发布域，并以 msg_id 作为成功凭证。"""
+    from app.services import wechat_publisher
+    from app.tasks.scheduled_task_executor import _publish_to_wechat
+
+    calls = []
+
+    def publish_private(*args, **kwargs):
+        calls.append(kwargs)
+        return {"msg_id": "msg-private-1", "relay_status": "FOLLOWER_PUSH_SENT"}
+
+    monkeypatch.setattr(wechat_publisher, "publish_article", publish_private)
+    article = SimpleNamespace(
+        id=26,
+        publish_id=None,
+        msg_data_id=None,
+        wechat_account_id=None,
+        publish_domain=None,
+    )
+    run = SimpleNamespace(id=46, delivery_results={}, publish_domain="private")
+
+    _publish_to_wechat(
+        db=SimpleNamespace(commit=lambda: None),
+        article=article,
+        account_ids=[103],
+        publish_mode="direct",
+        task=SimpleNamespace(tenant_id=107, created_by=9, publish_domain="public"),
+        run=run,
+    )
+
+    assert calls[0]["publish_domain"] == "private"
+    assert article.msg_data_id == "msg-private-1"
+    assert article.publish_id is None
+    assert article.publish_domain == "private"
+    assert run.delivery_results["26:103"] == {
+        "status": "success",
+        "mode": "direct",
+        "publish_domain": "private",
+        "msg_data_id": "msg-private-1",
+    }
+
+
+def test_scheduled_delivery_does_not_reuse_result_from_another_publish_domain():
+    """公域和私域结果不能共用同一条重试幂等记录。"""
+    from app.tasks.scheduled_task_executor import _is_successful_scheduled_delivery
+
+    result = {
+        "26:103": {
+            "status": "success",
+            "mode": "direct",
+            "publish_domain": "public",
+        }
+    }
+
+    assert _is_successful_scheduled_delivery(
+        result,
+        article_id=26,
+        account_id=103,
+        publish_mode="direct",
+        publish_domain="public",
+    ) is True
+    assert _is_successful_scheduled_delivery(
+        result,
+        article_id=26,
+        account_id=103,
+        publish_mode="direct",
+        publish_domain="private",
+    ) is False
+
+    legacy_result = {
+        "26:103": {
+            "status": "success",
+            "mode": "direct",
+        }
+    }
+    assert _is_successful_scheduled_delivery(
+        legacy_result,
+        article_id=26,
+        account_id=103,
+        publish_mode="direct",
+        publish_domain="private",
+    ) is False
+
+
+def test_historical_public_article_cannot_short_circuit_private_delivery():
+    """没有发布域快照的历史公域文章不能阻止新的私域交付。"""
+    from app.tasks.scheduled_task_executor import is_article_delivery_complete
+
+    article = SimpleNamespace(
+        status="published",
+        publish_id="old-public-publish-id",
+        msg_data_id=None,
+        publish_domain=None,
+    )
+
+    assert is_article_delivery_complete(article, "direct", "public") is True
+    assert is_article_delivery_complete(article, "direct", "private") is False
+
+
 def test_publish_to_wechat_rejects_unknown_mode_before_external_call(monkeypatch):
     """非法发布模式必须在调用微信前失败，避免错误配置产生外部副作用。"""
     from app.services import wechat_publisher
@@ -168,6 +267,7 @@ def test_publish_to_wechat_records_each_account_and_skips_completed_delivery(mon
     assert run.delivery_results["24:104"] == {
         "status": "success",
         "mode": "draft",
+        "publish_domain": "public",
         "media_id": "draft-104",
     }
     assert article.wechat_account_id == 104
@@ -213,6 +313,7 @@ def test_partial_direct_publish_is_recorded_before_error(monkeypatch):
     assert run.delivery_results["25:103"] == {
         "status": "partial",
         "mode": "direct",
+        "publish_domain": "public",
         "media_id": "draft-partial",
         "error": "正式发布接口失败",
     }

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onMounted, computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown, ArrowUp } from '@element-plus/icons-vue'
 import client from '@/api/client'
-import type { Account, FeedSource } from '@/api/types'
+import type { Account, ArticleFormatProfile, FeedSource, WritingStyleTemplateOption } from '@/api/types'
 import { listErpProductSources, type ErpProductSource } from '@/api/erpProducts'
 
 interface ScheduledTask {
@@ -15,6 +16,13 @@ interface ScheduledTask {
   feed_source_ids: number[] | null
   feed_source_id: number | null
   feed_article_ids: number[] | null
+  format_profile_id: number | null
+  template_rotation_config?: {
+    enabled: boolean
+    profile_ids: number[]
+    basis: 'publish_day' | 'publish_run'
+    uses_per_template: number
+  } | null
   style: string | null
   knowledge_base_ids: number[] | null
   day_of_week: number
@@ -22,17 +30,28 @@ interface ScheduledTask {
   article_slots: ArticleSlot[] | null
   articles_per_day: number
   html_image_count: number
+  layout_mode: 'standard' | 'seamless_poster'
   public_count: number
   private_count: number
   account_ids: number[] | null
   publish_mode: string
+  publish_domain: 'public' | 'private'
   image_source: string
   enabled_image_methods: string[] | null
+  enable_watermark: boolean
+  watermark_config?: {
+    enabled: boolean
+    type: 'text' | 'logo'
+    content?: string | null
+    font_size?: number
+    locked?: boolean
+  } | null
   erp_image_config?: {
     source_key: string
     commodity_category?: string | null
     repeat_after_days: number
     image_count: number
+    selection_scope?: string | null
   } | null
   footer_template: string | null
   total_generated: number
@@ -50,10 +69,68 @@ const tasks = ref<ScheduledTask[]>([])
 const accounts = ref<Account[]>([])
 const feedSources = ref<FeedSource[]>([])
 const knowledgeBases = ref<any[]>([])
+const formatProfiles = ref<ArticleFormatProfile[]>([])
 const erpProductSources = ref<ErpProductSource[]>([])
+/**
+ * 写作模板由后端目录接口统一提供。开发服务尚未重启或接口暂不可用时保留内置
+ * 她格模板，确保运营人员仍能选择已部署在 Worker 中的稳定模板编号。
+ */
+const builtinWritingStyleTemplates: WritingStyleTemplateOption[] = [
+  {
+    identifier: 'zhongxiwujie_east_west_living',
+    label: '中西无界 - 东方奢雅生活',
+    description: '用产品承接东方神韵与当代奢雅生活，标题更有文化感和画面感。',
+  },
+  {
+    identifier: 'xiehuai_oriental_living',
+    label: '写怀 - 东方留白生活',
+    description: '围绕产品与安静居住感写作，标题以温润、留白的完整短句呈现。',
+  },
+  {
+    identifier: 'jianzhi_artful_living',
+    label: '剪纸系列 - 当代艺术生活',
+    description: '从产品、光影与剪纸艺术感切入，形成温暖有画面的生活标题。',
+  },
+  {
+    identifier: 'shege_enterprise_ai_service',
+    label: '她格 - 企业 AI 服务',
+    description: '围绕中小企业经营问题，输出可落地的 AI 转型建议。',
+  },
+]
+const writingStyleTemplates = ref<WritingStyleTemplateOption[]>([...builtinWritingStyleTemplates])
 const showForm = ref(false)
 const editing = ref(false)
 const currentId = ref<number | null>(null)
+const fixedWatermarkLocked = ref(false)
+const rotationConfigTouched = ref(false)
+type FooterTemplateMode = 'none' | 'consultation_card' | 'custom'
+
+interface ConsultationQrCode {
+  label: string
+  url: string
+}
+
+/**
+ * 固定底部只在界面层展示业务字段，JSON 是后端渲染协议，不暴露给运营人员填写。
+ * 保留原始 footer_template 字段是为了兼容所有历史任务和已有发布链路。
+ */
+const footerTemplateMode = ref<FooterTemplateMode>('none')
+const customFooterTemplate = ref('')
+const consultationCard = reactive({
+  brand: '',
+  phone: '',
+  qrcodes: [] as ConsultationQrCode[],
+})
+const qrUploadTargetIndex = ref<number | null>(null)
+
+function createDefaultTemplateRotationConfig() {
+  return {
+    enabled: false,
+    profile_ids: [] as number[],
+    basis: 'publish_day' as 'publish_day' | 'publish_run',
+    uses_per_template: 1,
+  }
+}
 
 const form = reactive({
   name: '',
@@ -62,24 +139,34 @@ const form = reactive({
   feed_source_ids: [] as number[],
   feed_source_id: null as number | null,
   feed_article_ids: [] as number[],
+  format_profile_id: null as number | null,
+  template_rotation_config: createDefaultTemplateRotationConfig(),
   style: '',
   knowledge_base_ids: [] as number[],
   day_of_week: -1,
   publish_times: ['08:00'] as string[],
   articles_per_day: 1,
   html_image_count: 5,
+  layout_mode: 'standard' as 'standard' | 'seamless_poster',
   account_ids: [] as number[],
   publish_mode: 'draft',
+  publish_domain: 'public' as 'public' | 'private',
   image_source: 'DASHSCOPE',
   erp_source_key: '',
   erp_commodity_category: '',
   erp_repeat_after_days: 3,
   erp_image_count: 8,
+  // 品牌级防重范围由初始化脚本写入；编辑任务时原样回传，避免运营保存表单
+  // 时意外丢失公域/私域共享选品规则。
+  erp_selection_scope: '',
   footer_template: '',
   content_type: 'article',
   enabled_image_methods: ['DASHSCOPE'],
   enable_watermark: false,
 })
+
+// 轮换顺序以表单数组为唯一数据源；派生值仅供模板渲染，避免重排时出现副本不同步。
+const rotationProfileIds = computed(() => form.template_rotation_config.profile_ids)
 
 const dayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
 const dayOptions = [
@@ -99,7 +186,12 @@ const showFeedArticlePicker = ref(false)
 const loadingFeedArticles = ref(false)
 
 async function handleFeedSourceChange(preserveSelectedArticles = false) {
-  if (!preserveSelectedArticles) form.feed_article_ids = []
+  if (!preserveSelectedArticles) {
+    form.feed_article_ids = []
+    // 投喂源切换后旧模板可能属于另一篇文章；交给后端按新来源自动绑定，
+    // 用户仍可在“格式模板覆盖”中主动选择特定来源文章版本。
+    form.format_profile_id = null
+  }
   feedSourceArticles.value = []
   if (!form.feed_source_id) return
   loadingFeedArticles.value = true
@@ -139,13 +231,19 @@ const writingModeLabel: Record<string, string> = {
   kb: '知识库',
 }
 
-const styleOptions = [
-  { value: '', label: '默认风格' },
-  { value: 'tech', label: '科技风格' },
-  { value: 'emotional', label: '情感风格' },
-  { value: 'educational', label: '教育风格' },
-  { value: 'humorous', label: '幽默风格' },
-]
+/** 当前已选的公共模板；未知值按历史配置保留，避免编辑旧任务时丢失数据。 */
+const selectedWritingStyleTemplate = computed(() =>
+  writingStyleTemplates.value.find(item => item.identifier === form.style) || null,
+)
+
+const hasLegacyWritingStyle = computed(() => Boolean(
+  form.style && !selectedWritingStyleTemplate.value,
+))
+
+function getWritingStyleTemplateLabel(style: string | null): string {
+  if (!style) return '自动匹配内容来源'
+  return writingStyleTemplates.value.find(item => item.identifier === style)?.label || '历史任务风格'
+}
 
 function getAccountName(ids: number[] | null): string {
   if (!ids || ids.length === 0) return '未指定'
@@ -157,6 +255,34 @@ function getFeedSourceNames(ids: number[] | null): string {
   return ids.map(id => feedSources.value.find(f => f.id === id)?.name || `#${id}`).join(', ')
 }
 
+function getFormatProfileLabel(profileId: number | null): string {
+  if (!profileId) return '自动匹配（未绑定时沿用历史流程）'
+  const profile = formatProfiles.value.find(item => item.id === profileId)
+  return profile ? `${profile.name} v${profile.version}` : `模板 #${profileId}`
+}
+
+function getRotationProfileLabel(profileId: number): string {
+  const profile = formatProfiles.value.find(item => item.id === profileId)
+  if (!profile) return `模板 #${profileId}`
+  const source = profile.source_name || '未知投喂源'
+  const article = profile.source_article_title || profile.name
+  return `${source} / ${article} v${profile.version}`
+}
+
+function markRotationConfigTouched() {
+  rotationConfigTouched.value = true
+}
+
+function moveRotationProfile(index: number, direction: -1 | 1) {
+  const targetIndex = index + direction
+  const profileIds = form.template_rotation_config.profile_ids
+  if (targetIndex < 0 || targetIndex >= profileIds.length) return
+  const currentId = profileIds[index]
+  profileIds[index] = profileIds[targetIndex]
+  profileIds[targetIndex] = currentId
+  markRotationConfigTouched()
+}
+
 function getErpSourceName(sourceKey: string): string {
   return erpProductSources.value.find(source => source.key === sourceKey)?.name || sourceKey
 }
@@ -164,18 +290,28 @@ function getErpSourceName(sourceKey: string): string {
 async function load() {
   loading.value = true
   try {
-    const [t, a, f, k, erpSources] = await Promise.all([
+    const [t, a, f, k, profiles, erpSources, styleTemplates] = await Promise.all([
       client.get<{ total: number; items: ScheduledTask[] }>('/scheduled-tasks'),
       client.get<{ items: Account[] }>('/accounts'),
       client.get<{ total: number; items: FeedSource[] }>('/feed-sources').catch(() => ({ data: { items: [] } })),
       client.get<{ items: any[] }>('/knowledge-bases').catch(() => ({ data: { items: [] } })),
+      client.get<any[]>('/format-profiles').catch(() => ({ data: [] })),
       listErpProductSources().catch(() => []),
+      client
+        .get<WritingStyleTemplateOption[]>('/scheduled-tasks/writing-style-templates')
+        .catch(() => ({ data: builtinWritingStyleTemplates })),
     ])
     tasks.value = t.data.items || []
     accounts.value = a.data.items || []
     feedSources.value = f.data.items || []
     knowledgeBases.value = k.data.items || []
+    formatProfiles.value = profiles.data || []
     erpProductSources.value = erpSources
+    // 后端可用时以服务端目录为准；旧 API 尚未重启时保持内置兜底，选择模板和
+    // 保存任务不受影响。
+    writingStyleTemplates.value = styleTemplates.data?.length
+      ? styleTemplates.data
+      : [...builtinWritingStyleTemplates]
   } catch { ElMessage.error('加载失败') }
   finally { loading.value = false }
 }
@@ -188,14 +324,18 @@ function resetForm() {
   form.feed_source_ids = []
   form.feed_source_id = null
   form.feed_article_ids = []
+  form.format_profile_id = null
+  form.template_rotation_config = createDefaultTemplateRotationConfig()
   form.style = ''
   form.knowledge_base_ids = []
   form.day_of_week = -1
   form.publish_times = ['08:00']
   form.articles_per_day = 1
   form.html_image_count = 5
+  form.layout_mode = 'standard'
   form.account_ids = []
   form.publish_mode = 'draft'
+  form.publish_domain = 'public'
   form.image_source = 'DASHSCOPE'
   form.erp_source_key = ''
   form.erp_commodity_category = ''
@@ -205,8 +345,16 @@ function resetForm() {
   form.enabled_image_methods = ['DASHSCOPE']
   form.enable_watermark = false
   footerQrUrl.value = ''
+  footerTemplateMode.value = 'none'
+  customFooterTemplate.value = ''
+  consultationCard.brand = ''
+  consultationCard.phone = ''
+  consultationCard.qrcodes = []
+  qrUploadTargetIndex.value = null
   editing.value = false
   currentId.value = null
+  fixedWatermarkLocked.value = false
+  rotationConfigTouched.value = false
 }
 
 function openCreate() { resetForm(); showForm.value = true }
@@ -221,29 +369,114 @@ async function openEdit(task: ScheduledTask) {
   form.feed_source_ids = task.feed_source_ids || []
   form.feed_source_id = (task as any).feed_source_id || null
   form.feed_article_ids = (task as any).feed_article_ids || []
+  form.format_profile_id = task.format_profile_id || null
+  form.template_rotation_config = task.template_rotation_config
+    ? {
+        enabled: Boolean(task.template_rotation_config.enabled),
+        profile_ids: [...(task.template_rotation_config.profile_ids || [])],
+        basis: task.template_rotation_config.basis || 'publish_day',
+        uses_per_template: task.template_rotation_config.uses_per_template || 1,
+      }
+    : createDefaultTemplateRotationConfig()
+  rotationConfigTouched.value = false
   form.style = task.style || ''
   form.knowledge_base_ids = task.knowledge_base_ids || []
   form.day_of_week = task.day_of_week
   form.publish_times = task.publish_times?.length ? [...task.publish_times] : ['08:00']
   form.articles_per_day = task.articles_per_day
   form.html_image_count = task.html_image_count || 5
+  form.layout_mode = task.layout_mode || 'standard'
   form.account_ids = task.account_ids || []
   form.publish_mode = task.publish_mode || 'draft'
+  form.publish_domain = task.publish_domain || 'public'
   form.image_source = task.image_source || 'DASHSCOPE'
   form.erp_source_key = task.erp_image_config?.source_key || ''
   form.erp_commodity_category = task.erp_image_config?.commodity_category || ''
   form.erp_repeat_after_days = task.erp_image_config?.repeat_after_days || 3
   form.erp_image_count = task.erp_image_config?.image_count || 8
-  form.footer_template = task.footer_template || ''
+  form.erp_selection_scope = task.erp_image_config?.selection_scope || ''
+  hydrateFooterTemplate(task.footer_template || '')
   form.enabled_image_methods = (task as any).enabled_image_methods || ['DASHSCOPE']
-  form.enable_watermark = (task as any).enable_watermark || false
-  // 从 footer_template 中提取二维码 URL 用于预览
+  form.enable_watermark = task.enable_watermark || false
+  fixedWatermarkLocked.value = Boolean(task.watermark_config?.locked)
+  // 自定义旧页脚仍支持 Markdown 二维码；咨询卡则在 hydrate 时直接回填到参数表单。
   const qrMatch = form.footer_template.match(/!\[二维码\]\(([^)]+)\)/)
   footerQrUrl.value = qrMatch ? qrMatch[1] : ''
   showForm.value = true
   // 编辑已有投喂任务时也必须加载文章列表，否则用户只能看到来源无法选择文章。
   if (form.feed_source_id) await handleFeedSourceChange(true)
   if (erpProductSources.value.length === 0) await loadErpProductSources()
+}
+
+/** 将历史 Markdown 与结构化咨询卡分别回填到对应表单，避免编辑时丢失已有配置。 */
+function hydrateFooterTemplate(template: string) {
+  form.footer_template = template
+  customFooterTemplate.value = template
+  footerTemplateMode.value = template.trim() ? 'custom' : 'none'
+  consultationCard.brand = ''
+  consultationCard.phone = ''
+  consultationCard.qrcodes = []
+  qrUploadTargetIndex.value = null
+
+  try {
+    const parsed = JSON.parse(template)
+    if (parsed?.type !== 'consultation_card_v1') return
+    footerTemplateMode.value = 'consultation_card'
+    consultationCard.brand = String(parsed.brand || '')
+    consultationCard.phone = String(parsed.phone || '')
+    consultationCard.qrcodes = Array.isArray(parsed.qrcodes)
+      ? parsed.qrcodes
+        .filter((item: unknown) => item && typeof item === 'object')
+        .map((item: any) => ({ label: String(item.label || '二维码'), url: String(item.url || '') }))
+      : []
+  } catch {
+    // 非 JSON 是历史 Markdown 或自定义文本，继续由自定义内容模式承载。
+  }
+}
+
+/** 切换模板时只初始化必要默认值，不覆盖用户已经填好的卡片参数。 */
+function handleFooterTemplateModeChange(mode: FooterTemplateMode) {
+  qrUploadTargetIndex.value = null
+  if (mode === 'consultation_card' && consultationCard.qrcodes.length === 0) {
+    consultationCard.qrcodes.push({ label: '企业微信', url: '' })
+  }
+}
+
+function addConsultationQrCode() {
+  consultationCard.qrcodes.push({ label: '二维码', url: '' })
+}
+
+function removeConsultationQrCode(index: number) {
+  consultationCard.qrcodes.splice(index, 1)
+  if (qrUploadTargetIndex.value === index) qrUploadTargetIndex.value = null
+}
+
+function openQrUploader(targetIndex: number | null = null) {
+  qrUploadTargetIndex.value = targetIndex
+  ;(qrFileInput.value as HTMLInputElement | null)?.click()
+}
+
+/** 保存前统一生成协议 JSON，页面上不会出现或要求用户理解这些内部字段。 */
+function resolveFooterTemplateForSave(): string | null | undefined {
+  if (footerTemplateMode.value === 'none') return null
+  if (footerTemplateMode.value === 'custom') return customFooterTemplate.value.trim() || null
+
+  const brand = consultationCard.brand.trim()
+  const phone = consultationCard.phone.trim()
+  const qrcodes = consultationCard.qrcodes
+    .map(item => ({ label: item.label.trim() || '二维码', url: item.url.trim() }))
+    .filter(item => item.url)
+  if (!brand || !phone || qrcodes.length === 0) {
+    ElMessage.warning('产品咨询卡需要填写品牌、咨询电话和至少一个二维码')
+    return undefined
+  }
+  return JSON.stringify({
+    type: 'consultation_card_v1',
+    brand,
+    headline: '产品咨询',
+    phone,
+    qrcodes,
+  })
 }
 
 function addTime() { form.publish_times.push('08:00') }
@@ -262,8 +495,15 @@ async function uploadFooterQr(event: Event) {
     })
     const asset = res.data.data || res.data
     footerQrUrl.value = asset.preview_url || ''
-    const qrMd = footerQrUrl.value ? `![二维码](${footerQrUrl.value})` : ''
-    form.footer_template = qrMd ? `${qrMd}\n\n${form.footer_template.replace(/!\[二维码\]\(.*?\)\n\n/, '')}` : form.footer_template
+    if (footerTemplateMode.value === 'consultation_card' && qrUploadTargetIndex.value !== null) {
+      const target = consultationCard.qrcodes[qrUploadTargetIndex.value]
+      if (target) target.url = footerQrUrl.value
+    } else {
+      const qrMd = footerQrUrl.value ? `![二维码](${footerQrUrl.value})` : ''
+      customFooterTemplate.value = qrMd
+        ? `${qrMd}\n\n${customFooterTemplate.value.replace(/!\[二维码\]\(.*?\)\n\n/, '')}`
+        : customFooterTemplate.value
+    }
     ElMessage.success('二维码已上传')
   } catch (err: any) {
     ElMessage.error(err?.response?.data?.detail || '二维码上传失败')
@@ -274,6 +514,8 @@ async function uploadFooterQr(event: Event) {
 }
 
 async function save() {
+  const footerTemplate = resolveFooterTemplateForSave()
+  if (footerTemplate === undefined) return
   saving.value = true
   try {
     const payload: Record<string, any> = {
@@ -283,16 +525,20 @@ async function save() {
       feed_source_ids: form.feed_source_ids.length > 0 ? form.feed_source_ids : null,
       feed_source_id: form.feed_source_id || null,
       feed_article_ids: form.feed_article_ids.length > 0 ? form.feed_article_ids : null,
+      format_profile_id: form.format_profile_id,
       style: form.style || null,
       knowledge_base_ids: form.knowledge_base_ids.length > 0 ? form.knowledge_base_ids : null,
       day_of_week: form.day_of_week,
       publish_times: form.publish_times,
       articles_per_day: form.articles_per_day,
       html_image_count: form.html_image_count,
+      layout_mode: form.layout_mode,
       account_ids: form.account_ids.length > 0 ? form.account_ids : null,
       publish_mode: form.publish_mode,
+      // 发布域是任务级配置，Worker 会在每个运行记录中冻结该值，避免重试串域。
+      publish_domain: form.publish_domain,
       image_source: form.image_source,
-      footer_template: form.footer_template || null,
+      footer_template: footerTemplate,
       enabled_image_methods: form.enabled_image_methods,
       enable_watermark: form.enable_watermark,
       erp_image_config: form.erp_source_key
@@ -301,8 +547,24 @@ async function save() {
             commodity_category: form.erp_commodity_category.trim() || undefined,
             repeat_after_days: form.erp_repeat_after_days,
             image_count: form.erp_image_count,
+            ...(form.erp_selection_scope.trim()
+              ? { selection_scope: form.erp_selection_scope.trim() }
+              : {}),
           }
         : null,
+    }
+
+    // 轮换关闭且未被用户改动时不提交新字段，旧任务保存仍保持原请求语义；
+    // 用户明确关闭一个原本已启用的轮换任务时才发送 null，触发后端版本隔离。
+    if (rotationConfigTouched.value || form.template_rotation_config.enabled) {
+      payload.template_rotation_config = form.template_rotation_config.enabled
+        ? {
+            enabled: true,
+            profile_ids: [...form.template_rotation_config.profile_ids],
+            basis: form.template_rotation_config.basis,
+            uses_per_template: form.template_rotation_config.uses_per_template,
+          }
+        : null
     }
 
     if (editing.value && currentId.value) {
@@ -405,6 +667,30 @@ onMounted(load)
             <span>{{ task.publish_mode === 'direct' ? '直接发布' : '存草稿箱' }}</span>
           </div>
           <div class="info-row">
+            <span class="label">发布域</span>
+            <span>{{ task.publish_mode === 'direct' ? (task.publish_domain === 'private' ? '私域群发' : '公域发布') : '草稿不区分域' }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">文章版式</span>
+            <span>{{ task.layout_mode === 'seamless_poster' ? '无缝海报' : '普通文章 / HTML仿写' }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">写作模板</span>
+            <span>{{ getWritingStyleTemplateLabel(task.style) }}</span>
+          </div>
+          <div v-if="task.writing_mode === 'feed'" class="info-row">
+            <span class="label">格式模板</span>
+            <span>{{ getFormatProfileLabel(task.format_profile_id) }}</span>
+          </div>
+          <div class="info-row">
+            <span class="label">水印</span>
+            <span v-if="task.watermark_config?.enabled && task.watermark_config.type === 'text'">
+              固定文字：{{ task.watermark_config.content || '未设置' }}（{{ task.watermark_config.font_size || 24 }}px）
+            </span>
+            <span v-else-if="task.watermark_config?.enabled">固定 Logo 水印</span>
+            <span v-else>{{ task.enable_watermark ? '启用，跟随任务设置' : '关闭' }}</span>
+          </div>
+          <div class="info-row">
             <span class="label">封面来源</span>
             <span>{{ { DASHSCOPE: 'AI 生图', local: '本地素材库', erp: 'ERP 产品库' }[task.image_source] || task.image_source }}</span>
           </div>
@@ -454,10 +740,27 @@ onMounted(load)
             </el-form-item>
           </el-col>
           <el-col :span="8">
-            <el-form-item label="写作风格">
-              <el-select v-model="form.style" clearable placeholder="选择风格（可选）" class="full-width">
-                <el-option v-for="opt in styleOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+            <el-form-item label="写作模板">
+              <el-select v-model="form.style" clearable placeholder="自动匹配内容来源" class="full-width">
+                <el-option label="自动匹配内容来源" value="" />
+                <el-option
+                  v-for="option in writingStyleTemplates"
+                  :key="option.identifier"
+                  :label="option.label"
+                  :value="option.identifier"
+                />
+                <el-option
+                  v-if="hasLegacyWritingStyle"
+                  :label="`历史任务风格（${form.style}）`"
+                  :value="form.style"
+                />
               </el-select>
+              <span v-if="selectedWritingStyleTemplate" class="form-hint">
+                {{ selectedWritingStyleTemplate.description }}
+              </span>
+              <span v-else-if="hasLegacyWritingStyle" class="form-hint">
+                这是旧任务已有的风格配置；不修改时会原样保留。
+              </span>
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -470,6 +773,16 @@ onMounted(load)
             </el-form-item>
           </el-col>
         </el-row>
+
+        <el-form-item label="文章版式">
+          <el-radio-group v-model="form.layout_mode">
+            <el-radio value="standard">普通文章 / HTML仿写</el-radio>
+            <el-radio value="seamless_poster">无缝海报</el-radio>
+          </el-radio-group>
+          <span class="form-hint">
+            默认使用普通文章版式。只有明确选择“无缝海报”时，任务才会读取海报格式规则；已有“绣蔓仿写”等任务不会被自动切换。
+          </span>
+        </el-form-item>
 
         <el-form-item v-if="form.content_type === 'article'" label="正文配图来源（可多选）">
           <el-checkbox-group v-model="form.enabled_image_methods">
@@ -530,23 +843,158 @@ onMounted(load)
             <div v-else-if="loadingFeedArticles" class="feed-articles-banner">
               <el-skeleton :rows="1" animated />
             </div>
-            <span class="form-hint">需要先在「投喂源」中添加来源并执行「分析」才能获取风格特征；选择具体文章可让 AI 直接仿写原文风格</span>
+            <span class="form-hint">投喂源导入链接后会自动分析文章格式；保存任务时系统会按具体文章或来源最新模板自动绑定。选择具体文章可让 AI 同时参考原文风格。</span>
           </div>
         </el-form-item>
 
-        <el-form-item label="文章底部固定内容（可选）">
-          <div style="width:100%">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-              <input ref="qrFileInput" type="file" accept="image/*" style="display:none" @change="uploadFooterQr" />
-              <el-button size="small" @click="(qrFileInput as any)?.click()" :loading="uploadingQr">📷 上传二维码</el-button>
-              <span v-if="footerQrUrl" style="color:#67c23a;font-size:13px">✅ 已上传</span>
-              <span class="form-hint" style="margin-left:8px">上传后自动添加到页脚</span>
+        <el-form-item label="格式模板覆盖（可选）">
+          <el-select v-model="form.format_profile_id" clearable placeholder="选择来源模板" style="width:100%">
+            <el-option
+              v-for="profile in formatProfiles"
+              :key="profile.id"
+              :value="profile.id"
+              :label="`${profile.name} v${profile.version}`"
+            >
+                <span>{{ profile.name }} v{{ profile.version }}</span>
+                <span style="float:right;display:flex;gap:8px;color:#909399;font-size:12px">
+                  <span>{{ profile.render_mode === 'poster_gallery' ? '无缝海报' : 'HTML 版式' }}</span>
+                  <span>来源模板</span>
+                </span>
+            </el-option>
+          </el-select>
+          <span class="form-hint">
+            系统仍会自动绑定投喂文章的最新格式模板；手动选择后固定使用该版式。留空时保持原有任务的自动或历史行为。
+          </span>
+        </el-form-item>
+
+        <el-form-item label="来源模板轮换（可选）">
+          <div class="template-rotation-config">
+            <div class="rotation-toggle-row">
+              <el-switch
+                v-model="form.template_rotation_config.enabled"
+                active-text="启用模板轮换"
+                @change="markRotationConfigTouched"
+              />
+              <span class="form-hint">关闭时保持当前任务的固定模板逻辑</span>
             </div>
-            <el-input v-model="form.footer_template" type="textarea" :rows="2" placeholder="其他固定内容（如联系方式），二维码会自动加在前面" />
-            <div v-if="footerQrUrl" style="margin-top:8px;display:flex;align-items:center;gap:8px">
-              <img :src="footerQrUrl" style="width:48px;height:48px;border-radius:4px;object-fit:cover" />
-              <span style="font-size:12px;color:#909399">二维码将显示在页脚</span>
+
+            <div v-if="form.template_rotation_config.enabled" class="rotation-settings">
+              <el-form-item label="轮换模板顺序" required>
+                <el-select
+                  v-model="form.template_rotation_config.profile_ids"
+                  multiple
+                  collapse-tags
+                  collapse-tags-tooltip
+                  placeholder="选择至少 2 个来源模板"
+                  style="width:100%"
+                  @change="markRotationConfigTouched"
+                >
+                  <el-option
+                    v-for="profile in formatProfiles"
+                    :key="profile.id"
+                    :value="profile.id"
+                    :label="getRotationProfileLabel(profile.id)"
+                  >
+                    <span>{{ getRotationProfileLabel(profile.id) }}</span>
+                  </el-option>
+                </el-select>
+                <div v-if="rotationProfileIds.length" class="rotation-order-list">
+                  <div
+                    v-for="(profileId, index) in rotationProfileIds"
+                    :key="profileId"
+                    class="rotation-order-item"
+                  >
+                    <span class="rotation-order-index">{{ index + 1 }}</span>
+                    <span class="rotation-order-name">{{ getRotationProfileLabel(profileId) }}</span>
+                    <el-button
+                      text
+                      circle
+                      :icon="ArrowUp"
+                      :disabled="index === 0"
+                      title="上移模板"
+                      @click="moveRotationProfile(index, -1)"
+                    />
+                    <el-button
+                      text
+                      circle
+                      :icon="ArrowDown"
+                      :disabled="index === rotationProfileIds.length - 1"
+                      title="下移模板"
+                      @click="moveRotationProfile(index, 1)"
+                    />
+                  </div>
+                </div>
+              </el-form-item>
+
+              <el-row :gutter="16">
+                <el-col :span="12">
+                  <el-form-item label="切换依据">
+                    <el-radio-group
+                      v-model="form.template_rotation_config.basis"
+                      @change="markRotationConfigTouched"
+                    >
+                      <el-radio value="publish_day">按发布日</el-radio>
+                      <el-radio value="publish_run">按发布次数</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+                </el-col>
+                <el-col :span="12">
+                  <el-form-item label="每个模板连续使用次数">
+                    <el-input-number
+                      v-model="form.template_rotation_config.uses_per_template"
+                      :min="1"
+                      :max="365"
+                      style="width:100%"
+                      @change="markRotationConfigTouched"
+                    />
+                  </el-form-item>
+                </el-col>
+              </el-row>
+              <span class="form-hint">
+                按发布日时，同一天的多个发布时间共用一个模板；按发布次数时，每次发布按顺序切换。达到连续使用次数后进入下一个模板。
+              </span>
             </div>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="文章底部固定内容">
+          <div class="footer-template-editor">
+            <el-radio-group v-model="footerTemplateMode" @change="handleFooterTemplateModeChange">
+              <el-radio value="none">不添加</el-radio>
+              <el-radio value="consultation_card">产品咨询卡</el-radio>
+              <el-radio value="custom">自定义内容</el-radio>
+            </el-radio-group>
+
+            <div v-if="footerTemplateMode === 'consultation_card'" class="consultation-card-editor">
+              <el-row :gutter="12">
+                <el-col :span="12">
+                  <el-input v-model="consultationCard.brand" placeholder="品牌名称，例如：剪纸系列" />
+                </el-col>
+                <el-col :span="12">
+                  <el-input v-model="consultationCard.phone" placeholder="咨询电话" />
+                </el-col>
+              </el-row>
+              <div class="consultation-qr-list">
+                <div v-for="(qr, index) in consultationCard.qrcodes" :key="index" class="consultation-qr-row">
+                  <el-input v-model="qr.label" placeholder="二维码名称，例如：企业微信" />
+                  <el-input v-model="qr.url" placeholder="二维码图片地址" />
+                  <el-button size="small" :loading="uploadingQr && qrUploadTargetIndex === index" @click="openQrUploader(index)">上传</el-button>
+                  <el-button v-if="consultationCard.qrcodes.length > 1" size="small" text type="danger" @click="removeConsultationQrCode(index)">删除</el-button>
+                </div>
+              </div>
+              <el-button size="small" text @click="addConsultationQrCode">+ 添加二维码</el-button>
+              <span class="form-hint">自动生成“产品咨询”卡片。绣蔓可填企业微信和抖音两个二维码，其他公众号按需要添加。</span>
+            </div>
+
+            <div v-else-if="footerTemplateMode === 'custom'" class="custom-footer-editor">
+              <div class="footer-upload-row">
+                <el-button size="small" :loading="uploadingQr" @click="openQrUploader()">上传二维码</el-button>
+                <span v-if="footerQrUrl" class="upload-success">已上传</span>
+                <span class="form-hint">上传后会插入到自定义内容开头</span>
+              </div>
+              <el-input v-model="customFooterTemplate" type="textarea" :rows="3" placeholder="可填写其他固定内容；二维码使用 Markdown 格式" />
+            </div>
+            <input ref="qrFileInput" type="file" accept="image/*" style="display:none" @change="uploadFooterQr" />
           </div>
         </el-form-item>
 
@@ -571,11 +1019,22 @@ onMounted(load)
           {{ form.publish_mode === 'direct' ? '⚠️ 直接发布将立即推送给订阅用户，请确认内容无误' : '保存到微信草稿箱，可手动检查后再发布' }}
         </span>
 
+        <el-form-item v-if="form.account_ids.length > 0" label="发布域">
+          <el-radio-group v-model="form.publish_domain" :disabled="form.publish_mode !== 'direct'">
+            <el-radio value="public">公域发布</el-radio>
+            <el-radio value="private">私域群发</el-radio>
+          </el-radio-group>
+          <span class="form-hint" style="display:block;margin-top:4px">
+            {{ form.publish_mode === 'direct' ? '公域发布面向所有用户；私域群发面向公众号粉丝。' : '存草稿箱阶段不会触发公域或私域发送。' }}
+          </span>
+        </el-form-item>
+
         <el-divider />
         <el-form-item label="水印">
           <div class="watermark-toggle-row">
-            <el-switch v-model="form.enable_watermark" active-text="添加水印" inactive-text="无水印" />
-            <span class="form-hint">在「水印设置」中配置样式</span>
+            <el-switch v-model="form.enable_watermark" :disabled="fixedWatermarkLocked" active-text="添加水印" inactive-text="无水印" />
+            <span v-if="fixedWatermarkLocked" class="form-hint">当前任务已锁定固定水印</span>
+            <span v-else class="form-hint">在「水印设置」中配置样式</span>
           </div>
         </el-form-item>
 
@@ -666,6 +1125,20 @@ onMounted(load)
 .slot-row, .time-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .slot-index { min-width: 24px; font-size: 13px; color: #909399; }
 .feed-source-wrapper { width: 100%; }
+.template-rotation-config { width: 100%; }
+.rotation-toggle-row { display: flex; align-items: center; gap: 12px; min-height: 32px; }
+.rotation-settings { margin-top: 14px; padding: 14px; border: 1px solid #ebeef5; border-radius: 6px; background: #fafafa; }
+.rotation-settings :deep(.el-form-item) { margin-bottom: 14px; }
+.rotation-order-list { display: grid; gap: 6px; margin-top: 8px; }
+.rotation-order-item { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 4px 8px; border: 1px solid #ebeef5; border-radius: 4px; background: #fff; }
+.rotation-order-index { width: 20px; color: #909399; font-size: 12px; text-align: center; }
+.rotation-order-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #606266; font-size: 13px; }
+.footer-template-editor { width: 100%; }
+.consultation-card-editor, .custom-footer-editor { margin-top: 12px; padding: 14px; border: 1px solid #e7e1d9; border-radius: 6px; background: #fcfbf8; }
+.consultation-qr-list { display: grid; gap: 8px; margin: 12px 0 8px; }
+.consultation-qr-row { display: grid; grid-template-columns: minmax(110px, 0.8fr) minmax(180px, 2fr) auto auto; gap: 8px; align-items: center; }
+.footer-upload-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.upload-success { color: #529a72; font-size: 13px; }
 .erp-rule-grid { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr; gap: 10px; width: 100%; }
 .erp-rule-labels { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr; gap: 10px; width: 100%; margin-top: 5px; color: #909399; font-size: 12px; }
 .feed-articles-banner { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
@@ -678,4 +1151,8 @@ onMounted(load)
 .feed-article-item .article-info { flex: 1; min-width: 0; }
 .feed-article-item .article-info strong { display: block; font-size: 14px; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; }
 .feed-article-item .article-info p { font-size: 12px; color: #909399; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 700px) {
+  .consultation-qr-row { grid-template-columns: 1fr; }
+  .consultation-qr-row .el-button { justify-self: start; }
+}
 </style>

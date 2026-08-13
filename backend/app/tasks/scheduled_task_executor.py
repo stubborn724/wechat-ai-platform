@@ -11,6 +11,7 @@ from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
 from app.models.mysql_models import ScheduledTask, ScheduledTaskRun
 from app.schemas.article import ImageResult
+from app.services.publish_domain_policy import normalize_publish_domain
 from app.services.scheduled_erp_image_policy import find_due_schedule_times
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 # 足够恢复时间，也避免配置错误或永久故障造成无限调用和重复发布。
 SCHEDULED_TASK_RETRY_DELAYS = (120, 300, 900)
 SCHEDULED_TASK_MAX_ATTEMPTS = len(SCHEDULED_TASK_RETRY_DELAYS) + 1
+# 消息已经写入数据库但尚未被 Worker 认领时，不需要等待长任务保护窗口。
+# 该窗口大于 Beat 的一分钟扫描周期，又能在 Redis/Celery 消息丢失后及时补投。
+SCHEDULED_QUEUED_STALE_SECONDS = 5 * 60
+# retrying 状态的消息通常在等待下一次重试时间；使用短窗口即可接管没有回来
+# 的消息。它与 running 的长窗口职责不同，不能共用 30 分钟。
+SCHEDULED_RETRYING_STALE_SECONDS = 5 * 60
 # HTML 仿写可能包含多轮正文生成和最多 20 张图。保护窗口必须大于正常长任务，
 # 否则 Beat 会把仍在工作的 Worker 误判为丢失并启动并发副本；真正的失败重试仍
 # 使用下方 2/5/15 分钟序列，二者职责不能混用。
@@ -156,8 +163,10 @@ def is_retryable_scheduled_error(error: BaseException) -> bool:
 def should_recover_scheduled_run(run: ScheduledTaskRun, *, now: datetime) -> bool:
     """判断执行记录是否已经超过安全窗口，可以由 Beat 补偿接管。
 
-    ``retrying`` 记录会给 Celery 消息留出一次完整重试窗口，只有消息在下一次
-    重试时间之后仍未回到 Worker 才再次补偿；新鲜的 running 记录绝不能被并发复制。
+    ``queued`` 只有在已经产生投递尝试时才代表“消息可能丢失”；尚未派发的等待
+    记录必须无限期留在数据库队列中，不能因为前一个长任务执行超过五分钟而被
+    重复投递。新鲜的 ``running`` 记录仍使用长窗口，防止图片生成等正常长任务
+    被并发复制。数据库锁和执行入口的消息 ID 校验会进一步阻止重复执行。
     """
 
     status = str(getattr(run, "status", "") or "").lower()
@@ -165,13 +174,21 @@ def should_recover_scheduled_run(run: ScheduledTaskRun, *, now: datetime) -> boo
         next_retry_at = getattr(run, "next_retry_at", None)
         return bool(
             next_retry_at
-            and now >= next_retry_at + timedelta(seconds=SCHEDULED_RUN_STALE_SECONDS)
+            and now >= next_retry_at + timedelta(seconds=SCHEDULED_RETRYING_STALE_SECONDS)
         )
     if status == "queued":
+        # attempt_count 表示 Worker 实际认领过的执行次数；初始等待记录为 0，
+        # celery_task_id/next_retry_at 均为空。只有已经尝试投递的记录才允许进入
+        # 丢消息补偿窗口，避免正常排队任务被错误地增加尝试次数。
+        attempt_count = int(getattr(run, "attempt_count", 0) or 0)
+        celery_task_id = str(getattr(run, "celery_task_id", "") or "").strip()
+        dispatch_time = getattr(run, "next_retry_at", None)
+        if attempt_count <= 0 and not celery_task_id and dispatch_time is None:
+            return False
         # ``created_at`` 属于原始计划时段，Worker 丢失后重新入队仍可能是几天后；
         # 优先使用本次入队写入的 ``next_retry_at``，避免 Beat 刚派发就再次复制。
         reference_time = (
-            getattr(run, "next_retry_at", None)
+            dispatch_time
             or getattr(run, "started_at", None)
             or getattr(run, "created_at", None)
         )
@@ -179,10 +196,98 @@ def should_recover_scheduled_run(run: ScheduledTaskRun, *, now: datetime) -> boo
         reference_time = getattr(run, "started_at", None)
     else:
         return False
-    return bool(
-        reference_time
-        and now - reference_time >= timedelta(seconds=SCHEDULED_RUN_STALE_SECONDS)
+    stale_seconds = (
+        SCHEDULED_QUEUED_STALE_SECONDS
+        if status == "queued"
+        else SCHEDULED_RUN_STALE_SECONDS
     )
+    # 使用严格大于，避免刚好到达保护窗口边界时与 Beat 的下一次扫描并发
+    # 触发两次补偿；下一分钟扫描会安全接管超过窗口的记录。
+    return bool(reference_time and now - reference_time > timedelta(seconds=stale_seconds))
+
+
+def is_scheduled_run_in_flight(run: ScheduledTaskRun) -> bool:
+    """判断一条记录是否占用唯一的定时任务执行槽位。
+
+    定时文章故意采用单 Worker 串行处理，数据库中状态是可靠队列的唯一依据：
+    ``running`` 和 ``retrying`` 必须阻塞后续派发；``queued`` 只有已经写入投递
+    时间或 Celery 消息 ID 时才是“在途消息”。初始 ``queued`` 记录只是等待，
+    可以被调度器选为下一条队头。
+    """
+
+    status = str(getattr(run, "status", "") or "").lower()
+    if status in {"running", "retrying"}:
+        return True
+    if status != "queued":
+        return False
+    return bool(
+        int(getattr(run, "attempt_count", 0) or 0) > 0
+        or str(getattr(run, "celery_task_id", "") or "").strip()
+        or getattr(run, "next_retry_at", None) is not None
+    )
+
+
+def _scheduled_run_sort_key(run: ScheduledTaskRun) -> tuple[str, str, int]:
+    """返回定时任务运行记录的稳定队列顺序。
+
+    任务可能来自不同的定时配置，因此不能按某一个 task_id 分别排队；统一使用
+    计划日期、计划时间和自增 ID 排序，保证同一分钟创建的记录也有确定顺序。
+    """
+
+    return (
+        str(getattr(run, "scheduled_date", "") or ""),
+        str(getattr(run, "scheduled_time", "") or ""),
+        int(getattr(run, "id", 0) or 0),
+    )
+
+
+def select_next_waiting_scheduled_run(
+    runs: list[ScheduledTaskRun],
+) -> ScheduledTaskRun | None:
+    """从活动运行记录中选择下一条真正等待派发的记录。
+
+    队列是全局串行的：只要存在已经派发、正在运行或等待重试的记录，后续记录
+    都必须留在数据库中等待。只有没有任何在途记录时，才选择最早的初始 queued
+    记录；这一步是避免“第三个任务排队五分钟后被误补投”的核心边界。
+    """
+
+    active_runs = sorted(
+        [
+            run
+            for run in runs
+            if str(getattr(run, "status", "") or "").lower()
+            in {"queued", "running", "retrying"}
+        ],
+        key=_scheduled_run_sort_key,
+    )
+    if any(is_scheduled_run_in_flight(run) for run in active_runs):
+        return None
+
+    for run in active_runs:
+        if str(getattr(run, "status", "") or "").lower() == "queued":
+            return run
+    return None
+
+
+def _load_active_scheduled_runs(db, *, lock: bool = False) -> list[ScheduledTaskRun]:
+    """读取活动队列记录，并在调度关键区按需加数据库行锁。
+
+    行锁让多个 Beat 或 API 线程同时检查队列时共享同一份队列视图；提交派发
+    记录前，其他检查者不能同时把下一条任务也认领成在途消息。
+    """
+
+    query = (
+        db.query(ScheduledTaskRun)
+        .filter(ScheduledTaskRun.status.in_(["queued", "running", "retrying"]))
+        .order_by(
+            ScheduledTaskRun.scheduled_date.asc(),
+            ScheduledTaskRun.scheduled_time.asc(),
+            ScheduledTaskRun.id.asc(),
+        )
+    )
+    if lock:
+        query = query.with_for_update()
+    return query.all()
 
 
 def mark_scheduled_run_retry(
@@ -221,9 +326,39 @@ def mark_scheduled_run_retry(
     return False
 
 
-def is_article_delivery_complete(article, publish_mode: str) -> bool:
-    """判断文章是否已经完成微信交付，供重试入口幂等短路。"""
+def resolve_scheduled_publish_domain(task, run: ScheduledTaskRun | None = None) -> str:
+    """解析一次定时运行实际使用的发布域。
 
+    已创建的运行记录优先使用自己的快照，避免用户后来编辑任务配置时改变已
+    排队时段；没有快照的历史运行才回退到任务字段，保证旧数据能够继续重试。
+    """
+
+    run_domain = getattr(run, "publish_domain", None) if run is not None else None
+    task_domain = getattr(task, "publish_domain", None)
+    return normalize_publish_domain(run_domain or task_domain)
+
+
+def is_article_delivery_complete(
+    article,
+    publish_mode: str,
+    publish_domain: str = "public",
+) -> bool:
+    """判断文章是否已经完成同一发布域的微信交付，供重试入口幂等短路。"""
+
+    normalized_domain = normalize_publish_domain(publish_domain)
+    article_domain = getattr(article, "publish_domain", None)
+    # 历史文章没有快照时沿用旧的“有外部 ID 即视为已交付”规则；新文章若已
+    # 记录域且与当前运行不同，则不能把公域结果当作私域结果复用。
+    # 私域能力是本次新增的，历史直发布文章不可能是私域交付；只有草稿模式
+    # 或历史默认公域可以兼容短路。
+    if (
+        not article_domain
+        and publish_mode == "direct"
+        and normalized_domain == "private"
+    ):
+        return False
+    if article_domain and normalize_publish_domain(article_domain) != normalized_domain:
+        return False
     status = str(getattr(article, "status", "") or "").lower()
     if publish_mode == "draft" and status == "draft_saved":
         return True
@@ -245,11 +380,12 @@ def _enqueue_scheduled_run(
     reason: str,
     allow_fresh: bool = False,
 ) -> bool:
-    """为初次执行或 Worker 丢失的运行记录预留一次尝试并派发消息。
+    """为队头运行记录派发一次 Celery 消息。
 
-    先把 ``attempt_count`` 和 ``queued`` 写入数据库，再发送 Celery 消息；如果
-    当前进程在发送后立即崩溃，下一次 Beat 扫描仍能根据记录恢复。消息 ID 最终
-    写回数据库用于识别同一消息的 Worker 丢失重投，避免新旧执行并发生成。
+    ``attempt_count`` 只统计 Worker 真正开始执行的次数，不能在消息投递前增加；
+    否则 Broker 暂时不可用或任务仅仅排队时，会错误消耗“最大执行次数”。先把
+    当前记录标成已派发，再发送消息，能让调度器在进程发送后立即崩溃时通过恢复
+    窗口补投；消息 ID 最终写回数据库，用于识别同一消息的安全重投。
     ``allow_fresh`` 仅用于新计划时段的第一次派发；恢复路径必须重新检查过期窗口，
     这样多个 Beat 同时扫描时只有第一个恢复者能够成功入队。
     """
@@ -266,21 +402,20 @@ def _enqueue_scheduled_run(
         logger.warning("定时任务运行记录不存在 task_id=%s run_id=%s", task_id, run.id)
         return False
     run = locked_run
-    if not allow_fresh and not should_recover_scheduled_run(run, now=now):
+    if allow_fresh:
+        # 新队头只能来自尚未派发的初始 queued 记录。即使调用方拿到的是
+        # 旧查询结果，也不能在行锁内把已经被另一个 Beat 标记为在途的记录再次
+        # 派发；这一步是数据库队列的并发闸门。
+        if (
+            str(getattr(run, "status", "") or "").lower() != "queued"
+            or is_scheduled_run_in_flight(run)
+        ):
+            return False
+    elif not should_recover_scheduled_run(run, now=now):
         # 多个 Beat 可能同时扫描到同一条过期记录。第一个事务提交后，后续
         # 进程必须重新检查保护窗口，不能因为旧查询结果继续派发重复消息。
         return False
 
-    attempt_count = int(getattr(run, "attempt_count", 0) or 0) + 1
-    if attempt_count > SCHEDULED_TASK_MAX_ATTEMPTS:
-        run.status = "failed"
-        run.error_message = "定时任务超过最大尝试次数，已停止自动重试"
-        run.next_retry_at = None
-        run.finished_at = now
-        db.commit()
-        return False
-
-    run.attempt_count = attempt_count
     run.status = "queued"
     run.started_at = None
     run.finished_at = None
@@ -292,13 +427,26 @@ def _enqueue_scheduled_run(
     db.commit()
 
     try:
-        async_result = execute_scheduled_article.delay(task_id, run.id)
+        # 这里由普通 Worker 中的检查任务发起，不能只依赖 Celery 的全局路由。
+        # 在 Worker 重启后的积压恢复场景中，显式指定交换路由可确保文章执行消息
+        # 始终进入专用 scheduled 队列，而不会出现数据库已标记派发、Worker 却
+        # 没有收到消息的悬挂记录。
+        async_result = execute_scheduled_article.apply_async(
+            args=(task_id, run.id),
+            queue="scheduled",
+            routing_key="scheduled",
+            retry=True,
+        )
     except Exception as exc:
         # Broker 短暂不可用时也不能把记录留在 queued 假装已经派发；下一次
         # Beat 会在保护窗口后重新接管这条记录。
         run.status = "retrying"
         run.error_message = f"Celery 派发失败：{exc}"[:4000]
-        run.next_retry_at = now + timedelta(seconds=get_scheduled_retry_delay(attempt_count))
+        # 派发失败不是一次内容执行失败，不消耗 attempt_count；恢复扫描会在
+        # 延迟窗口后再次尝试同一条队头记录，后续任务继续留在数据库中等待。
+        run.next_retry_at = now + timedelta(seconds=get_scheduled_retry_delay(
+            int(getattr(run, "attempt_count", 0) or 0) + 1
+        ))
         db.commit()
         logger.error("定时任务派发失败 task_id=%s run_id=%s: %s", task_id, run.id, exc)
         return False
@@ -317,32 +465,61 @@ def _enqueue_scheduled_run(
 
 
 def _recover_stale_scheduled_runs(db, *, now: datetime | None = None) -> int:
-    """补偿 Worker 中断、Broker 丢消息或进程重启留下的旧运行记录。"""
+    """补偿队头 Worker 中断、Broker 丢消息或进程重启留下的旧运行记录。
+
+    恢复同样遵守单 Worker 队列约束：一次扫描最多重投一条消息；如果还有新鲜的
+    在途记录，后面的历史记录不能被提前派发。初始 ``queued`` 记录不属于丢消息，
+    由 ``_dispatch_next_waiting_scheduled_run`` 按顺序派发。
+    """
 
     now = now or datetime.utcnow()
-    runs = (
-        db.query(ScheduledTaskRun)
-        .filter(ScheduledTaskRun.status.in_(["queued", "running", "retrying"]))
-        .all()
-    )
-    recovered = 0
+    runs = _load_active_scheduled_runs(db)
+    # 任何新鲜在途记录都代表唯一 Worker 仍可能正在处理队头；不能因为另一个
+    # 旧记录已经超过窗口，就把它也重新投递，避免队列里出现两个生成副本。
+    if any(
+        is_scheduled_run_in_flight(run)
+        and not should_recover_scheduled_run(run, now=now)
+        for run in runs
+    ):
+        return 0
+
     for run in runs:
         if not should_recover_scheduled_run(run, now=now):
             continue
-        if int(getattr(run, "attempt_count", 0) or 0) >= SCHEDULED_TASK_MAX_ATTEMPTS:
-            run.status = "failed"
-            run.error_message = "Worker 中断后已达到最大尝试次数，已停止自动重试"
-            run.next_retry_at = None
-            run.finished_at = now
-            db.commit()
-            continue
-
-        reason = f"检测到 {run.status} 运行记录超过 {SCHEDULED_RUN_STALE_SECONDS // 60} 分钟，自动接管"
+        reason = (
+            f"检测到 {run.status} 运行记录超过保护窗口，自动重新排入队头"
+        )
         if _enqueue_scheduled_run(db, run.task_id, run, reason=reason):
-            recovered += 1
-    if recovered:
-        logger.warning("已补偿接管 %d 条过期定时任务运行记录", recovered)
-    return recovered
+            logger.warning(
+                "已补偿定时任务队头 task_id=%s run_id=%s，后续记录继续等待",
+                run.task_id,
+                run.id,
+            )
+            return 1
+        # 派发失败后记录会变成 retrying，仍然是队头；本轮不能继续派发下一条。
+        return 0
+    return 0
+
+
+def _dispatch_next_waiting_scheduled_run(db) -> bool:
+    """只派发全局队列中最早的一条尚未投递记录。
+
+    新任务到达时先写入 ``scheduled_task_runs``，再由这里挑选队头。队头执行期间
+    后续记录保持 ``queued/attempt_count=0``，不会因等待时间超过五分钟而触发
+    补偿，也不会被错误地同时发送到 Celery。
+    """
+
+    runs = _load_active_scheduled_runs(db, lock=True)
+    run = select_next_waiting_scheduled_run(runs)
+    if run is None:
+        return False
+    return _enqueue_scheduled_run(
+        db,
+        run.task_id,
+        run,
+        reason="按全局定时任务顺序进入执行队列",
+        allow_fresh=True,
+    )
 
 
 def _claim_scheduled_run(
@@ -380,10 +557,10 @@ def _claim_scheduled_run(
             return False
 
     attempt_count = int(getattr(run, "attempt_count", 0) or 0)
-    # queued 状态由派发辅助函数预留了尝试次数；执行入口只需认领，不应重复增加。
-    pre_reserved = status == "queued" and attempt_count > 0
-    if not pre_reserved:
-        attempt_count += 1
+    # attempt_count 只在 Worker 真正认领新消息时递增。初次派发、失败重试和
+    # Worker 中断恢复都可以先经过 queued 状态，但它们本身不是一次内容执行；
+    # 在这里统一计数，才能让“最多四次执行”与“排队/补投次数”彻底分离。
+    attempt_count += 1
     if attempt_count > SCHEDULED_TASK_MAX_ATTEMPTS:
         run.status = "failed"
         run.error_message = "定时任务超过最大尝试次数，已停止自动重试"
@@ -446,14 +623,32 @@ def _is_successful_scheduled_delivery(
     article_id: int,
     account_id: int,
     publish_mode: str,
+    publish_domain: str = "public",
 ) -> bool:
-    """判断某篇文章是否已经在指定公众号完成同一种交付。"""
+    """判断某篇文章是否已经在指定公众号完成同一种交付和发布域。"""
 
+    normalized_domain = normalize_publish_domain(publish_domain)
     result = delivery_results.get(_scheduled_delivery_key(article_id, account_id))
+    recorded_domain = result.get("publish_domain") if isinstance(result, dict) else None
     return bool(
         isinstance(result, dict)
         and result.get("status") == "success"
         and result.get("mode") == publish_mode
+        # 旧结果没有域字段时只在草稿或默认公域下兼容复用；私域必须有新字段
+        # 证明它确实经过了 follower_push，不能拿历史公域结果顶替。
+        and (
+            (
+                recorded_domain is None
+                and (
+                    publish_mode == "draft"
+                    or normalized_domain == "public"
+                )
+            )
+            or (
+                recorded_domain is not None
+                and normalize_publish_domain(recorded_domain) == normalized_domain
+            )
+        )
     )
 
 
@@ -566,11 +761,32 @@ def check_scheduled_tasks():
                 grace_minutes=5,
             )
             for schedule_time in due_times:
+                from app.services.scheduled_template_rotation_service import (
+                    resolve_rotation_profile_for_scheduled_slot,
+                )
+
+                rotation_profile_id, rotation_version = (
+                    resolve_rotation_profile_for_scheduled_slot(
+                        db,
+                        task=task,
+                        scheduled_date=today,
+                        scheduled_time=schedule_time,
+                    )
+                )
                 # 唯一约束与独立提交共同防止 API 后台线程和 Celery Beat 并发重复触发。
                 run = ScheduledTaskRun(
                     task_id=task.id,
                     scheduled_date=today,
                     scheduled_time=schedule_time,
+                    # 在入队时冻结发布域。任务后续编辑只影响新的时间段，不能
+                    # 改变已经排队的公域/私域交付意图。
+                    publish_domain=normalize_publish_domain(
+                        getattr(task, "publish_domain", None)
+                    ),
+                    # 轮换模板在入队瞬间冻结；关闭轮换时保持空值，Worker 继续读取
+                    # 任务上的历史单模板字段，确保旧任务无行为变化。
+                    format_profile_id=rotation_profile_id,
+                    template_rotation_version=rotation_version,
                     status="queued",
                 )
                 db.add(run)
@@ -581,15 +797,18 @@ def check_scheduled_tasks():
                     logger.warning("Task %d slot %s was already claimed or could not be created: %s", task.id, schedule_time, exc)
                     continue
 
-                logger.info("Triggering scheduled task %d at %s: %s", task.id, schedule_time, (task.topic or task.name)[:60])
-                if _enqueue_scheduled_run(
-                    db,
+                # 这里只创建可靠队列记录，不立即把所有到期任务一起发送到
+                # Celery。扫描结束后由统一队头调度器只派发最早的一条，其他记录
+                # 保持 attempt_count=0 的纯等待状态，前一个长任务多久都不影响它们。
+                logger.info(
+                    "已创建定时任务队列记录 task_id=%d scheduled_time=%s: %s",
                     task.id,
-                    run,
-                    reason="首次到达计划发布时间，已进入执行队列",
-                    allow_fresh=True,
-                ):
-                    triggered += 1
+                    schedule_time,
+                    (task.topic or task.name)[:60],
+                )
+
+        if _dispatch_next_waiting_scheduled_run(db):
+            triggered = 1
 
         logger.info("Scheduled tasks: %d due tasks, %d jobs created", len(tasks), triggered)
         return {"tasks_checked": len(tasks), "jobs_created": triggered}
@@ -689,6 +908,13 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
                     "status": "already_running",
                 }
 
+        publish_domain = resolve_scheduled_publish_domain(task, run)
+        if run is not None and not getattr(run, "publish_domain", None):
+            # 旧版本运行记录没有发布域字段，首次被 Worker 接管时补齐快照，
+            # 后续重试始终使用同一域。迁移后的新记录不会进入该分支。
+            run.publish_domain = publish_domain
+            db.commit()
+
         # 用户没提供主题时，不给兜底值 — 让具体处理函数自行决定（仿写标题或回退任务名）
         topic = task.topic  # 可能为 None
         fallback_topic = task.name
@@ -698,14 +924,18 @@ def execute_scheduled_article(self, task_id: int, run_id: int | None = None):
 
         print(f"\n{'='*60}")
         print(f"  [定时任务 {task_id}] content_type={content_type} topic={topic or '(用户未设置)'}")
-        print(f"  accounts={account_ids} mode={publish_mode}")
+        print(f"  accounts={account_ids} mode={publish_mode} domain={publish_domain}")
         print(f"{'='*60}")
 
         # 如果上一次异常发生在微信调用之后、数据库最终状态提交之前，重试必须
         # 先识别已经交付的文章；否则同一时段会再次保存草稿或直接发布。
         if run is not None and run.article_id:
             existing_article = db.query(Article).filter(Article.id == run.article_id).first()
-            if existing_article and is_article_delivery_complete(existing_article, publish_mode):
+            if existing_article and is_article_delivery_complete(
+                existing_article,
+                publish_mode,
+                publish_domain,
+            ):
                 run.status = "completed"
                 run.error_message = None
                 run.next_retry_at = None
@@ -906,6 +1136,32 @@ def _scheduled_article(
         has_feed_source=has_feed_source,
         has_knowledge_base=has_knowledge_base,
     )
+    # 格式模板是测试任务的显式能力开关。未绑定时绝不查询/切换格式，确保线上
+    # 绣蔓 ERP 仿写继续使用经过验证的原执行链路与提示词。
+    from app.services.format_profile_task_policy import should_use_format_profile
+
+    # 轮换任务使用运行记录冻结的模板；普通任务继续使用任务级模板。读取运行快照
+    # 是重试一致性的关键，不能只按 task.format_profile_id 重新查询。
+    effective_format_profile_id = (
+        getattr(run, "format_profile_id", None) if run is not None else None
+    ) or getattr(task, "format_profile_id", None)
+    format_profile = None
+    if effective_format_profile_id and (
+        should_use_format_profile(task)
+        or getattr(run, "template_rotation_version", None) is not None
+    ):
+        from app.models.mysql_models import ArticleFormatProfile
+
+        format_profile = (
+            db.query(ArticleFormatProfile)
+            .filter(
+                ArticleFormatProfile.id == effective_format_profile_id,
+                ArticleFormatProfile.tenant_id == task.tenant_id,
+            )
+            .first()
+        )
+        if format_profile is None:
+            raise ValueError("定时任务绑定的格式模板不存在，已停止生成")
     generated_article_id = None
 
     for slot_idx in range(task.articles_per_day or 1):
@@ -944,6 +1200,11 @@ def _scheduled_article(
         # ERP 路径中，投喂源只仿写文章结构与文案；产品图片和知识库背景是唯一
         # 视觉输入。该显式状态会传到 HTML 仿写 Agent，避免它再分析原文章图片。
         state.skip_reference_image_understanding = image_route.mode == "erp_knowledge_background"
+        if format_profile and format_profile.render_mode == "html_slots":
+            # 已保存的模板蓝图直接交给内容 Agent，既不重新分析原 HTML，也不把长
+            # HTML/CSS 发送给文本模型；任务原先选择的投喂源仍可提供风格上下文。
+            state.format_profile_payload = format_profile.template_payload
+            state.format_profile_title_policy = format_profile.title_policy
 
         # 3. 加载投喂源（仿写模式）。无论图片来源为何，文章文本、HTML 结构和
         # 风格档案都必须保留；但 ERP 模式禁止把投喂源图片送入视觉理解或仿写。
@@ -952,13 +1213,27 @@ def _scheduled_article(
             try:
                 from app.models.mysql_models import FeedSource, FeedSourceArticle
 
-                if task.feed_article_ids:
+                rotation_reference_article_id = (
+                    format_profile.source_article_id
+                    if (
+                        format_profile is not None
+                        and getattr(run, "template_rotation_version", None) is not None
+                    )
+                    else None
+                )
+                reference_article_ids = (
+                    [rotation_reference_article_id]
+                    if rotation_reference_article_id
+                    else task.feed_article_ids
+                )
+                if reference_article_ids:
                     refs = db.query(FeedSourceArticle).filter(
-                        FeedSourceArticle.id.in_(task.feed_article_ids),
+                        FeedSourceArticle.id.in_(reference_article_ids),
                         FeedSourceArticle.body_markdown.isnot(None),
                     ).all()
                     if refs:
-                        # 用户明确选中的第一篇文章决定 HTML 版式，其他文章只提供语言风格。
+                        # 轮换模板绑定的来源文章决定本次 HTML 版式；普通任务继续
+                        # 使用用户明确选中的第一篇文章，其他文章只提供语言风格。
                         state.reference_html = refs[0].body_html or None
                         ref_texts = []
                         for r in refs:
@@ -976,8 +1251,13 @@ def _scheduled_article(
                         print(f"  📄 已加载 {len(ref_texts)} 篇用户选中的参考文章，{len(ref_image_urls)} 张参考图片")
                         _load_layout_template(state, refs[0])
 
-                    if task.feed_source_id:
-                        src = db.query(FeedSource).filter(FeedSource.id == task.feed_source_id).first()
+                    style_source_id = (
+                        refs[0].feed_source_id
+                        if rotation_reference_article_id and refs
+                        else task.feed_source_id
+                    )
+                    if style_source_id:
+                        src = db.query(FeedSource).filter(FeedSource.id == style_source_id).first()
                         if src and src.style_profile:
                             state.style_profile = src.style_profile
                             print(f"  🎯 已加载仿写风格: {src.name}")
@@ -1065,10 +1345,25 @@ def _scheduled_article(
                             product_name=prepared_image.product.name,
                             image_url=prepared_image.reference_url,
                         )
+                        # 产品一旦选定就同步冻结空间规则。规则来自 ERP 名称、分类和
+                        # 标签的确定性匹配，不增加模型调用；后续标题、HTML 图片槽位
+                        # 和最终图生图提示词都复用这一份快照，避免同一篇文章出现餐桌、
+                        # 沙发等互相冲突的空间语义。
+                        from app.services.scheduled_product_scene_service import (
+                            resolve_product_scene_profile,
+                        )
+
+                        product_scene_profile = resolve_product_scene_profile(
+                            product_name,
+                            tags=prepared_image.product.tags,
+                            categories=prepared_image.product.categories,
+                        )
+                        s.product_scene_profile = product_scene_profile.to_payload()
                         print(
                             f"  🖼️ ERP 配图: {erp_image_config.commodity_category or '全部分类'}，"
                             f"已选择产品“{product_name}”作为图生图参考，"
-                            f"近 {erp_image_config.repeat_after_days} 天不重复"
+                            f"近 {erp_image_config.repeat_after_days} 天不重复，"
+                            f"场景={product_scene_profile.label}/{product_scene_profile.required_rooms[0]}"
                         )
 
                     article_context = ""
@@ -1120,11 +1415,21 @@ def _scheduled_article(
 
                 await _prepare_product_and_knowledge_context()
 
-                # 纯海报格式由知识库全文决定，不能沿用投喂源/普通文章的“标题、
-                # 大纲、正文、配图”四步链路。格式配置会完整保留图片文案与页脚，
-                # 再把同一张 ERP 原图传给每张海报，确保产品主体始终一致。
-                if task.knowledge_base_ids:
+                # 纯海报格式必须由任务显式开启。知识库只提供规则，不拥有改变
+                # 历史任务输出格式的权限；旧对象没有新字段时也按 standard 处理。
+                layout_mode = getattr(task, "layout_mode", "standard") or "standard"
+                profile_uses_poster_renderer = bool(
+                    format_profile and format_profile.render_mode == "poster_gallery"
+                )
+                if (layout_mode == "seamless_poster" or profile_uses_poster_renderer) and not task.knowledge_base_ids:
+                    raise ScheduledKnowledgeContextError(
+                        "无缝海报任务必须绑定包含海报格式规则的知识库"
+                    )
+                if (layout_mode == "seamless_poster" or profile_uses_poster_renderer) and task.knowledge_base_ids:
                     from app.database import PgSessionLocal
+                    from app.services.brand_knowledge_routing import (
+                        resolve_brand_knowledge_base_ids_for_task,
+                    )
                     from app.services.image_generation_service import image_generation_service
                     from app.services.poster_article_service import (
                         generate_poster_images,
@@ -1134,18 +1439,64 @@ def _scheduled_article(
                         load_publication_format_from_knowledge_bases,
                         render_poster_gallery_html,
                     )
+                    from app.services.format_profile_service import (
+                        apply_poster_template_to_publication_profile,
+                    )
+                    from app.services.scheduled_publication_policy import (
+                        should_use_poster_layout,
+                    )
+                    from app.services.scheduled_product_scene_service import (
+                        product_scene_profile_from_payload,
+                    )
+                    from app.services.scheduled_image_quality_service import (
+                        inspect_generated_image_url,
+                    )
 
+                    poster_knowledge_base_ids = list(task.knowledge_base_ids or [])
                     pg_db = PgSessionLocal()
                     try:
+                        # ERP 来源键是海报背景的品牌边界。任务历史上可能只绑定了
+                        # 背景库，运行时补齐同品牌格式库即可识别纯海报规则，避免
+                        # 要求运营人员手工修改旧任务，也不会把其他品牌规则混入。
+                        poster_knowledge_base_ids = resolve_brand_knowledge_base_ids_for_task(
+                            db=pg_db,
+                            tenant_id=task.tenant_id,
+                            source_key=erp_image_config.source_key if erp_image_config else None,
+                            configured_ids=poster_knowledge_base_ids,
+                        )
                         publication_profile = load_publication_format_from_knowledge_bases(
                             db=pg_db,
-                            knowledge_base_ids=task.knowledge_base_ids,
+                            knowledge_base_ids=poster_knowledge_base_ids,
                             tenant_id=task.tenant_id,
                         )
                     finally:
                         pg_db.close()
 
-                    if publication_profile.is_poster_gallery:
+                    use_poster_layout = should_use_poster_layout(
+                        "seamless_poster" if profile_uses_poster_renderer else layout_mode,
+                        publication_profile,
+                    )
+                    if not use_poster_layout:
+                        raise ScheduledKnowledgeContextError(
+                            "任务已选择无缝海报，但知识库未识别到纯海报格式规则"
+                        )
+
+                    if use_poster_layout:
+                        poster_text_overlay_enabled = bool(
+                            format_profile
+                            and isinstance(format_profile.template_payload, dict)
+                            and format_profile.template_payload.get(
+                                "poster_text_overlay_mode"
+                            )
+                            == "programmatic_text_v1"
+                        )
+                        if profile_uses_poster_renderer:
+                            # 模板只覆盖连续图片数量；知识库仍提供品牌视觉、文案和
+                            # 页脚。两者组合保持当前无缝海报的输出质量与零缝隙 HTML。
+                            publication_profile = apply_poster_template_to_publication_profile(
+                                publication_profile,
+                                format_profile.template_payload,
+                            )
                         # 产品名在准备阶段已写入 ``ArticleState``，海报分支不能
                         # 引用准备函数的局部变量，否则异步边界外会出现未定义错误。
                         if not s.product_name:
@@ -1153,13 +1504,20 @@ def _scheduled_article(
                                 "纯海报定时任务必须配置 ERP 产品图片来源"
                             )
                         print(
-                            f"  🧩 发布格式: 纯海报拼接，标题海报 + "
-                            f"{publication_profile.poster_count} 张内容海报"
+                            "  🧩 发布格式: 纯海报拼接，"
+                            f"{publication_profile.poster_count + 1} 张"
+                            f"{'正文型内容海报' if poster_text_overlay_enabled else '海报'}"
                         )
                         s.footer_template = publication_profile.footer_template
                         poster_plan = await generate_poster_plan(
                             profile=publication_profile,
                             product_name=s.product_name,
+                            # 公共写作模板同时约束公众号标题；未设置时保持既有海报
+                            # 标题链路，确保正式运行中的绣蔓任务不受影响。
+                            style=task.style,
+                            # 新三品牌的程序叠字模板要求三张都承载正文信息；历史
+                            # 海报任务保留标题海报行为，避免影响已经正式运行的绣蔓。
+                            body_copy_only=poster_text_overlay_enabled,
                         )
                         poster_urls = await generate_poster_images(
                             profile=publication_profile,
@@ -1168,7 +1526,13 @@ def _scheduled_article(
                             tenant_id=s.tenant_id,
                             reference_image_bytes=s.reference_image_bytes,
                             reference_content_type=s.reference_content_type,
+                            product_scene_profile=product_scene_profile_from_payload(
+                                s.product_scene_profile,
+                                product_name=s.product_name,
+                            ),
                             generate_image=image_generation_service.generate,
+                            embed_copy_in_model=not poster_text_overlay_enabled,
+                            quality_checker=inspect_generated_image_url,
                         )
                         s.title = SelectedTitle(
                             main_title=poster_plan.article_title,
@@ -1187,32 +1551,43 @@ def _scheduled_article(
                         s.content = render_poster_gallery_html(
                             image_urls=poster_urls,
                             footer_template=publication_profile.footer_template,
+                            poster_copies=[poster.copy for poster in poster_plan.posters],
+                            programmatic_text_overlay=poster_text_overlay_enabled,
+                            body_copy_only=poster_text_overlay_enabled,
                         )
                         s.full_content = s.content
                         return s
 
-                # Agent 1: 标题 — 返回 ArticleState
-                s = await agent1_generate_title_options(s)
-                if s.error:
-                    raise RuntimeError(s.error)
-                selected_title = (
-                    s.title_options[0]
-                    if s.title_options
-                    else SelectedTitle(
-                        main_title=s.topic or (s.reference_articles[0] if s.reference_articles else ""),
+                # HTML 模板把公众号标题、首屏标题和正文槽位合并为同一次文本调用。
+                # 只有显式模板任务跳过标题候选 Agent；正式 ERP 任务保持原调用顺序。
+                if s.format_profile_payload:
+                    s.title = SelectedTitle(
+                        main_title=s.topic or "公众号文章",
                         sub_title="",
                     )
-                )
-                s.title = (
-                    ensure_product_name_in_title(selected_title, s.product_name)
-                    if s.product_name else selected_title
-                )
+                else:
+                    # Agent 1: 标题 — 返回 ArticleState
+                    s = await agent1_generate_title_options(s)
+                    if s.error:
+                        raise RuntimeError(s.error)
+                    selected_title = (
+                        s.title_options[0]
+                        if s.title_options
+                        else SelectedTitle(
+                            main_title=s.topic or (s.reference_articles[0] if s.reference_articles else ""),
+                            sub_title="",
+                        )
+                    )
+                    s.title = (
+                        ensure_product_name_in_title(selected_title, s.product_name)
+                        if s.product_name else selected_title
+                    )
 
                 # HTML 仿写已经锁定真实 DOM 槽位、顺序与目标长度。独立大纲既不
                 # 改变槽位，也不会作为最终内容落库，只会额外产生一次文生文调用。
                 # 因此该模式直接进入槽位内容 Agent；普通 Markdown/知识库任务仍
                 # 保留大纲步骤，保证自由文章的结构完整性。
-                if not s.reference_html:
+                if not s.reference_html and not s.format_profile_payload:
                     s = await agent2_generate_outline(s)
                     if s.error:
                         raise RuntimeError(s.error)
@@ -1277,6 +1652,21 @@ def _scheduled_article(
                         s = await agent4_analyze_image_requirements(s)
                         s = await agent5_generate_images(s)
                         merge_images_into_content(s)
+                        # 她格的原创图文没有 HTML 图片槽位。图片生成成功后必须按
+                        # Agent 4 的章节需求写回 Markdown 正文，不能只保留在状态对象
+                        # 中导致草稿只显示文字。服务内部按模板 ID 严格隔离，绣蔓及
+                        # 所有仿写任务不会进入这条新路径。
+                        from app.services.original_article_image_service import (
+                            insert_original_article_images,
+                            should_insert_original_article_images,
+                        )
+
+                        if should_insert_original_article_images(task.style):
+                            s.full_content = insert_original_article_images(
+                                s.full_content or s.content or "",
+                                s.images,
+                            )
+                            s.content = s.full_content
                 else:
                     s.full_content = s.content or ""
 
@@ -1293,6 +1683,19 @@ def _scheduled_article(
             append_ai_image_disclaimer,
             normalize_final_article_images_with_attribution,
         )
+        from app.services.scheduled_image_normalization_service import (
+            CANONICAL_SCHEDULED_IMAGE_SIZE,
+            SCHEDULED_WATERMARK_FONT_SIZE,
+        )
+
+        # 当前用户确认的 1024×1365 + 24px 规格只应用于普通 ERP 定时图文。
+        # 无缝海报有自己的整套切片尺寸，不能被普通文章画布规则覆盖；普通投喂源
+        # 文章也保持原始尺寸，避免这次视觉优化污染已有格式任务。
+        use_fixed_erp_image_policy = (
+            image_route.mode == "erp_knowledge_background"
+            and (getattr(task, "layout_mode", "standard") or "standard")
+            != "seamless_poster"
+        )
 
         normalized_images = asyncio.run(
             normalize_final_article_images_with_attribution(
@@ -1304,11 +1707,32 @@ def _scheduled_article(
                 product_name=state.product_name or (
                     state.title.main_title if state.title else state.topic
                 ),
+                target_size=(
+                    CANONICAL_SCHEDULED_IMAGE_SIZE
+                    if use_fixed_erp_image_policy
+                    else None
+                ),
+                watermark_font_size=(
+                    SCHEDULED_WATERMARK_FONT_SIZE
+                    if use_fixed_erp_image_policy
+                    else None
+                ),
+                # 定时任务的勾选状态覆盖租户全局水印开关；普通文章调用不传该
+                # 参数，继续使用素材归档层已有的全局配置回退逻辑。
+                watermark_enabled=bool(getattr(task, "enable_watermark", False)),
+                # 非空时使用任务保存的水印快照，避免每次执行重新读取全局样式。
+                task_watermark_config=getattr(task, "watermark_config", None),
             )
         )
         # 让 state 中的图片元数据同步使用归档版本，后续封面选择不能回退到临时 URL。
-        for image in state.images:
-            image.url = normalized_images.url_mapping.get(image.url, image.url)
+        if len(state.images) == len(normalized_images.body_image_urls):
+            # 连续海报的三张切片共享一个上游主视觉 URL，不能使用普通字典映射，
+            # 否则三个状态对象会全部指向同一张图。正文 DOM 顺序才是这里的稳定契约。
+            for image, archived_url in zip(state.images, normalized_images.body_image_urls):
+                image.url = archived_url
+        else:
+            for image in state.images:
+                image.url = normalized_images.url_mapping.get(image.url, image.url)
         final_content = normalized_images.content
         state.content = final_content
         state.full_content = append_ai_image_disclaimer(final_content)
@@ -1319,6 +1743,9 @@ def _scheduled_article(
         article.main_title = title_text
         article.content = state.full_content or state.content or ""
         article.full_content = state.full_content or state.content or ""
+        # 持久化 Agent 的图片元数据，便于后台排查“已生成但未入正文”等问题；正文
+        # 仍是发布的唯一真相，因此图片元数据只作为诊断和素材审计使用。
+        article.images = [image.model_dump() for image in state.images if image.url]
 
         cover_image_url = _select_article_cover(state, article.full_content or "")
         if cover_image_url:
@@ -1813,6 +2240,7 @@ def _publish_to_wechat(
 
     from app.services.wechat_publisher import WechatPublishAmbiguousError, publish_article
 
+    publish_domain = resolve_scheduled_publish_domain(task, run)
     delivery_results = dict(getattr(run, "delivery_results", None) or {}) if run else {}
     pending_account_ids = [
         aid
@@ -1822,6 +2250,7 @@ def _publish_to_wechat(
             article_id=article.id,
             account_id=aid,
             publish_mode=publish_mode,
+            publish_domain=publish_domain,
         )
     ]
 
@@ -1832,6 +2261,11 @@ def _publish_to_wechat(
         if (
             isinstance(previous_result, dict)
             and previous_result.get("mode") == publish_mode
+            and (
+                previous_result.get("publish_domain") is None
+                or normalize_publish_domain(previous_result.get("publish_domain"))
+                == publish_domain
+            )
             and previous_result.get("status") in {"partial", "ambiguous"}
         ):
             raise RuntimeError(
@@ -1846,6 +2280,7 @@ def _publish_to_wechat(
                 article,
                 aid,
                 mode=publish_mode,
+                publish_domain=publish_domain,
                 tenant_id=task.tenant_id,
                 actor_id=task.created_by or 0,
             )
@@ -1858,6 +2293,7 @@ def _publish_to_wechat(
                 partial_result = {
                     "status": "partial",
                     "mode": publish_mode,
+                    "publish_domain": publish_domain,
                     "media_id": str(result.get("media_id") or "").strip(),
                     "error": str(result["publish_error"])[:2000],
                 }
@@ -1867,13 +2303,26 @@ def _publish_to_wechat(
                     db.commit()
                 raise RuntimeError(f"正式发布失败：{result['publish_error']}")
 
-            delivery_result = {"status": "success", "mode": publish_mode}
+            delivery_result = {
+                "status": "success",
+                "mode": publish_mode,
+                "publish_domain": publish_domain,
+            }
             if publish_mode == "direct":
-                publish_id = str(result.get("publish_id") or "").strip()
-                if not publish_id:
-                    raise RuntimeError("正式发布失败：微信未返回 publish_id")
-                article.publish_id = publish_id
-                delivery_result["publish_id"] = publish_id
+                if publish_domain == "private":
+                    msg_id = str(
+                        result.get("msg_id")
+                        or result.get("msg_data_id")
+                        or ""
+                    ).strip()
+                    if not msg_id:
+                        raise RuntimeError("私域群发失败：微信未返回 msg_id")
+                else:
+                    publish_id = str(result.get("publish_id") or "").strip()
+                    if not publish_id:
+                        raise RuntimeError("公域发布失败：微信未返回 publish_id")
+                    article.publish_id = publish_id
+                    delivery_result["publish_id"] = publish_id
             else:
                 media_id = str(result.get("media_id") or "").strip()
                 if not media_id:
@@ -1886,6 +2335,7 @@ def _publish_to_wechat(
             if msg_data_id:
                 article.msg_data_id = msg_data_id
                 delivery_result["msg_data_id"] = msg_data_id
+            article.publish_domain = publish_domain
             article.wechat_account_id = aid
             if run is not None:
                 delivery_results[delivery_key] = delivery_result
@@ -1893,7 +2343,13 @@ def _publish_to_wechat(
                 db.commit()
             logger.info(
                 "已%s到公众号 #%s",
-                "直接发布" if publish_mode == "direct" else "保存草稿",
+                (
+                    "私域群发"
+                    if publish_mode == "direct" and publish_domain == "private"
+                    else "公域发布"
+                    if publish_mode == "direct"
+                    else "保存草稿"
+                ),
                 aid,
             )
         except Exception as e:
@@ -1905,6 +2361,7 @@ def _publish_to_wechat(
                 delivery_results[delivery_key] = {
                     "status": "ambiguous",
                     "mode": publish_mode,
+                    "publish_domain": publish_domain,
                     "error": str(e)[:2000],
                 }
                 run.delivery_results = dict(delivery_results)

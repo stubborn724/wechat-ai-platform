@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
 from app.models.mysql_models import ContentAsset, ContentJob, ContentJobArticle, ContentVersion
+from app.services.job_queue_service import claim_dispatched_job_for_execution
 from app.services.storage_service import generate_object_key, storage_service
 
 logger = logging.getLogger(__name__)
@@ -215,8 +216,12 @@ def process_image_job(self, job_id: int):
         if not job:
             return {"error": f"Job {job_id} not found"}
 
-        if job.status != "queued":
-            return {"error": f"Job {job_id} is not in queued state"}
+        # 图片生成同样可能被 Broker 重投。领取操作必须是条件更新，避免同一任务并发生成
+        # 多组图片并重复写入素材库或公众号草稿。
+        job = claim_dispatched_job_for_execution(db, job_id)
+        if not job:
+            current = db.query(ContentJob).filter(ContentJob.id == job_id).first()
+            return {"job_id": job_id, "status": current.status if current else "missing", "ignored": True}
 
         from app.services.image_generation_service import image_generation_service
         from app.services.storage_service import generate_object_key, storage_service
@@ -411,8 +416,11 @@ def process_video_job(self, job_id: int):
         if not job:
             return {"error": f"Job {job_id} not found"}
 
-        if job.status != "queued":
-            return {"error": f"Job {job_id} is not in queued state"}
+        # 视频生成成本更高，必须与文章/图片共用同一领取协议，重复消息只能有一个 Worker 胜出。
+        job = claim_dispatched_job_for_execution(db, job_id)
+        if not job:
+            current = db.query(ContentJob).filter(ContentJob.id == job_id).first()
+            return {"job_id": job_id, "status": current.status if current else "missing", "ignored": True}
 
         from app.services.video_script_service import generate_video_script
         from app.services.image_generation_service import image_generation_service

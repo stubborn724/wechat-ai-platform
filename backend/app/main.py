@@ -1,5 +1,16 @@
 """FastAPI 应用入口"""
 
+import sys
+
+# Windows 中文系统下，print 含 emoji（📝✅❌等）的日志在 stdout/stderr 重定向到
+# 文件时会因 GBK 编码崩溃（UnicodeEncodeError → HTTP 500）。统一强制 UTF-8 输出，
+# 保证控制台和日志重定向两种模式都不会因为日志字符集而中断请求处理。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import logging
 import threading
 import time
@@ -42,17 +53,43 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 _running = True
 
 
+def _deliver_tageai_callback_snapshots() -> dict[str, int]:
+    """扫描当前调用状态并投递到期的 TaGeAI outbox 事件。
+
+    本地 API 进程不应自行拼装回调请求。复用集成层的扫描与投递服务可以沿用幂等快照、
+    HMAC 签名、指数退避和失败审计；返回小型摘要仅用于后台日志与单元测试，不泄露事件
+    载荷、账号凭据或文章正文。
+    """
+
+    from app.integrations.tageai.callback_delivery import deliver_due_callback_events
+    from app.integrations.tageai.service import enqueue_current_callback_snapshots
+
+    created = enqueue_current_callback_snapshots()
+    delivery = deliver_due_callback_events()
+    return {
+        "created": created,
+        "delivered": int(delivery.get("delivered", 0)),
+        "failed": int(delivery.get("failed", 0)),
+    }
+
+
 def _bg_worker():
-    """后台工作线程：轮询定时任务 + 消费内容任务"""
+    """后台工作线程：消费文章任务并驱动桌面联调所需的状态回调。
+
+    正式部署由 Celery Beat 负责 outbox 扫描与投递；本地桌面启动脚本只启动 FastAPI，
+    若这里不补齐同一职责，文章即使已经生成并保存草稿，Gateway 仍只能看到早期的
+    ``GENERATING`` 快照。该线程只调用幂等 outbox 服务，不直接构造回调或改写任务状态。
+    """
     from app.tasks.scheduled_task_executor import check_scheduled_tasks
     from app.database import MysqlSessionLocal
     from app.models.mysql_models import ContentJob
-    from app.services.job_queue_service import create_slot_articles, transition_job
 
     check_interval = 60 * 5  # 每 5 分钟检查定时任务
     poll_interval = 30       # 每 30 秒检查待处理任务
+    callback_interval = 15   # 与 Celery Beat 一致，避免完成状态长期滞留在平台侧
     last_check = 0
     last_poll = 0
+    last_callback = 0
 
     while _running:
         now = time.time()
@@ -91,6 +128,19 @@ def _bg_worker():
             except Exception as e:
                 logger.error("bg_worker poll error: %s", e)
             last_poll = now
+
+        # 3. 本地桌面联调通常只启动 API 进程，仍需将 ContentJob 的真实终态投影给
+        # Gateway。扫描与投递均使用持久化 outbox，进程重启或重复执行不会重复改变业务状态。
+        if now - last_callback >= callback_interval:
+            try:
+                delivery = _deliver_tageai_callback_snapshots()
+                logger.info(
+                    "bg_worker delivered TaGeAI callback snapshots: created=%d delivered=%d failed=%d",
+                    delivery["created"], delivery["delivered"], delivery["failed"],
+                )
+            except Exception as e:
+                logger.error("bg_worker callback delivery error: %s", e)
+            last_callback = now
 
         time.sleep(15)
 
@@ -200,6 +250,10 @@ def create_app() -> FastAPI:
     app.include_router(content_assets.router, prefix="/api/v1", tags=["content-assets"])
     app.include_router(wechat_interact.router, prefix="/api/v1", tags=["wechat-interact"])
     app.include_router(wechat_articles.router, prefix="/api/v1", tags=["wechat-articles"])
+
+    # TaGeAI Integration API（服务间 HMAC 认证，不复用 JWT）
+    from app.integrations.tageai.router import router as tageai_router
+    app.include_router(tageai_router, prefix="/api/v1/integrations/tageai", tags=["tageai-integration"])
 
     return app
 

@@ -64,6 +64,26 @@ def run_migration() -> None:
 
         for statement in CREATE_TABLES:
             connection.execute(text(statement))
+
+        selection_scope_exists = connection.execute(text("""
+            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'scheduled_task_erp_image_usages'
+              AND COLUMN_NAME = 'selection_scope'
+        """)).scalar()
+        if selection_scope_exists is None:
+            connection.execute(text("""
+                ALTER TABLE scheduled_task_erp_image_usages
+                ADD COLUMN selection_scope VARCHAR(128) NULL
+                COMMENT 'ERP 防重范围；为空时兼容旧任务按 task_id 防重'
+            """))
+            connection.execute(text("""
+                CREATE INDEX ix_scheduled_erp_image_scope_window
+                ON scheduled_task_erp_image_usages (selection_scope, used_at)
+            """))
+            logger.info("已添加 scheduled_task_erp_image_usages.selection_scope")
+        else:
+            logger.info("scheduled_task_erp_image_usages.selection_scope 已存在")
         logger.info("ERP 定时任务迁移完成")
 
 

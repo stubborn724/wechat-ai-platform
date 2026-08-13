@@ -45,6 +45,20 @@ def test_poster_profile_combines_brand_tone_with_image_directives() -> None:
     assert "文案要求" not in profile.visual_directives
 
 
+def test_poster_profile_uses_structured_consultation_card_from_contact_rule() -> None:
+    """知识库中的咨询卡规则必须原样成为任务运行时的固定页脚。"""
+    from app.services.publication_format_service import analyze_publication_format
+
+    source = """【文章形式】纯海报拼接形式，无独立文字段落。
+【末尾联系方式】文章末尾展示产品咨询卡。
+【咨询卡】{"type":"consultation_card_v1","brand":"写怀","headline":"产品咨询","phone":"18928694592","qrcodes":[{"label":"企业微信","url":"https://cdn.example.com/qr.png"}]}"""
+
+    profile = analyze_publication_format(source)
+
+    assert '"type":"consultation_card_v1"' in profile.footer_template
+    assert '"phone":"18928694592"' in profile.footer_template
+
+
 def test_poster_html_contains_only_generated_images_before_fixed_footer():
     """纯海报正文不得生成独立文字节点，联系方式只通过固定页脚追加。"""
     from app.services.publication_format_service import render_poster_gallery_html
@@ -58,3 +72,60 @@ def test_poster_html_contains_only_generated_images_before_fixed_footer():
     assert "<p" not in before_footer
     assert content.count("<img") == 3
     assert "中西无界TEL: 18138381749" in content
+
+
+def test_poster_html_images_are_block_level_with_zero_margin() -> None:
+    """连续海报切片必须没有底部间距，避免公众号中出现白缝。"""
+
+    from app.services.publication_format_service import render_poster_gallery_html
+
+    content = render_poster_gallery_html(
+        image_urls=["https://cdn.example.com/title.png", "https://cdn.example.com/story.png"],
+        footer_template="",
+    )
+
+    assert content.count('display:block;margin:0;') == 2
+    assert "margin:0 auto 12px" not in content
+    assert '<div data-ai-layout="seamless-poster"' in content
+    assert 'style="margin:0;padding:0;line-height:0;font-size:0;"' in content
+
+
+def test_poster_html_can_keep_copy_metadata_for_programmatic_overlay() -> None:
+    """程序叠字只保存图片属性，不在正文生成可见独立文字节点。"""
+    from app.services.publication_format_service import render_poster_gallery_html
+
+    content = render_poster_gallery_html(
+        image_urls=["https://cdn.example.com/title.png", "https://cdn.example.com/story.png"],
+        footer_template="",
+        poster_copies=["一席成景", "让日常回到从容。"],
+        programmatic_text_overlay=True,
+    )
+
+    assert 'data-poster-copy="一席成景"' in content
+    assert 'data-poster-kind="title"' in content
+    assert 'data-poster-kind="content"' in content
+    assert "<p" not in content
+
+
+def test_body_copy_only_poster_marks_every_image_as_content() -> None:
+    """正文型三图模板不得把第一张重新标记为标题海报。"""
+    from app.services.publication_format_service import render_poster_gallery_html
+
+    content = render_poster_gallery_html(
+        image_urls=[
+            "https://cdn.example.com/one.png",
+            "https://cdn.example.com/two.png",
+            "https://cdn.example.com/three.png",
+        ],
+        footer_template="",
+        poster_copies=[
+            "第一段正文内容，带有完整的阅读节奏。",
+            "第二段正文内容，继续展开产品体验。",
+            "第三段正文内容，落回日常使用场景。",
+        ],
+        programmatic_text_overlay=True,
+        body_copy_only=True,
+    )
+
+    assert content.count('data-poster-kind="content"') == 3
+    assert 'data-poster-kind="title"' not in content

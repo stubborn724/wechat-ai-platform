@@ -50,12 +50,18 @@ async def test_generate_image_logs_http_status_and_response_without_secret(monke
 async def test_dashscope_service_returns_none_when_wanxiang_fails(monkeypatch, caplog):
     """仿写图片生成失败时不得回退为随机图库地址。"""
     from app.services.image_service_v2 import DashScopeImageGenService
-    from app.services.wanxiang_service import WanxiangImageService
+    from app.services import image_generation_service as service_module
 
     async def failing_generation(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(WanxiangImageService, "generate_image", failing_generation)
+    # ``DashScopeImageGenService`` 现在只是兼容旧的来源枚举，实际统一走图片主备
+    # 路由；拦截路由入口才能保证测试不访问任何真实图片提供商。
+    monkeypatch.setattr(
+        service_module.image_generation_service,
+        "generate_image",
+        failing_generation,
+    )
     caplog.set_level(logging.ERROR, logger="app.services.image_service_v2")
 
     result = await DashScopeImageGenService().search_image(

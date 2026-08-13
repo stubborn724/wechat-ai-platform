@@ -44,3 +44,19 @@ def test_brand_split_knowledge_uses_erp_source_as_task_binding_key() -> None:
     assert {profile.erp_source_key for profile in BRAND_SPLIT_KNOWLEDGE} == {
         "xiuman", "zhongxiwujie", "xiehuai", "jianzhi",
     }
+
+
+def test_xiuman_visual_rule_keeps_contact_details_out_of_image_model() -> None:
+    """绣蔓的电话和二维码只能由程序页脚渲染，不能再交给图片模型。"""
+
+    from scripts.rebuild_brand_split_knowledge_bases import BRAND_SPLIT_KNOWLEDGE
+
+    xiuman = next(
+        profile for profile in BRAND_SPLIT_KNOWLEDGE
+        if profile.erp_source_key == "xiuman"
+    )
+
+    assert "每篇图片由程序按不同机位轮换" in xiuman.visual_document_text
+    assert "模型不得生成任何可读文字" in xiuman.visual_document_text
+    assert "右下角添加艺术字水印" not in xiuman.visual_document_text
+    assert "绣蔓家具TEL" not in xiuman.visual_document_text

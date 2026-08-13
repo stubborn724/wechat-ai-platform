@@ -114,6 +114,9 @@ def load_publication_format_from_knowledge_bases(
 def render_poster_gallery_html(
     image_urls: Iterable[str],
     footer_template: str,
+    poster_copies: Iterable[str] | None = None,
+    programmatic_text_overlay: bool = False,
+    body_copy_only: bool = False,
 ) -> str:
     """渲染纯海报文章，正文仅保留图片，固定内容统一置于末尾。
 
@@ -122,17 +125,45 @@ def render_poster_gallery_html(
     """
 
     image_nodes: list[str] = []
+    copy_values = list(poster_copies or ())
     for index, raw_url in enumerate(image_urls, start=1):
         image_url = str(raw_url or "").strip()
         if not image_url:
             continue
         safe_url = html.escape(image_url, quote=True)
+        overlay_attributes = ""
+        if programmatic_text_overlay and index <= len(copy_values):
+            # 文案只保存为图片节点属性，最终归档器据此绘制像素；正文仍没有可见
+            # p/h1 节点，公众号编辑器不会在连续海报之间插入文字或默认间距。
+            safe_copy = html.escape(str(copy_values[index - 1] or "").strip(), quote=True)
+            if safe_copy:
+                # 新三品牌的程序叠字模板要求三张均承担正文叙事。历史模板仍
+                # 保留首图标题的版式，两个模式通过显式参数隔离，不能按图片
+                # 序号隐式猜测，避免改变绣蔓等已上线任务的视觉输出。
+                kind = "content" if body_copy_only else ("title" if index == 1 else "content")
+                overlay_attributes = (
+                    f' data-poster-copy="{safe_copy}"'
+                    f' data-poster-kind="{kind}"'
+                )
         image_nodes.append(
             f'<img src="{safe_url}" alt="海报 {index}" '
-            'style="width:100%;max-width:640px;display:block;margin:0 auto 12px;" />'
+            f'{overlay_attributes}'
+            # 图片是同一张长海报的切片，不能保留普通文章的段落间距。块级显示
+            # 消除行内基线空隙，零 margin 保证相邻切片在公众号中紧贴排列。
+            'style="width:100%;max-width:640px;display:block;margin:0;" />'
         )
 
-    content = "\n".join(image_nodes)
+    # 使用专用容器锁定连续海报的排版上下文。公众号编辑器可能对裸 img 节点
+    # 自动套段落样式；容器同时关闭行高、字号和内外边距，避免切片之间出现
+    # 浏览器基线空隙或编辑器默认段落间距。
+    content = (
+        '<div data-ai-layout="seamless-poster" '
+        'style="margin:0;padding:0;line-height:0;font-size:0;">'
+        f'{"".join(image_nodes)}'
+        "</div>"
+        if image_nodes
+        else ""
+    )
     if footer_template.strip():
         from app.services.footer_template_service import render_footer_template_html
 
@@ -200,6 +231,20 @@ def _extract_char_limit(source: str, anchor: str, *, default: int) -> int:
 
 def _extract_footer_template(source: str) -> str:
     """从末尾联系方式章节提取唯一文字和二维码 URL，拒绝额外正文。"""
+
+    # 结构化咨询卡优先于历史 Markdown。它可承载电话和多个二维码，且完整 JSON
+    # 会作为任务快照传递至最终 HTML 渲染层，不会被模型或正文规则重新改写。
+    card_match = re.search(r"【咨询卡】\s*(\{.*?\})(?=\s*【|\s*$)", source, re.DOTALL)
+    if card_match:
+        candidate = card_match.group(1).strip()
+        try:
+            import json
+
+            card = json.loads(candidate)
+        except json.JSONDecodeError:
+            card = None
+        if isinstance(card, dict) and card.get("type") == "consultation_card_v1":
+            return candidate
 
     footer_source = _extract_section(source, "末尾联系方式") or source
     url_match = _URL_PATTERN.search(footer_source)

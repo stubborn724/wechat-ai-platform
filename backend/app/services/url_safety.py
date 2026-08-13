@@ -52,6 +52,14 @@ _TRUSTED_EXTERNAL_IMAGE_HOSTS = {
     "videos.tpkcur.xyz",
 }
 
+# 公众号文章抓取域名白名单。
+# 微信文章在当前网络环境中可能被解析到 RFC 2544 基准测试网段，
+# 但它是用户明确输入的外部内容源，因此只对这个精确域名的 HTTPS
+# 默认端口做兼容，避免把整个微信域名体系或整个基准网段放开。
+_TRUSTED_EXTERNAL_CONTENT_HOSTS = {
+    "mp.weixin.qq.com",
+}
+
 # 从配置动态添加 MinIO 等信任主机
 def _init_trusted_hosts():
     try:
@@ -123,6 +131,19 @@ def _is_trusted_external_image_url(parsed) -> bool:
     )
 
 
+def _is_trusted_external_content_url(parsed) -> bool:
+    """判断 URL 是否为经过审计的外部文章内容源。
+
+    文章抓取和图片归档是两类不同的业务边界，分别维护域名集合可以
+    避免后续新增 CDN 或内容源时意外扩大另一类请求的权限。
+    """
+    return (
+        parsed.scheme == "https"
+        and parsed.port in (None, 443)
+        and (parsed.hostname or "").lower() in _TRUSTED_EXTERNAL_CONTENT_HOSTS
+    )
+
+
 def validate_url(url: str, _is_redirect: bool = False) -> None:
     """校验 URL 是否安全，若不安全则抛出 ValueError
 
@@ -157,6 +178,10 @@ def validate_url(url: str, _is_redirect: bool = False) -> None:
 
     # 精确放行可信图片域名在当前网络中的基准网段 DNS 映射。
     if _is_trusted_external_image_url(parsed):
+        return
+
+    # 精确放行可信文章域名在当前网络中的基准网段 DNS 映射。
+    if _is_trusted_external_content_url(parsed):
         return
 
     # 信任的主机跳过 SSRF 检查（如本地 MinIO、CORS 源等基础设施）

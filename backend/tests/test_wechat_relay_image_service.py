@@ -97,6 +97,63 @@ def test_unrelated_http_image_is_not_treated_as_local_minio():
     assert result.object_keys == []
 
 
+def test_historical_localhost_url_is_staged_when_worker_uses_internal_minio_endpoint():
+    """Worker 使用容器地址时，历史本机 MinIO 地址仍必须进入 COS 中转。
+
+    文章可能由宿主机后端生成并保存 ``localhost:9002`` 地址，而发布 Worker
+    在 Docker 中通过 ``minio:9000`` 访问同一个桶。两者只是访问入口不同，不能
+    因为当前进程的公共地址发生变化就把历史本地图片漏给微信中转站。
+    """
+    from app.services.wechat_relay_image_service import WeChatRelayImageService
+
+    local_url = "http://localhost:9002/wechat-assets/assets/107/footer.png"
+
+    class FakeStorage:
+        """记录对象键，确保别名解析后仍从 MinIO 下载正确对象。"""
+
+        def __init__(self):
+            self.downloaded_keys = []
+
+        def download_bytes(self, object_key):
+            self.downloaded_keys.append(object_key)
+            return b"local-image"
+
+    class FakeRelay:
+        """返回固定 COS 地址，隔离真实云服务。"""
+
+        def __init__(self):
+            self.stage_calls = []
+
+        def stage_bytes(self, **kwargs):
+            self.stage_calls.append(kwargs)
+            return SimpleNamespace(
+                object_key="temporary/107/wechat-24/footer.png",
+                signed_url="https://cos.example.com/signed-footer",
+            )
+
+    storage = FakeStorage()
+    relay = FakeRelay()
+    service = WeChatRelayImageService(
+        storage=storage,
+        relay=relay,
+        minio_public_endpoint="http://minio:9000",
+        minio_bucket="wechat-assets",
+        minio_url_aliases=("http://localhost:9002",),
+    )
+
+    result = service.prepare(
+        html=f'<p>页脚</p><img alt="二维码" src="{local_url}">',
+        cover_image_url=local_url,
+        tenant_id=107,
+        article_id=24,
+    )
+
+    assert local_url not in result.html
+    assert result.cover_image_url == "https://cos.example.com/signed-footer"
+    assert storage.downloaded_keys == ["assets/107/footer.png"]
+    assert len(relay.stage_calls) == 1
+
+
 def test_local_image_uses_detected_mime_when_storage_extension_is_wrong():
     """中转必须使用真实字节格式，不能盲信存储对象后缀或错误响应头。"""
     from app.services.wechat_relay_image_service import WeChatRelayImageService

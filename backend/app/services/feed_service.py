@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
@@ -15,6 +16,47 @@ from app.models.mysql_models import FeedSource, FeedSourceArticle
 from app.services.url_safety import validate_url
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AutoFormatProfileResult:
+    """单篇投喂文章的自动格式分析结果。
+
+    抓取与格式分析的容错边界在这里明确：抓取成功是主流程，格式模板只是后续仿写的
+    增强能力。因此某篇 HTML 不完整时返回错误信息，由调用方汇总告警，而不是让整个
+    投喂源导入回滚。
+    """
+
+    created: bool
+    profile_id: int | None
+    error: str | None = None
+
+
+def auto_create_format_profile_for_article(
+    *,
+    db: Session,
+    article: FeedSourceArticle,
+) -> AutoFormatProfileResult:
+    """为已保存的文章自动创建或复用格式模板，并隔离单篇解析错误。"""
+
+    from app.services.format_profile_persistence_service import (
+        create_or_reuse_format_profile,
+    )
+
+    try:
+        persisted = create_or_reuse_format_profile(db, article=article)
+    except ValueError as exc:
+        logger.warning(
+            "跳过投喂文章格式分析: article_id=%s, reason=%s",
+            getattr(article, "id", None),
+            exc,
+        )
+        return AutoFormatProfileResult(created=False, profile_id=None, error=str(exc))
+
+    return AutoFormatProfileResult(
+        created=persisted.created,
+        profile_id=persisted.profile.id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +105,8 @@ async def fetch_source(db: Session, source_id: int, tenant_id: int = 0) -> dict:
 
     # Save articles — update existing or insert new
     saved_count = 0
+    format_profiles_created = 0
+    format_profile_errors: list[str] = []
     for article_data in articles:
         title = article_data.get("title", "")[:255]
         article_url = article_data.get("link", "")[:512]
@@ -84,6 +128,7 @@ async def fetch_source(db: Session, source_id: int, tenant_id: int = 0) -> dict:
             existing.published_at = article_data.get("published_at") or existing.published_at
             existing.word_count = len(body_md)
             existing.is_analyzed = False
+            persisted_article = existing
         else:
             fa = FeedSourceArticle(
                 tenant_id=source.tenant_id,
@@ -99,6 +144,20 @@ async def fetch_source(db: Session, source_id: int, tenant_id: int = 0) -> dict:
                 is_analyzed=False,
             )
             db.add(fa)
+            # 新建文章需要先得到主键，格式模板外键才能在同一个事务中安全引用它。
+            db.flush()
+            persisted_article = fa
+
+        format_result = auto_create_format_profile_for_article(
+            db=db,
+            article=persisted_article,
+        )
+        if format_result.created:
+            format_profiles_created += 1
+        if format_result.error:
+            format_profile_errors.append(
+                f"《{title or '未命名文章'}》格式分析失败: {format_result.error}"
+            )
         saved_count += 1
 
     # Update last_fetched_at
@@ -110,6 +169,8 @@ async def fetch_source(db: Session, source_id: int, tenant_id: int = 0) -> dict:
         "source_name": source.name,
         "articles_fetched": len(articles),
         "articles_saved": saved_count,
+        "format_profiles_created": format_profiles_created,
+        "format_profile_errors": format_profile_errors,
         "errors": errors,
     }
 

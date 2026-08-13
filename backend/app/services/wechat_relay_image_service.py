@@ -11,13 +11,14 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from io import BytesIO
-from urllib.parse import unquote, urlsplit
+from collections.abc import Iterable
 
 from PIL import Image, UnidentifiedImageError
 
 from app.config import settings
 from app.services.cos_image_relay_service import CosImageRelayService
 from app.services.storage_service import storage_service
+from app.services.minio_url_resolver import MinioUrlResolver
 
 
 logger = logging.getLogger(__name__)
@@ -46,14 +47,37 @@ class WeChatRelayImageService:
         relay: CosImageRelayService | None = None,
         minio_public_endpoint: str | None = None,
         minio_bucket: str | None = None,
+        minio_url_aliases: Iterable[str] | str | None = None,
     ) -> None:
-        """注入存储依赖并固化本地公开 URL 的精确解析前缀。"""
+        """注入依赖并建立所有已知 MinIO 入口到对象键的解析表。
+
+        ``MINIO_PUBLIC_ENDPOINT`` 不是稳定的唯一入口：宿主机通常使用
+        ``localhost:9002``，Docker 内部则使用 ``minio:9000``，历史文章还可能
+        留下迁移前的旧域名。这里把入口差异收敛在发布适配层，后续流程只处理
+        对象键和图片字节，从而既不修改数据库里的归档地址，也不会把本地地址
+        泄漏给微信中转站。
+        """
         self.storage = storage
         self.relay = relay or CosImageRelayService()
-        endpoint = (minio_public_endpoint or settings.minio_public_endpoint).rstrip("/")
-        self._minio_base = urlsplit(endpoint)
         bucket = (minio_bucket or settings.minio_bucket).strip().strip("/")
-        self._object_path_prefix = f"{self._minio_base.path.rstrip('/')}/{bucket}/"
+        configured_public_endpoint = (
+            minio_public_endpoint or settings.minio_public_endpoint
+        )
+        configured_aliases = (
+            minio_url_aliases
+            if minio_url_aliases is not None
+            else getattr(settings, "minio_url_aliases", "")
+        )
+        internal_endpoint = getattr(settings, "minio_endpoint", "")
+        use_ssl = bool(getattr(settings, "minio_use_ssl", False))
+        self._minio_url_resolver = MinioUrlResolver(
+            bucket=bucket,
+            endpoints=(
+                configured_public_endpoint,
+                MinioUrlResolver.with_scheme(internal_endpoint, use_ssl=use_ssl),
+                *self._split_aliases(configured_aliases),
+            ),
+        )
 
     def prepare(
         self,
@@ -114,19 +138,29 @@ class WeChatRelayImageService:
                 logger.warning("微信发布 COS 临时图片清理失败 key=%s: %s", object_key, exc)
 
     def _extract_local_storage_key(self, image_url: str) -> str | None:
-        """仅从当前 MinIO 公共前缀解析对象键，并拒绝空键或路径穿越。"""
-        parsed = urlsplit(str(image_url or "").strip())
-        if (
-            parsed.scheme.lower() != self._minio_base.scheme.lower()
-            or parsed.netloc.lower() != self._minio_base.netloc.lower()
-            or not parsed.path.startswith(self._object_path_prefix)
-        ):
-            return None
+        """从任一已配置 MinIO 入口解析对象键，并拒绝空键或路径穿越。
 
-        object_key = unquote(parsed.path[len(self._object_path_prefix):]).lstrip("/")
-        if not object_key or ".." in object_key.split("/"):
-            raise ValueError("本地素材 URL 包含无效对象键")
-        return object_key
+        只接受配置过的 scheme、host、port 和桶路径。即使正文中出现了其它
+        外部 HTTP 地址，也不会被误当作本地对象去下载，保持原有 SSRF 边界。
+        """
+        return self._minio_url_resolver.extract_object_key(image_url)
+
+    @staticmethod
+    def _split_aliases(aliases: Iterable[str] | str) -> tuple[str, ...]:
+        """把环境变量或测试注入的地址列表统一为去空白后的元组。"""
+        if isinstance(aliases, str):
+            values = aliases.split(",")
+        else:
+            values = aliases
+        return tuple(str(value).strip() for value in values if str(value).strip())
+
+    @staticmethod
+    def _with_scheme(endpoint: str, *, use_ssl: bool) -> str:
+        """为 MinIO SDK 的 ``host:port`` 入口补齐 URL scheme。"""
+        normalized = str(endpoint or "").strip()
+        if not normalized or "://" in normalized:
+            return normalized
+        return f"{'https' if use_ssl else 'http'}://{normalized}"
 
     @staticmethod
     def _detect_image_content_type(image_bytes: bytes, storage_key: str) -> str:

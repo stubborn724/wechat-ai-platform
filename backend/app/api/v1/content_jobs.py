@@ -12,7 +12,9 @@ from app.database import get_mysql_db
 from app.deps import CurrentPrincipal, require_auth
 from app.models.mysql_models import ContentAsset, ContentJob, ContentVersion, PublishAttempt
 from app.services.job_queue_service import (
+    claim_queued_job_for_dispatch,
     create_slot_articles,
+    release_dispatch_claim,
     transition_job,
     validate_transition,
 )
@@ -254,9 +256,15 @@ def transition_content_job(
     if req.action == "queue":
         # Create slot articles for batch processing
         create_slot_articles(db, job)
-        # 先发派 Celery 任务，再改状态 — 防止 _bg_worker / poll_queued_jobs 抢走
+        # 先提交 queued，再通过条件更新领取。旧顺序会让 Worker 在任务仍为 pending 时启动，
+        # 也会让 Beat 与 HTTP 入口重复发派同一个 Job。
+        job = transition_job(db, job_id, "queue")
+        claimed = claim_queued_job_for_dispatch(db, job_id)
+        if not claimed:
+            db.refresh(job)
+            return job
         content_type = job.content_type or "article"
-        logger.info("Dispatching job %d with content_type=%s to Celery", job_id, content_type)
+        logger.info("Dispatching claimed job %d with content_type=%s to Celery", job_id, content_type)
         try:
             if content_type in ("image", "pure_image"):
                 from app.tasks.content_tasks import process_image_job
@@ -272,7 +280,9 @@ def transition_content_job(
                 logger.info("Dispatched job %d to process_content_job", job_id)
         except Exception as exc:
             logger.error("Failed to dispatch job %d to Celery: %s", job_id, exc)
-        job = transition_job(db, job_id, "queue")
+            # 仅释放仍未被 Worker 取得的领取状态；消息实际已到达时不能把 generating 覆盖回 queued。
+            release_dispatch_claim(db, job_id)
+        job = db.query(ContentJob).filter(ContentJob.id == job_id).first()
     else:
         job = transition_job(db, job_id, req.action)
 

@@ -709,7 +709,19 @@ STYLE_PROMPT_MAP = {
 
 
 def get_style_prompt(style: str) -> str:
-    """Return the style-specific prompt section for a given style key."""
+    """返回模板或历史预设风格对应的生成要求。
+
+    新任务优先使用公共模板编号，使定时任务和即时生成共享同一套规则；未迁移的
+    历史 ``tech``、``emotional`` 等风格继续从旧映射读取，避免改变已有任务。
+    """
+
+    from app.services.writing_style_template_service import (
+        get_writing_style_template_prompt,
+    )
+
+    template_prompt = get_writing_style_template_prompt(style)
+    if template_prompt:
+        return template_prompt
     return STYLE_PROMPT_MAP.get(style.strip().lower(), "")
 
 

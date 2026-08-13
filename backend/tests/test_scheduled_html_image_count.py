@@ -32,6 +32,27 @@ def test_scheduled_task_image_count_defaults_to_five_and_accepts_nineteen() -> N
     assert ArticleState(task_id="test", topic="测试").max_generated_images == 5
 
 
+def test_scheduled_task_layout_mode_defaults_to_standard_and_requires_explicit_poster_mode() -> None:
+    """历史定时任务必须默认使用旧版式，海报模式只能由任务显式开启。"""
+
+    default_request = ScheduledTaskCreate(name="绣蔓仿写", publish_times=["08:00"])
+    poster_request = ScheduledTaskCreate(
+        name="无缝海报测试",
+        publish_times=["08:00"],
+        layout_mode="seamless_poster",
+    )
+
+    assert default_request.layout_mode == "standard"
+    assert poster_request.layout_mode == "seamless_poster"
+
+    with pytest.raises(ValidationError):
+        ScheduledTaskCreate(
+            name="未知版式",
+            publish_times=["08:00"],
+            layout_mode="auto_detect",
+        )
+
+
 def test_scheduled_task_image_count_rejects_values_outside_one_to_thirty() -> None:
     """图片数量必须有成本上限，避免错误配置一次生成过多图片。"""
 
@@ -123,3 +144,19 @@ def test_scheduled_task_ui_exposes_html_image_count() -> None:
     assert "html_image_count: 5" in source
     assert ":min=\"1\"" in source
     assert ":max=\"30\"" in source
+
+
+def test_scheduled_task_ui_exposes_explicit_poster_layout_mode() -> None:
+    """前端必须显示版式模式，并把旧任务默认值固定为 standard。"""
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "frontend"
+        / "src"
+        / "views"
+        / "ScheduledTasksView.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "layout_mode: 'standard'" in source
+    assert "value=\"standard\"" in source
+    assert "value=\"seamless_poster\"" in source
