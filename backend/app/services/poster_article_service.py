@@ -63,11 +63,12 @@ async def generate_poster_plan(
 
     required_count = profile.poster_count + 1
     style_prompt = get_writing_style_template_prompt(style)
-    # 海报首图标题的十二字限制不等于公众号标题限制。只有明确选中品牌模板时
-    # 才放宽公众号标题，历史绣蔓任务和其他任务继续读取既有格式规则。
-    title_max_chars = (
-        get_writing_style_template_title_max_chars(style)
-        or profile.title_max_chars
+    # 海报是品牌化长标题，不应继续沿用普通图文的十二字上限。若任务明确选了
+    # 写作模板，则仍可读取模板自带的推荐长度；否则统一按海报专用长标题处理。
+    title_max_chars = max(
+        26,
+        get_writing_style_template_title_max_chars(style) or 0,
+        profile.title_max_chars or 0,
     )
     request = TextGenerationRequest(
         system_prompt=(
@@ -452,26 +453,31 @@ def _product_anchor(product_name: str) -> str:
 
 
 def _ensure_product_related_title(title: str, *, product_name: str, max_chars: int) -> str:
-    """为公众号标题补齐产品语义，避免抽象口号直接进入草稿箱。"""
+    """为公众号标题补齐产品语义，并稳定使用“产品名|风格长句”格式。
 
-    normalized = _clean_copy(title, max_chars)
+    纯海报的公众号标题不是普通图文标题，而是品牌化的海报总题。它必须让读者
+    先看到真实产品，再看到风格长句，因此这里不再用“产品品类·短标题”兜底。
+    这样即使模型返回一段不稳定文本，最终草稿仍保留用户期望的标题结构。
+    """
+
+    normalized = _clean_copy(title, max_chars * 2)
+    product_label = _poster_title_subject(product_name)
     anchor = _product_anchor(product_name)
-    unrelated_markers = ("曲奇", "潮流中", "我们向", "爆款", "震撼")
-    if (
-        anchor
-        and anchor in normalized
-        and not _is_model_identifier_title(normalized)
-        and not any(marker in normalized for marker in unrelated_markers)
+
+    # 模型返回的标题只要还保留完整语义，就按“产品名|风格长句”结构保留；
+    # 一旦出现型号、夸张营销词或明显跑偏词，就直接回退为稳定的品牌长句。
+    normalized = normalized.strip("｜|")
+    normalized = re.sub(r"^[^｜|·:：]+[｜|·:：]\s*", "", normalized)
+    if not normalized or _is_model_identifier_title(normalized) or any(
+        marker in normalized for marker in ("曲奇", "潮流中", "我们向", "爆款", "震撼")
     ):
-        return normalized
-    if (
-        normalized
-        and not _is_model_identifier_title(normalized)
-        and not any(marker in normalized for marker in unrelated_markers)
-    ):
-        prefix = f"{anchor}·"
-        return _clean_copy(prefix + normalized, max_chars)
-    return _clean_copy(_build_product_title_fallback(anchor), max_chars) or "家居产品的日常美学"
+        normalized = "东方神韵与当代奢雅，在沉静里修养日常"
+    normalized = normalized.replace(product_label, "").strip("，。；、:： ")
+    candidate = _clean_copy(f"{product_label}|{normalized}", max_chars)
+    if "|" not in candidate:
+        fallback = _clean_copy(f"{product_label}|东方神韵与当代奢雅，在沉静里修养日常", max_chars)
+        return fallback or f"{product_label}|留住生活里的从容"
+    return candidate
 
 
 def _is_model_identifier_title(title: str) -> bool:
@@ -491,15 +497,38 @@ def _build_product_title_fallback(anchor: str) -> str:
     """为无效模型标题生成与产品品类匹配的可发布兜底标题。"""
 
     title_by_category = {
-        "沙发": "沙发｜让客厅的停留更从容",
-        "餐桌": "餐桌｜把相聚安放在日常",
-        "茶几": "茶几｜留住客厅的从容",
-        "椅": "座椅｜让身体回到舒适的位置",
-        "床": "床｜让休息回归安静的秩序",
-        "柜": "柜体｜让收纳成为空间的留白",
-        "灯": "灯光｜让光线慢慢安放情绪",
+        "沙发": "东方神韵与当代奢雅，在沉静里修养日常",
+        "餐桌": "东方神韵与当代奢雅，在沉静里修养日常",
+        "茶几": "东方神韵与当代奢雅，在沉静里修养日常",
+        "椅": "东方神韵与当代奢雅，在沉静里修养日常",
+        "床": "东方神韵与当代奢雅，在沉静里修养日常",
+        "柜": "东方神韵与当代奢雅，在沉静里修养日常",
+        "灯": "东方神韵与当代奢雅，在沉静里修养日常",
     }
-    return title_by_category.get(anchor, f"{anchor}｜留住生活里的从容")
+    return title_by_category.get(anchor, "东方神韵与当代奢雅，在沉静里修养日常")
+
+
+def _poster_title_subject(product_name: str) -> str:
+    """提取海报标题中应优先展示的产品主体，避免模型编号污染标题。"""
+
+    normalized = _clean_copy(product_name, 24)
+    if not normalized:
+        return _product_anchor(product_name) or "家居产品"
+
+    segments = [
+        segment.strip()
+        for segment in re.split(r"[·|｜/:：_\-\s]+", normalized)
+        if segment and segment.strip()
+    ]
+    chinese_segments = [segment for segment in segments if re.search(r"[\u4e00-\u9fff]", segment)]
+    if chinese_segments:
+        for segment in chinese_segments:
+            if _product_anchor(product_name) and _product_anchor(product_name) in segment:
+                return segment
+        return max(chinese_segments, key=len)
+
+    anchor = _product_anchor(product_name)
+    return anchor or normalized
 
 
 def _is_story_copy(copy: str) -> bool:

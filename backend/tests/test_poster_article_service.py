@@ -85,6 +85,37 @@ async def test_poster_plan_applies_brand_title_template_without_shortening_to_le
 
 
 @pytest.mark.asyncio
+async def test_poster_plan_keeps_product_and_style_body_separated_by_bar():
+    """海报标题必须稳定保留“产品名|风格长句”的版式，而不是退回短标签。"""
+    from app.services.poster_article_service import generate_poster_plan
+    from app.services.publication_format_service import analyze_publication_format
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【标题要求】海报主标题不超过12字；公众号草稿标题自然包含产品名称。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+
+    async def fake_complete(_request):
+        return json.dumps({
+            "article_title": "东方神韵与当代奢雅，在沉静里修养日常",
+            "title_poster_copy": "东方神韵与当代奢雅，在沉静里修养日常",
+            "posters": [{"copy": "光线沿着扶手慢慢落下，让空间留下更从容的停留。", "scene": "客厅"}],
+        }, ensure_ascii=False)
+
+    plan = await generate_poster_plan(
+        profile=profile,
+        product_name="单人沙发椅",
+        style="zhongxiwujie_east_west_living",
+        complete_text=fake_complete,
+    )
+
+    assert plan.article_title == "单人沙发椅|东方神韵与当代奢雅，在沉静里修养日常"
+    assert "|" in plan.article_title
+    assert "·" not in plan.article_title
+
+
+@pytest.mark.asyncio
 async def test_programmatic_three_poster_plan_uses_body_copy_for_every_panel_and_filters_model_id():
     """通用三图模板的每一张都应是正文型文案，并过滤产品型号式标题。"""
     from app.services.poster_article_service import generate_poster_plan

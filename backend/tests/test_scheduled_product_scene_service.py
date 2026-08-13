@@ -5,6 +5,15 @@
 悄悄绕过，同时也不会为了场景判断增加额外 token 消耗。
 """
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_test_tables():
+    """本模块只测试纯函数规则，不需要触发全局数据库清理夹具。"""
+
+    yield
+
 
 def test_dining_table_uses_dining_room_and_excludes_living_room_furniture():
     """餐桌类产品必须进入餐厅，并明确排除沙发等客厅主体。"""
@@ -107,6 +116,60 @@ def test_product_scene_guard_is_idempotent_and_contains_negative_constraints():
     assert "禁止出现：" in prompt
     assert "沙发" in prompt
     assert repeated == prompt
+
+
+def test_product_scene_guard_explicitly_blocks_wrong_room_furniture_for_bed():
+    """床类产品的海报场景必须明确排除客厅和餐厅家具，避免画面跑偏。"""
+
+    from app.services.scheduled_product_scene_service import (
+        append_product_scene_guard,
+        resolve_product_scene_profile,
+    )
+
+    profile = resolve_product_scene_profile("单人床")
+    prompt = append_product_scene_guard(
+        "主体：单人床，静谧卧室",
+        profile,
+        product_name="单人床",
+    )
+
+    assert profile.key == "bed"
+    assert "卧室" in prompt
+    assert "沙发" in prompt
+    assert "餐桌" in prompt
+    assert "客厅" in prompt
+    assert "床品专属约束" in prompt
+
+
+def test_product_scene_guard_explicitly_blocks_wrong_room_furniture_for_sofa_and_table():
+    """沙发与餐桌也必须锁定自己的功能空间，不能混入卧室家具。"""
+
+    from app.services.scheduled_product_scene_service import (
+        append_product_scene_guard,
+        resolve_product_scene_profile,
+    )
+
+    sofa_profile = resolve_product_scene_profile("单人沙发椅")
+    sofa_prompt = append_product_scene_guard(
+        "主体：单人沙发椅，安静客厅",
+        sofa_profile,
+        product_name="单人沙发椅",
+    )
+    table_profile = resolve_product_scene_profile("圆餐桌")
+    table_prompt = append_product_scene_guard(
+        "主体：圆餐桌，温暖用餐空间",
+        table_profile,
+        product_name="圆餐桌",
+    )
+
+    assert sofa_profile.key == "sofa"
+    assert "沙发专属约束" in sofa_prompt
+    assert "餐桌" in sofa_prompt
+    assert "床具" in sofa_prompt
+    assert table_profile.key == "dining_table"
+    assert "餐桌专属约束" in table_prompt
+    assert "床" in table_prompt
+    assert "卧室" in table_prompt
 
 
 def test_html_slot_compiler_removes_conflicting_alt_text_for_erp_product():

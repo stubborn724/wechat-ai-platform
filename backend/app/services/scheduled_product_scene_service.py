@@ -332,6 +332,16 @@ def append_product_scene_guard(
             "床品专属约束：画面只能是卧室或睡眠空间，不得出现沙发、贵妃榻、"
             "休闲榻、客厅或任何客厅会客区陈设。"
         )
+    elif profile.key == "sofa":
+        guard += (
+            "沙发专属约束：画面只能是客厅或休闲起居区，不得出现餐桌、餐椅、"
+            "餐边柜、厨房岛台或卧室床具。"
+        )
+    elif profile.key == "dining_table":
+        guard += (
+            "餐桌专属约束：画面只能是餐厅或独立用餐区，不得出现床、床头柜、"
+            "卧室、沙发、电视柜或客厅休闲区陈设。"
+        )
     return f"{normalized_prompt}\n\n{guard}" if normalized_prompt else guard
 
 
