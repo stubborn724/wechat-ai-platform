@@ -140,3 +140,45 @@ def test_format_profile_visual_title_slot_may_match_wechat_title(monkeypatch) ->
     assert result.error is None
     assert "同一标题" in result.content
     assert "新的导语" in result.content
+
+
+def test_bound_erp_html_profile_normalizes_title_and_article_scene(monkeypatch) -> None:
+    """ERP HTML 模板必须同时保护公众号标题和正文产品场景。"""
+
+    import app.services.article_agent_service as article_agent_service
+    from app.schemas.article import ArticleState, SelectedTitle
+    from app.services.format_profile_service import analyze_feed_article_format
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+
+    profile = analyze_feed_article_format(
+        article_id=46,
+        article_title="床类模板",
+        body_html='<section><p>原始正文</p><img src="https://cdn.example.com/bed.jpg" /></section>',
+    )
+
+    async def fake_call_llm(*_args, **_kwargs):
+        return (
+            '{"wechat_title":"C2025111479 家具单品","visual_title":"",'
+            '"visual_subtitle":"","text_slots":[{"id":"text-1",'
+            '"content":"光线穿过客厅，床在沙发旁重新塑造客厅格局。"}],"image_slots":[]}'
+        )
+
+    monkeypatch.setattr(article_agent_service, "_call_llm", fake_call_llm)
+    state = ArticleState(
+        task_id="profile-bed-task",
+        topic="C2025111479 家具单品",
+        title=SelectedTitle(main_title="C2025111479 家具单品", sub_title=""),
+        product_name="C2025111479 家具单品",
+        product_scene_profile=resolve_product_scene_profile("C2025111479", tags=["床类"]).to_payload(),
+        format_profile_payload=profile.template_payload,
+        format_profile_title_policy=profile.title_policy,
+        skip_reference_image_understanding=True,
+    )
+
+    result = __import__("asyncio").run(article_agent_service.agent3_generate_content(state))
+
+    assert result.error is None
+    assert result.title.main_title.startswith("床|")
+    assert "客厅" not in result.title.main_title
+    assert "客厅" not in result.content
+    assert "沙发" not in result.content

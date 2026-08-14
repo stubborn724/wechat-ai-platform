@@ -585,8 +585,31 @@ async def agent3_generate_html_imitation_content(state: ArticleState) -> Article
             temperature=0.7,
         )
         data = _parse_json_response(raw)
+        if state.product_scene_profile:
+            # ERP 场景档案不仅约束图片，也必须约束正文与公众号标题。否则床类
+            # 图片虽然生成在卧室，标题和文字槽位仍可能被通用“客厅”文案污染。
+            scene_profile = product_scene_profile_from_payload(
+                state.product_scene_profile,
+                product_name=state.product_name or state.topic,
+            )
+            from app.services.scheduled_product_title_service import (
+                normalize_scheduled_product_title,
+            )
+
+            data["wechat_title"] = normalize_scheduled_product_title(
+                state.product_name or state.topic,
+                profile=scene_profile,
+                candidate_title=str(data.get("wechat_title") or ""),
+            )
         _apply_format_profile_titles(state, data)
         text_by_slot = _index_agent_slots(data.get("text_slots", []), "content")
+        if state.product_scene_profile:
+            from app.services.scheduled_product_scene_service import sanitize_article_scene_text
+
+            text_by_slot = {
+                slot_id: sanitize_article_scene_text(content, scene_profile)
+                for slot_id, content in text_by_slot.items()
+            }
         _apply_visual_title_slots(state, data, text_by_slot)
         text_by_slot = await _repair_duplicate_article_title_slots(
             state,

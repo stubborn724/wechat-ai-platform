@@ -95,6 +95,42 @@ def test_bed_uses_bedroom_and_removes_sofa_related_elements():
     assert "卧室" in result
 
 
+def test_bed_title_uses_product_scene_and_never_falls_back_to_living_room():
+    """床类标题必须使用卧室语义，不能把 ERP 型号直接作为公众号标题。"""
+
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+    from app.services.scheduled_product_title_service import normalize_scheduled_product_title
+
+    profile = resolve_product_scene_profile("C2025111479 家具单品", tags=["床类"])
+    title = normalize_scheduled_product_title(
+        "C2025111479 家具单品",
+        profile=profile,
+        candidate_title="C2025111479 家具单品",
+    )
+
+    assert title.startswith("床|")
+    assert "客厅" not in title
+    assert "C2025111479" not in title
+
+
+def test_bed_html_slot_text_removes_living_room_conflict():
+    """床类 HTML 文案槽位不得保留客厅或沙发等冲突场景词。"""
+
+    from app.services.scheduled_product_scene_service import (
+        resolve_product_scene_profile,
+        sanitize_article_scene_text,
+    )
+
+    profile = resolve_product_scene_profile("C2025111479 家具单品", tags=["床类"])
+    result = sanitize_article_scene_text(
+        "光线穿过客厅，床在沙发旁重新塑造客厅格局。",
+        profile,
+    )
+
+    assert "客厅" not in result
+    assert "沙发" not in result
+
+
 def test_product_scene_guard_is_idempotent_and_contains_negative_constraints():
     """最终图生图提示词要稳定追加场景正向与反向约束，重复编排不增长。"""
 

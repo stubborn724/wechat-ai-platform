@@ -300,6 +300,29 @@ def sanitize_product_scene_text(
     return cleaned
 
 
+def sanitize_article_scene_text(text: str, profile: ProductSceneProfile) -> str:
+    """移除正文槽位中与产品功能冲突的整句场景描述。
+
+    图片提示词已有更严格的场景编译器，但正文槽位过去没有同等保护，导致床类
+    文章仍可能写出“客厅格局”。这里按句子丢弃含冲突词的描述，而不是逐词删除
+    后留下语病；若整个槽位都冲突，再给出简洁、与正确房间一致的安全语句。
+    """
+
+    normalized = str(text or "").strip()
+    if not normalized:
+        return normalized
+    sentences = re.split(r"(?<=[。！？!?])", normalized)
+    safe_sentences = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+        and not any(term and term in sentence for term in profile.forbidden_elements)
+    ]
+    if safe_sentences:
+        return "".join(safe_sentences)
+    return f"围绕{profile.required_rooms[0]}的真实使用关系展开。"
+
+
 def append_product_scene_guard(
     prompt: str,
     profile: ProductSceneProfile,
