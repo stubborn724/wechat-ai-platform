@@ -134,7 +134,9 @@ def _render_consultation_card_html(template: str) -> str | None:
     # 合作诉求和电话作为同一组信息，而不是深色营销卡。两个二维码时仍保留右侧
     # 文字区，避免绣蔓的企业微信和抖音入口破坏整体层级。
     has_qrcodes = bool(safe_codes)
-    code_width = 32 if len(safe_codes) == 1 else 25
+    # 单二维码时缩小二维码列并给文字区更多空间；微信会将内联字号按设备缩放，
+    # 旧的 32/68 固定分配会让“中西无界 产品顾问”在“顾问”前意外换行。
+    code_width = 30 if len(safe_codes) == 1 else 25
     # 未配置二维码时，文字信息区占满整行，避免保留空白二维码列造成版式失衡。
     detail_width = 100 - code_width * len(safe_codes) if has_qrcodes else 100
     code_size = 180 if len(safe_codes) == 1 else 132
@@ -165,7 +167,7 @@ def _render_consultation_card_html(template: str) -> str | None:
         '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;"><tbody><tr>'
         f'{code_cells}'
         f'<td style="width:{detail_width}%;padding:4px 8px 4px:{20 if has_qrcodes else 8}px;vertical-align:middle;">'
-        f'<p style="margin:0;color:#1f1f1f;font-size:27px;font-weight:600;line-height:1.3;">{brand} 产品顾问</p>'
+        f'<p style="margin:0;color:#1f1f1f;font-size:24px;font-weight:600;line-height:1.35;white-space:nowrap;word-break:keep-all;">{brand} 产品顾问</p>'
         f'<p style="margin:13px 0 0;color:#3d3d3d;font-size:18px;line-height:1.55;">{headline}　商务合作</p>'
         f'{phone_html}'
         '</td></tr></tbody></table>'

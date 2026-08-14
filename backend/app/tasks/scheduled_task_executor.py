@@ -1530,9 +1530,16 @@ def _scheduled_article(
                             f"{'正文型内容海报' if poster_text_overlay_enabled else '海报'}"
                         )
                         s.footer_template = publication_profile.footer_template
+                        # 标题和图片使用同一份已冻结的产品场景快照。ERP 名称退化为
+                        # 型号时，标题可使用已确认的品类（如茶几），不把内部编号带到草稿。
+                        poster_scene_profile = product_scene_profile_from_payload(
+                            s.product_scene_profile,
+                            product_name=s.product_name,
+                        )
                         poster_plan = await generate_poster_plan(
                             profile=publication_profile,
                             product_name=s.product_name,
+                            title_subject=poster_scene_profile.label,
                             # 公共写作模板同时约束公众号标题；未设置时保持既有海报
                             # 标题链路，确保正式运行中的绣蔓任务不受影响。
                             style=task.style,
@@ -1547,10 +1554,7 @@ def _scheduled_article(
                             tenant_id=s.tenant_id,
                             reference_image_bytes=s.reference_image_bytes,
                             reference_content_type=s.reference_content_type,
-                            product_scene_profile=product_scene_profile_from_payload(
-                                s.product_scene_profile,
-                                product_name=s.product_name,
-                            ),
+                            product_scene_profile=poster_scene_profile,
                             generate_image=image_generation_service.generate,
                             embed_copy_in_model=not poster_text_overlay_enabled,
                             quality_checker=inspect_generated_image_url,

@@ -76,9 +76,28 @@ def test_render_consultation_card_uses_reference_style_horizontal_contact_layout
     assert "剪纸系列 产品顾问" in html
     assert "产品咨询" in html
     assert "商务合作" in html
-    assert "width:32%" in html
-    assert "width:68%" in html
+    assert "width:30%" in html
+    assert "width:70%" in html
     assert "width:180px" in html
+
+
+def test_render_consultation_card_keeps_long_brand_consultant_title_on_one_line():
+    """单二维码咨询卡需让“中西无界 产品顾问”保持单行，不能在顾问前断行。"""
+    from app.services.footer_template_service import render_footer_template_html
+
+    template = json.dumps({
+        "type": "consultation_card_v1",
+        "brand": "中西无界",
+        "phone": "18138381749",
+        "qrcodes": [{"label": "企业微信", "url": "https://cdn.example.com/wecom.png"}],
+    }, ensure_ascii=False)
+
+    html = render_footer_template_html(template)
+
+    assert "中西无界 产品顾问" in html
+    assert "width:30%" in html
+    assert "width:70%" in html
+    assert "white-space:nowrap" in html
 
 
 def test_render_consultation_card_keeps_phone_when_qrcodes_are_empty():

@@ -48,6 +48,7 @@ async def generate_poster_plan(
     *,
     profile: PublicationFormatProfile,
     product_name: str,
+    title_subject: str | None = None,
     style: str | None = None,
     body_copy_only: bool = False,
     complete_text: Callable[[TextGenerationRequest], Awaitable[str]] = text_generation_service.complete,
@@ -101,7 +102,9 @@ async def generate_poster_plan(
     )
     raw = await complete_text(request)
     data = _parse_json(raw)
-    title = _clean_copy(data.get("article_title", ""), title_max_chars)
+    # 模型偶尔会先输出“型号·占位品类|长句”。此处不能过早按最终标题长度截断，
+    # 否则在清掉型号后正文已变成半句话；最终长度只在语义主体确定后统一收敛。
+    title = _clean_copy(data.get("article_title", ""), 120)
     raw_posters = data.get("posters") if isinstance(data.get("posters"), list) else []
 
     posters: list[PosterText] = []
@@ -149,6 +152,7 @@ async def generate_poster_plan(
     safe_title = _ensure_product_related_title(
         title,
         product_name=forbidden_product_name,
+        title_subject=title_subject,
         max_chars=title_max_chars,
     )
     return PosterPlan(
@@ -452,7 +456,13 @@ def _product_anchor(product_name: str) -> str:
     return normalized[:12] or "家居产品"
 
 
-def _ensure_product_related_title(title: str, *, product_name: str, max_chars: int) -> str:
+def _ensure_product_related_title(
+    title: str,
+    *,
+    product_name: str,
+    title_subject: str | None,
+    max_chars: int,
+) -> str:
     """为公众号标题补齐产品语义，并稳定使用“产品名|风格长句”格式。
 
     纯海报的公众号标题不是普通图文标题，而是品牌化的海报总题。它必须让读者
@@ -461,23 +471,49 @@ def _ensure_product_related_title(title: str, *, product_name: str, max_chars: i
     """
 
     normalized = _clean_copy(title, max_chars * 2)
-    product_label = _poster_title_subject(product_name)
+    product_label = _poster_title_subject(product_name, title_subject=title_subject)
     anchor = _product_anchor(product_name)
 
     # 模型返回的标题只要还保留完整语义，就按“产品名|风格长句”结构保留；
     # 一旦出现型号、夸张营销词或明显跑偏词，就直接回退为稳定的品牌长句。
-    normalized = normalized.strip("｜|")
-    normalized = re.sub(r"^[^｜|·:：]+[｜|·:：]\s*", "", normalized)
+    normalized = _extract_poster_title_body(normalized)
     if not normalized or _is_model_identifier_title(normalized) or any(
         marker in normalized for marker in ("曲奇", "潮流中", "我们向", "爆款", "震撼")
     ):
         normalized = "东方神韵与当代奢雅，在沉静里修养日常"
     normalized = normalized.replace(product_label, "").strip("，。；、:： ")
-    candidate = _clean_copy(f"{product_label}|{normalized}", max_chars)
+    normalized = _truncate_poster_title_body(
+        normalized,
+        max_chars=max_chars - len(product_label) - 1,
+    )
+    candidate = f"{product_label}|{normalized}".strip("|")
     if "|" not in candidate:
         fallback = _clean_copy(f"{product_label}|东方神韵与当代奢雅，在沉静里修养日常", max_chars)
         return fallback or f"{product_label}|留住生活里的从容"
     return candidate
+
+
+def _extract_poster_title_body(title: str) -> str:
+    """从模型标题中取出分隔符右侧的风格长句，去掉型号和占位产品名。"""
+
+    normalized = str(title or "").strip("｜|")
+    segments = [segment.strip() for segment in re.split(r"[｜|]", normalized) if segment.strip()]
+    if len(segments) >= 2:
+        return segments[-1]
+    return re.sub(r"^[^·:：]+[·:：]\s*", "", normalized)
+
+
+def _truncate_poster_title_body(copy: str, *, max_chars: int) -> str:
+    """按完整短语边界压缩标题正文，避免在逗号或半个意群处硬截断。"""
+
+    normalized = str(copy or "").strip("，。；、:： ")
+    if len(normalized) <= max_chars:
+        return normalized
+    clipped = normalized[:max(1, max_chars)].rstrip("，。；、:： ")
+    boundary = max(clipped.rfind(mark) for mark in "，。；、")
+    if boundary >= max(6, max_chars // 2):
+        return clipped[:boundary].rstrip("，。；、:： ")
+    return clipped
 
 
 def _is_model_identifier_title(title: str) -> bool:
@@ -508,12 +544,12 @@ def _build_product_title_fallback(anchor: str) -> str:
     return title_by_category.get(anchor, "东方神韵与当代奢雅，在沉静里修养日常")
 
 
-def _poster_title_subject(product_name: str) -> str:
+def _poster_title_subject(product_name: str, *, title_subject: str | None = None) -> str:
     """提取海报标题中应优先展示的产品主体，避免模型编号污染标题。"""
 
     normalized = _clean_copy(product_name, 24)
     if not normalized:
-        return _product_anchor(product_name) or "家居产品"
+        return _normalize_title_subject(title_subject) or _product_anchor(product_name) or "家居产品"
 
     # ERP 名称有时会把型号直接粘在中文品类前面，例如
     # ``FSCJ3012家具单品·家具单品``。先截取型号后的中文片段，避免可读标题
@@ -525,22 +561,60 @@ def _poster_title_subject(product_name: str) -> str:
     if suffix_match:
         suffix_label = suffix_match.group("label").strip("·、")
         if suffix_label:
-            return suffix_label.split("·", 1)[0]
+            subject = suffix_label.split("·", 1)[0]
+            if not _is_generic_title_subject(subject):
+                return subject
 
+    # ``_clean_copy`` 会移除型号后的空白，导致 ``FSCJ0125 家具单品`` 变成
+    # ``FSCJ0125家具单品``。先剥离开头 SKU，后续中文片段判断才不会把整段
+    # 内部编号误当成产品主体。
+    subject_source = re.sub(
+        r"^[A-Za-z]{2,}[-_]?\d+[A-Za-z]*(?:[·、\-_/\s]+)?",
+        "",
+        normalized,
+    )
     segments = [
         segment.strip()
-        for segment in re.split(r"[·|｜/:：_\-\s]+", normalized)
+        for segment in re.split(r"[·|｜/:：_\-\s]+", subject_source)
         if segment and segment.strip()
     ]
     chinese_segments = [segment for segment in segments if re.search(r"[\u4e00-\u9fff]", segment)]
     if chinese_segments:
         for segment in chinese_segments:
             if _product_anchor(product_name) and _product_anchor(product_name) in segment:
-                return segment
-        return max(chinese_segments, key=len)
+                subject = segment
+                break
+        else:
+            subject = max(chinese_segments, key=len)
+        if not _is_generic_title_subject(subject):
+            return subject
+        # 中文片段已经明确是“家具单品”这类 ERP 兜底名时，不能再把整段原始
+        # 型号回填到标题；优先使用场景策略已经确认的具体家具品类。
+        fallback_subject = _normalize_title_subject(title_subject)
+        if fallback_subject:
+            return fallback_subject
+        return subject
 
     anchor = _product_anchor(product_name)
-    return anchor or normalized
+    if not _is_generic_title_subject(anchor):
+        return anchor or normalized
+    return _normalize_title_subject(title_subject) or anchor or normalized
+
+
+def _is_generic_title_subject(value: str) -> bool:
+    """判断 ERP 降级占位名，避免把内部兜底词展示给公众号读者。"""
+
+    normalized = str(value or "").strip()
+    return not normalized or normalized in {"家具单品", "未识别家具", "家居产品", "未命名产品"}
+
+
+def _normalize_title_subject(value: str | None) -> str:
+    """将场景策略的复合品类压缩为可直接放入标题的首个明确品类。"""
+
+    normalized = _clean_copy(value or "", 16).strip("，。；、:： ")
+    if not normalized or _is_generic_title_subject(normalized):
+        return ""
+    return re.split(r"[/／、]", normalized, maxsplit=1)[0].strip()
 
 
 def _is_story_copy(copy: str) -> bool:
