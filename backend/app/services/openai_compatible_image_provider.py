@@ -56,6 +56,7 @@ class OpenAICompatibleImageProvider:
         api_key: str | None = None,
         model: str | None = None,
         edit_model: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         """注入站点级配置、存储与客户端，使同一协议可安全复用到多个站点。"""
         self.settings = settings
@@ -77,7 +78,13 @@ class OpenAICompatibleImageProvider:
                 settings.image_generation_edit_model or self.model
             )
         ).strip()
-        self.timeout_seconds = int(settings.image_generation_timeout_seconds)
+        # 同一适配器可承担主、备两层中转站；超时由装配层传入而非依赖全局设置，
+        # 这样备用站不会继承主站过长的历史 30 分钟超时。
+        self.timeout_seconds = int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else settings.image_generation_timeout_seconds
+        )
         self.max_response_bytes = int(settings.image_generation_max_response_bytes)
 
     async def generate(self, request: ImageGenerationRequest) -> GeneratedImage:

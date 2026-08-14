@@ -18,6 +18,7 @@ from app.services.image_generation_models import (
     ImageGenerationRequest,
     ImageProviderError,
 )
+from app.services.image_provider_health_service import ImageProviderHealthService
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class ImageGenerationService:
         *,
         settings=application_settings,
         providers: Mapping[str, ImageGenerationProvider] | None = None,
+        health_service: ImageProviderHealthService | None = None,
     ) -> None:
         """延迟创建默认提供商，同时支持测试注入确定性替身。"""
         self.settings = settings
@@ -79,17 +81,46 @@ class ImageGenerationService:
             if name and name.strip()
         ))
         self.providers = dict(providers or _build_default_providers(settings))
+        self.health_service = health_service or ImageProviderHealthService(
+            failure_threshold=getattr(
+                settings,
+                "image_provider_circuit_failure_threshold",
+                3,
+            ),
+            cooldown_seconds=getattr(
+                settings, "image_provider_circuit_cooldown_seconds", 600
+            ),
+        )
 
     async def generate(self, request: ImageGenerationRequest) -> GeneratedImage:
         """逐级调用提供商；不可降级错误立即停止，避免掩盖错误配置。"""
         errors: list[ImageProviderError] = []
+        operation = (
+            "edit"
+            if request.reference_image_bytes or request.reference_image_url
+            else "generation"
+        )
         for provider_index, provider_name in enumerate(self.provider_names):
             provider = self._require_provider(
                 provider_name,
                 role="主" if provider_index == 0 else f"第 {provider_index + 1} 层",
             )
+            if not self.health_service.allow_request(provider_name, operation):
+                skipped_error = ImageProviderError(
+                    "图片提供商处于故障冷却期，已跳过本次请求",
+                    category=ImageErrorCategory.TEMPORARY,
+                    provider=provider_name,
+                )
+                errors.append(skipped_error)
+                logger.warning(
+                    "图片提供商熔断中，跳过 provider=%s operation=%s",
+                    provider_name,
+                    operation,
+                )
+                continue
             try:
                 result = await provider.generate(request)
+                self.health_service.record_success(provider_name, operation)
                 from app.services.model_usage_service import record_image_generation_usage
 
                 record_image_generation_usage(
@@ -111,6 +142,11 @@ class ImageGenerationService:
                 return result
             except ImageProviderError as provider_error:
                 errors.append(provider_error)
+                self.health_service.record_failure(
+                    provider_name,
+                    operation,
+                    provider_error.category,
+                )
                 if not provider_error.can_fallback:
                     logger.error(
                         "图片提供商失败且禁止降级 provider=%s category=%s",
@@ -177,6 +213,11 @@ def _build_default_providers(settings) -> dict[str, ImageGenerationProvider]:
     kuai_provider = OpenAICompatibleImageProvider(
         settings=settings,
         name="kuai_openai_compatible",
+        timeout_seconds=getattr(
+            settings,
+            "image_generation_primary_timeout_seconds",
+            settings.image_generation_timeout_seconds,
+        ),
     )
     openai_provider = OpenAICompatibleImageProvider(
         settings=settings,
@@ -193,9 +234,21 @@ def _build_default_providers(settings) -> dict[str, ImageGenerationProvider]:
         edit_model=getattr(settings, "image_generation_secondary_edit_model", "") or (
             settings.image_generation_edit_model
         ),
+        timeout_seconds=getattr(
+            settings,
+            "image_generation_secondary_timeout_seconds",
+            settings.image_generation_timeout_seconds,
+        ),
     )
     wanxiang_provider = WanxiangImageProvider()
-    ark_provider = VolcengineArkImageProvider(settings=settings)
+    ark_provider = VolcengineArkImageProvider(
+        settings=settings,
+        timeout_seconds=getattr(
+            settings,
+            "image_generation_ark_timeout_seconds",
+            settings.image_generation_timeout_seconds,
+        ),
+    )
     return {
         kuai_provider.name: kuai_provider,
         openai_provider.name: openai_provider,

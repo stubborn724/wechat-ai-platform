@@ -1,6 +1,8 @@
 """定时任务微信公众号交付结果测试。"""
 
 from types import SimpleNamespace
+import threading
+import time
 
 import pytest
 
@@ -272,6 +274,96 @@ def test_publish_to_wechat_records_each_account_and_skips_completed_delivery(mon
     }
     assert article.wechat_account_id == 104
     assert db.commits == 1
+
+
+def test_pending_draft_delivery_accounts_skip_already_successful_accounts():
+    """草稿重试只提交没有成功记录的账号，避免并发优化破坏投递幂等。"""
+    from app.services.scheduled_delivery_service import pending_draft_delivery_account_ids
+
+    delivery_results = {
+        "24:103": {
+            "status": "success",
+            "mode": "draft",
+            "publish_domain": "public",
+            "media_id": "draft-existing",
+        }
+    }
+
+    assert pending_draft_delivery_account_ids(
+        article_id=24,
+        account_ids=[103, 104, 107],
+        delivery_results=delivery_results,
+        publish_domain="public",
+    ) == [104, 107]
+
+
+def test_bounded_draft_delivery_never_exceeds_configured_parallelism():
+    """五账号草稿保存最多双并发，避免并发过高反而触发微信或中转站限流。"""
+    from app.services.scheduled_delivery_service import execute_bounded_draft_deliveries
+
+    active_calls = 0
+    peak_calls = 0
+    lock = threading.Lock()
+
+    def deliver(account_id: int) -> str:
+        """用短暂阻塞模拟微信请求并记录实际并行度。"""
+        nonlocal active_calls, peak_calls
+        with lock:
+            active_calls += 1
+            peak_calls = max(peak_calls, active_calls)
+        time.sleep(0.03)
+        with lock:
+            active_calls -= 1
+        return f"draft-{account_id}"
+
+    results = execute_bounded_draft_deliveries(
+        [103, 104, 107, 108, 109],
+        max_workers=2,
+        deliver=deliver,
+    )
+
+    assert peak_calls == 2
+    assert [result.account_id for result in results] == [103, 104, 107, 108, 109]
+    assert [result.value for result in results] == [
+        "draft-103", "draft-104", "draft-107", "draft-108", "draft-109"
+    ]
+    assert all(result.error is None for result in results)
+
+
+def test_publish_to_wechat_uses_account_isolated_workers_for_multi_account_drafts(monkeypatch):
+    """多账号草稿必须委托独立工作单元，主会话不得跨线程复用。"""
+    from app.tasks import scheduled_task_executor as executor
+
+    calls = []
+
+    def deliver_one(*, article_id, task_id, run_id, account_id, publish_domain):
+        """模拟子线程独立完成账号级保存。"""
+        calls.append((article_id, task_id, run_id, account_id, publish_domain))
+        return {"media_id": f"draft-{account_id}"}
+
+    monkeypatch.setattr(executor, "_publish_scheduled_draft_for_account", deliver_one)
+    monkeypatch.setattr(
+        executor.settings,
+        "scheduled_draft_delivery_max_workers",
+        2,
+        raising=False,
+    )
+    run = SimpleNamespace(id=45, delivery_results={}, publish_domain="public")
+
+    executor._publish_to_wechat(
+        db=SimpleNamespace(),
+        article=SimpleNamespace(id=24),
+        account_ids=[103, 104, 107],
+        publish_mode="draft",
+        task=SimpleNamespace(id=8, tenant_id=107, created_by=9, publish_domain="public"),
+        run=run,
+    )
+
+    assert calls == [
+        (24, 8, 45, 103, "public"),
+        (24, 8, 45, 104, "public"),
+        (24, 8, 45, 107, "public"),
+    ]
 
 
 def test_partial_direct_publish_is_recorded_before_error(monkeypatch):

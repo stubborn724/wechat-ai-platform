@@ -101,7 +101,29 @@ async def generate_poster_plan(
         temperature=0.65,
     )
     raw = await complete_text(request)
-    data = _parse_json(raw)
+    try:
+        data = _parse_json(raw)
+    except ValueError as first_error:
+        # 上游偶尔忽略“只返回 JSON”的指令。此处只允许一次结构修复：把原始
+        # 内容交给同一文本通道整理为既定 Schema，而不是重新策划一篇海报文案，
+        # 从而既减少无效失败，也避免重试后风格和标题发生漂移。
+        repair_request = TextGenerationRequest(
+            system_prompt=(
+                "你是 JSON 结构修复器。只修复 JSON 结构，不改写、不补充、不删减"
+                "原始海报文案语义。只返回合法 JSON，不使用 Markdown。"
+            ),
+            user_message=(
+                "将以下模型输出整理为对象 JSON。必须包含 article_title 字符串与 "
+                "posters 数组；posters 每项包含 copy 和 scene 字符串。\n\n"
+                f"原始输出：\n{str(raw or '')[:8000]}"
+            ),
+            temperature=0,
+        )
+        repaired_raw = await complete_text(repair_request)
+        try:
+            data = _parse_json(repaired_raw)
+        except ValueError as repair_error:
+            raise ValueError("海报文案 Agent 返回的 JSON 无效") from repair_error
     # 模型偶尔会先输出“型号·占位品类|长句”。此处不能过早按最终标题长度截断，
     # 否则在清掉型号后正文已变成半句话；最终长度只在语义主体确定后统一收敛。
     title = _clean_copy(data.get("article_title", ""), 120)

@@ -314,6 +314,50 @@ def test_queue_selector_only_returns_the_oldest_waiting_run():
     assert select_next_waiting_scheduled_run([waiting_first, in_flight]) is None
 
 
+def test_admission_selector_accepts_two_distinct_queued_tasks_when_slots_are_free():
+    """双槽调度应领取最早两个不同任务，不能继续维持全局单任务串行。"""
+
+    from app.services.scheduled_run_admission_service import select_admissible_scheduled_runs
+
+    first = SimpleNamespace(
+        id=1, task_id=11, status="queued", scheduled_date="2026-08-14", scheduled_time="08:00"
+    )
+    second = SimpleNamespace(
+        id=2, task_id=12, status="queued", scheduled_date="2026-08-14", scheduled_time="08:00"
+    )
+    third = SimpleNamespace(
+        id=3, task_id=13, status="queued", scheduled_date="2026-08-14", scheduled_time="08:00"
+    )
+
+    selected = select_admissible_scheduled_runs(
+        [third, second, first], max_active_runs=2
+    )
+
+    assert selected == [first, second]
+
+
+def test_admission_selector_never_runs_two_slots_of_the_same_task_together():
+    """同一任务的下一时段必须等待当前运行结束，防止内容与投递结果交叉。"""
+
+    from app.services.scheduled_run_admission_service import select_admissible_scheduled_runs
+
+    running = SimpleNamespace(
+        id=1, task_id=11, status="running", scheduled_date="2026-08-14", scheduled_time="08:00"
+    )
+    same_task_waiting = SimpleNamespace(
+        id=2, task_id=11, status="queued", scheduled_date="2026-08-14", scheduled_time="09:00"
+    )
+    other_task_waiting = SimpleNamespace(
+        id=3, task_id=12, status="queued", scheduled_date="2026-08-14", scheduled_time="08:00"
+    )
+
+    selected = select_admissible_scheduled_runs(
+        [same_task_waiting, other_task_waiting, running], max_active_runs=2
+    )
+
+    assert selected == [other_task_waiting]
+
+
 def test_queued_message_has_shorter_recovery_window_than_running_message():
     """消息未被 Worker 认领时应快速补投，已运行任务仍须保留长保护窗口。"""
 

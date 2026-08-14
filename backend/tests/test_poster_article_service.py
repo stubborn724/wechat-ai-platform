@@ -116,6 +116,43 @@ async def test_poster_plan_keeps_product_and_style_body_separated_by_bar():
 
 
 @pytest.mark.asyncio
+async def test_poster_plan_repairs_invalid_json_once_without_regenerating_copy():
+    """海报文案偶发非 JSON 时应做一次结构修复，避免整条任务无效失败。"""
+    from app.services.poster_article_service import generate_poster_plan
+    from app.services.publication_format_service import analyze_publication_format
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+    requests = []
+
+    async def fake_complete(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return "标题：餐桌的安静日常"
+        return json.dumps(
+            {
+                "article_title": "餐桌|让日常在光线里慢慢安静",
+                "posters": [
+                    {"copy": "光线落在桌面上，让每一次用餐都回到从容。", "scene": "餐厅"}
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    plan = await generate_poster_plan(
+        profile=profile,
+        product_name="餐桌",
+        complete_text=fake_complete,
+    )
+
+    assert len(requests) == 2
+    assert "只修复 JSON 结构" in requests[1].system_prompt
+    assert plan.article_title.startswith("餐桌|")
+
+
+@pytest.mark.asyncio
 async def test_poster_plan_removes_model_prefix_when_model_and_category_are_concatenated():
     """型号与品类无分隔符粘连时，公众号标题仍只展示可读产品主体。"""
     from app.services.poster_article_service import generate_poster_plan

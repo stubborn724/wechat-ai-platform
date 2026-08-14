@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.database import MysqlSessionLocal
 from app.models.mysql_models import ScheduledTask, ScheduledTaskRun
 from app.schemas.article import ImageResult
@@ -523,24 +524,35 @@ def _recover_stale_scheduled_runs(db, *, now: datetime | None = None) -> int:
 
 
 def _dispatch_next_waiting_scheduled_run(db) -> bool:
-    """只派发全局队列中最早的一条尚未投递记录。
+    """在全局有限槽位中派发可准入的等待记录。
 
-    新任务到达时先写入 ``scheduled_task_runs``，再由这里挑选队头。队头执行期间
-    后续记录保持 ``queued/attempt_count=0``，不会因等待时间超过五分钟而触发
-    补偿，也不会被错误地同时发送到 Celery。
+    数据库行锁和单条记录的 ``_enqueue_scheduled_run`` 仍负责避免重复消息；本函数
+    只把原来的全局单队头改为“不同任务最多两个并行槽”。同一任务始终只会选中
+    一条，保证文章生成、防重和微信投递语义不变。
     """
 
-    runs = _load_active_scheduled_runs(db, lock=True)
-    run = select_next_waiting_scheduled_run(runs)
-    if run is None:
-        return False
-    return _enqueue_scheduled_run(
-        db,
-        run.task_id,
-        run,
-        reason="按全局定时任务顺序进入执行队列",
-        allow_fresh=True,
+    from app.config import settings
+    from app.services.scheduled_run_admission_service import (
+        select_admissible_scheduled_runs,
     )
+
+    runs = _load_active_scheduled_runs(db, lock=True)
+    admitted_runs = select_admissible_scheduled_runs(
+        runs,
+        max_active_runs=settings.scheduled_task_max_active_runs,
+        is_in_flight=is_scheduled_run_in_flight,
+    )
+    dispatched = False
+    for run in admitted_runs:
+        if _enqueue_scheduled_run(
+            db,
+            run.task_id,
+            run,
+            reason="按受控并发定时任务顺序进入执行队列",
+            allow_fresh=True,
+        ):
+            dispatched = True
+    return dispatched
 
 
 def _claim_scheduled_run(
@@ -1362,10 +1374,6 @@ def _scheduled_article(
                             enrich_erp_product_display_name,
                         )
 
-                        product_name = await enrich_erp_product_display_name(
-                            product_name=prepared_image.product.name,
-                            image_url=prepared_image.reference_url,
-                        )
                         # 产品一旦选定就同步冻结空间规则。规则来自 ERP 名称、分类和
                         # 标签的确定性匹配，不增加模型调用；后续标题、HTML 图片槽位
                         # 和最终图生图提示词都复用这一份快照，避免同一篇文章出现餐桌、
@@ -1375,9 +1383,19 @@ def _scheduled_article(
                         )
 
                         product_scene_profile = resolve_product_scene_profile(
-                            product_name,
+                            prepared_image.product.name,
                             tags=prepared_image.product.tags,
                             categories=prepared_image.product.categories,
+                        )
+                        # 视觉模型仅用于细化纯编号 ERP 商品的展示名。分类和标签已经
+                        # 能确定产品所在空间，故先解析一次并作为命名降级值；额度耗尽
+                        # 或服务不可用时不再退化成“家具单品”，也不额外增加模型调用。
+                        product_name = await enrich_erp_product_display_name(
+                            product_name=prepared_image.product.name,
+                            image_url=prepared_image.reference_url,
+                            # ``label`` 可能同时表达品类和房间，例如“茶几/边几/客厅”。
+                            # 展示名只能保留第一个明确产品品类，不能把房间词拼入标题。
+                            fallback_category=str(product_scene_profile.label).split("/", 1)[0],
                         )
                         s.product_scene_profile = product_scene_profile.to_payload()
                         print(
@@ -2297,6 +2315,34 @@ def _publish_to_wechat(
                 f"公众号 #{aid} 已存在未确认的微信交付结果，禁止自动重复发布；请先人工核对"
             )
 
+    # 草稿保存不包含正式发布的二阶段状态，也不会修改同一个公众号的外部文章；
+    # 因而不同账号可以有限并发。正式发布仍严格串行，避免并发改变微信发布顺序
+    # 或把部分成功语义变得不可解释。每个子工作单元自行创建数据库会话，主会话
+    # 绝不能跨线程传递给 SQLAlchemy 或微信发布服务。
+    if publish_mode == "draft" and run is not None and len(pending_account_ids) > 1:
+        from app.services.scheduled_delivery_service import execute_bounded_draft_deliveries
+
+        executions = execute_bounded_draft_deliveries(
+            pending_account_ids,
+            max_workers=getattr(settings, "scheduled_draft_delivery_max_workers", 2),
+            deliver=lambda account_id: _publish_scheduled_draft_for_account(
+                article_id=article.id,
+                task_id=task.id,
+                run_id=run.id,
+                account_id=account_id,
+                publish_domain=publish_domain,
+            ),
+        )
+        failed_execution = next(
+            (execution for execution in executions if execution.error is not None),
+            None,
+        )
+        if failed_execution is not None:
+            raise RuntimeError(
+                f"发布到公众号 #{failed_execution.account_id} 失败: {failed_execution.error}"
+            ) from failed_execution.error
+        return
+
     for aid in pending_account_ids:
         delivery_key = _scheduled_delivery_key(article.id, aid)
         try:
@@ -2393,6 +2439,171 @@ def _publish_to_wechat(
                 db.commit()
             logger.error("发布到公众号 #%s 失败: %s", aid, e)
             raise RuntimeError(f"发布到公众号 #{aid} 失败: {e}") from e
+
+
+def _persist_scheduled_draft_delivery_result(
+    db,
+    *,
+    run_id: int,
+    article_id: int,
+    account_id: int,
+    publish_domain: str,
+    result: dict,
+) -> bool:
+    """在账号工作单元结束时锁定运行记录并保存单个草稿结果。
+
+    并发账号不能先读取同一份 JSON 后再各自覆盖写回。这里在最终写入点对运行记录
+    加行锁、重新读取当前 ``delivery_results``，让每个账号只增量合并自己的键；
+    同时再检查是否已经成功，防御 Celery 重投或异常恢复和当前工作单元交错。
+    """
+
+    locked_run = (
+        db.query(ScheduledTaskRun)
+        .filter(ScheduledTaskRun.id == run_id)
+        .with_for_update()
+        .first()
+    )
+    if locked_run is None:
+        raise RuntimeError(f"定时运行 #{run_id} 不存在，已取消草稿结果写入")
+    delivery_results = dict(locked_run.delivery_results or {})
+    if _is_successful_scheduled_delivery(
+        delivery_results,
+        article_id=article_id,
+        account_id=account_id,
+        publish_mode="draft",
+        publish_domain=publish_domain,
+    ):
+        db.rollback()
+        return False
+    delivery_results[_scheduled_delivery_key(article_id, account_id)] = dict(result)
+    locked_run.delivery_results = delivery_results
+    db.commit()
+    return True
+
+
+def _publish_scheduled_draft_for_account(
+    *,
+    article_id: int,
+    task_id: int,
+    run_id: int,
+    account_id: int,
+    publish_domain: str,
+) -> dict:
+    """在独立会话中向一个公众号保存草稿并立即记录幂等结果。
+
+    这个函数是多账号草稿并发的事务边界：只加载本账号所需对象、调用一次外部接口、
+    并持久化一条账号级结果。出现不明确响应时先写 ``ambiguous``，后续自动重试会
+    被原有保护逻辑阻止，不能因为并发而重复创建微信草稿。
+    """
+
+    from app.models.mysql_models import Article
+    from app.services.wechat_publisher import WechatPublishAmbiguousError, publish_article
+
+    db = MysqlSessionLocal()
+    delivery_key = _scheduled_delivery_key(article_id, account_id)
+    normalized_domain = normalize_publish_domain(publish_domain)
+    try:
+        article = db.query(Article).filter(Article.id == article_id).first()
+        task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+        run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_id).first()
+        if article is None or task is None or run is None:
+            raise RuntimeError("草稿投递所需的文章、任务或运行记录不存在")
+
+        delivery_results = dict(run.delivery_results or {})
+        if _is_successful_scheduled_delivery(
+            delivery_results,
+            article_id=article_id,
+            account_id=account_id,
+            publish_mode="draft",
+            publish_domain=normalized_domain,
+        ):
+            return {"status": "skipped"}
+        previous_result = delivery_results.get(delivery_key)
+        if (
+            isinstance(previous_result, dict)
+            and previous_result.get("mode") == "draft"
+            and normalize_publish_domain(previous_result.get("publish_domain")) == normalized_domain
+            and previous_result.get("status") in {"partial", "ambiguous"}
+        ):
+            raise RuntimeError(
+                f"公众号 #{account_id} 已存在未确认的微信交付结果，禁止自动重复发布；请先人工核对"
+            )
+
+        result = publish_article(
+            db,
+            article,
+            account_id,
+            mode="draft",
+            publish_domain=normalized_domain,
+            tenant_id=task.tenant_id,
+            actor_id=task.created_by or 0,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("公众号发布接口没有返回结构化结果")
+        if result.get("publish_error"):
+            partial_result = {
+                "status": "partial",
+                "mode": "draft",
+                "publish_domain": normalized_domain,
+                "media_id": str(result.get("media_id") or "").strip(),
+                "error": str(result["publish_error"])[:2000],
+            }
+            _persist_scheduled_draft_delivery_result(
+                db,
+                run_id=run_id,
+                article_id=article_id,
+                account_id=account_id,
+                publish_domain=normalized_domain,
+                result=partial_result,
+            )
+            raise RuntimeError(f"保存草稿失败：{result['publish_error']}")
+        media_id = str(result.get("media_id") or "").strip()
+        if not media_id:
+            raise RuntimeError("保存草稿失败：微信未返回 media_id")
+        delivery_result = {
+            "status": "success",
+            "mode": "draft",
+            "publish_domain": normalized_domain,
+            "media_id": media_id,
+        }
+        _persist_scheduled_draft_delivery_result(
+            db,
+            run_id=run_id,
+            article_id=article_id,
+            account_id=account_id,
+            publish_domain=normalized_domain,
+            result=delivery_result,
+        )
+        logger.info("已保存草稿到公众号 #%s", account_id)
+        return delivery_result
+    except Exception as exc:
+        db.rollback()
+        if any(
+            isinstance(error, WechatPublishAmbiguousError)
+            for error in _iter_exception_chain(exc)
+        ):
+            ambiguous_result = {
+                "status": "ambiguous",
+                "mode": "draft",
+                "publish_domain": normalized_domain,
+                "error": str(exc)[:2000],
+            }
+            try:
+                _persist_scheduled_draft_delivery_result(
+                    db,
+                    run_id=run_id,
+                    article_id=article_id,
+                    account_id=account_id,
+                    publish_domain=normalized_domain,
+                    result=ambiguous_result,
+                )
+            except Exception as persist_error:
+                db.rollback()
+                logger.error("公众号 #%s 的不明确草稿结果未能保存: %s", account_id, persist_error)
+        logger.error("发布草稿到公众号 #%s 失败: %s", account_id, exc)
+        raise
+    finally:
+        db.close()
 
 
 def _finalize_article_delivery(db, article, publish_mode: str) -> None:

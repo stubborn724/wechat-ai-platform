@@ -37,6 +37,50 @@ def build_settings():
 
 
 @pytest.mark.asyncio
+async def test_open_circuit_skips_unhealthy_provider_and_uses_fallback():
+    """同一提供商连续临时失败后，后续图片不得再次等待其超时。"""
+    from app.services.image_generation_models import (
+        GeneratedImage,
+        ImageErrorCategory,
+        ImageGenerationRequest,
+        ImageProviderError,
+    )
+    from app.services.image_generation_service import ImageGenerationService
+    from app.services.image_provider_health_service import ImageProviderHealthService
+
+    primary = FakeProvider(
+        "openai_compatible",
+        error=ImageProviderError(
+            "timeout",
+            category=ImageErrorCategory.TEMPORARY,
+            provider="openai_compatible",
+        ),
+    )
+    fallback = FakeProvider(
+        "wanxiang",
+        result=GeneratedImage(
+            "https://cdn.example.com/fallback.png",
+            "wanxiang",
+            "wanx",
+        ),
+    )
+    service = ImageGenerationService(
+        settings=build_settings(),
+        providers={primary.name: primary, fallback.name: fallback},
+        health_service=ImageProviderHealthService(
+            failure_threshold=1,
+            cooldown_seconds=600,
+        ),
+    )
+
+    await service.generate(ImageGenerationRequest(prompt="第一张"))
+    await service.generate(ImageGenerationRequest(prompt="第二张"))
+
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_primary_success_does_not_call_fallback():
     """主模型成功时不得额外调用万相造成重复计费。"""
     from app.services.image_generation_models import GeneratedImage, ImageGenerationRequest

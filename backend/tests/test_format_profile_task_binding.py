@@ -32,6 +32,37 @@ def test_bound_testing_task_uses_explicit_profile_only() -> None:
     assert should_use_format_profile(task) is True
 
 
+def test_xiuman_binding_only_updates_tasks_using_the_fixed_feed_article() -> None:
+    """绣蔓模板绑定必须限定固定投喂源，不能误改其他 ERP 任务。"""
+
+    from app.services.xiuman_format_profile_binding_service import (
+        build_xiuman_format_profile_binding_updates,
+    )
+
+    matching_task = SimpleNamespace(
+        id=11,
+        name="绣蔓仿写-私域",
+        writing_mode="feed",
+        feed_article_ids=[1],
+        format_profile_id=None,
+    )
+    unrelated_task = SimpleNamespace(
+        id=13,
+        name="绣蔓仿写-公域",
+        writing_mode="feed",
+        feed_article_ids=[2],
+        format_profile_id=None,
+    )
+
+    updates = build_xiuman_format_profile_binding_updates(
+        [matching_task, unrelated_task],
+        source_article_id=1,
+        format_profile_id=6,
+    )
+
+    assert updates == [(matching_task, 6)]
+
+
 def test_format_profile_state_uses_saved_blueprint_without_reparsing_source_html(monkeypatch) -> None:
     """模板任务应从持久化蓝图恢复，不能再次解析原文章 HTML。"""
 

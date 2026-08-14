@@ -27,13 +27,15 @@ async def enrich_erp_product_display_name(
     *,
     product_name: str,
     image_url: str,
+    fallback_category: str | None = None,
     analyze_image: Callable[[str], Awaitable[str]] | None = None,
 ) -> str:
     """为纯编号 ERP 产品补充中文品类说明，并保留原始编号。
 
     ERP 已返回中文名称时直接采用，避免无意义调用视觉模型和覆盖人工维护名称。
-    只有纯编号或英文编号才分析主图；模型异常、空结果或不可信结果均回退通用品类，
-    保证命名增强不是文章生成与发布的单点故障。
+    只有纯编号或英文编号才分析主图；模型异常、空结果或不可信结果优先回退 ERP
+    已确认的分类品类，再回退通用品类。分类由调用方从 ERP 标签和分类确定，不增加
+    模型请求，因此视觉额度耗尽时仍能保持标题、正文和图片对产品主体的语义一致。
     """
     normalized_product_name = str(product_name or "").strip() or "未命名产品"
     if _CHINESE_CHARACTER_PATTERN.search(normalized_product_name):
@@ -46,7 +48,13 @@ async def enrich_erp_product_display_name(
         logger.warning("ERP 产品中文说明识别失败 product=%s: %s", normalized_product_name, exc)
         category_description = ""
 
-    return f"{normalized_product_name} {category_description or _FALLBACK_CATEGORY_DESCRIPTION}"
+    deterministic_category = _normalize_category_description(fallback_category or "")
+    resolved_category = (
+        category_description
+        or deterministic_category
+        or _FALLBACK_CATEGORY_DESCRIPTION
+    )
+    return f"{normalized_product_name} {resolved_category}"
 
 
 async def _analyze_product_category_with_visual_agent(image_url: str) -> str:

@@ -48,6 +48,24 @@ async def test_product_code_uses_safe_fallback_when_visual_analysis_fails() -> N
 
 
 @pytest.mark.asyncio
+async def test_product_code_prefers_known_category_when_visual_analysis_fails() -> None:
+    """视觉服务不可用时，ERP 已确认的品类应优先于通用占位名称。"""
+    from app.services.erp_product_naming_service import enrich_erp_product_display_name
+
+    async def failing_analyzer(_image_url: str) -> str:
+        raise RuntimeError("vision unavailable")
+
+    display_name = await enrich_erp_product_display_name(
+        product_name="FSJJ-24979",
+        image_url="https://cos.example.com/erp-product.jpg",
+        fallback_category="茶几",
+        analyze_image=failing_analyzer,
+    )
+
+    assert display_name == "FSJJ-24979 茶几"
+
+
+@pytest.mark.asyncio
 async def test_existing_chinese_product_name_does_not_spend_extra_visual_call() -> None:
     """ERP 已提供中文名称时保留原值，避免无意义消耗视觉模型额度。"""
     from app.services.erp_product_naming_service import enrich_erp_product_display_name

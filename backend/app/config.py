@@ -116,8 +116,20 @@ class Settings(BaseSettings):
     image_generation_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_generation_ark_api_key: str = ""
     image_generation_ark_model: str = "doubao-seedream-4-0-250828"
-    # 图片服务偶发排队且一篇文章可能请求多张图片；单次图片请求最多等待 30 分钟。
+    # 历史全局超时仅作为兼容回退。生产链路必须优先采用下方按 Provider 划分的
+    # 超时，避免单个异常中转站把整篇定时文章阻塞 30 分钟。
     image_generation_timeout_seconds: int = 1800
+    image_generation_primary_timeout_seconds: int = 120
+    image_generation_secondary_timeout_seconds: int = 150
+    image_generation_ark_timeout_seconds: int = 180
+    # 同一 Provider 连续临时故障时，后续图片直接走备用链路，避免五张图重复等待。
+    image_provider_circuit_failure_threshold: int = 3
+    image_provider_circuit_cooldown_seconds: int = 600
+    # 定时文章按任务维度互斥，但不同品牌可以在有限槽位中并行，消除全局串行排队。
+    scheduled_task_max_active_runs: int = 2
+    # 同一篇草稿会向多个公众号发起独立 HTTP 请求；限制为两个并行账号，既缩短
+    # 五账号场景的尾部时间，也避免中转站或微信接口因突发并发产生限流。
+    scheduled_draft_delivery_max_workers: int = 2
     # 旧万相适配器仅用于兼容历史部署；新部署默认以方舟 Seedream 作为最终兜底。
     image_generation_fallback_provider: str = "volcengine_ark"
     image_generation_max_response_bytes: int = 20 * 1024 * 1024

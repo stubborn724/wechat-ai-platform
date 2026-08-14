@@ -48,6 +48,7 @@ class VolcengineArkImageProvider:
         storage=storage_service,
         client_factory: Callable[..., Any] = httpx.AsyncClient,
         object_key_factory: Callable[[int], str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         """注入基础设施依赖，便于在不访问真实方舟的情况下测试协议。"""
         self.settings = settings
@@ -63,8 +64,11 @@ class VolcengineArkImageProvider:
         self.model = str(
             getattr(settings, "image_generation_ark_model", "") or ""
         ).strip()
+        # 方舟是最后一层兜底，使用独立的有限超时，避免继承历史 30 分钟全局值。
         self.timeout_seconds = int(
-            getattr(settings, "image_generation_timeout_seconds", 240)
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(settings, "image_generation_ark_timeout_seconds", 240)
         )
         self.max_response_bytes = int(
             getattr(settings, "image_generation_max_response_bytes", 20 * 1024 * 1024)
