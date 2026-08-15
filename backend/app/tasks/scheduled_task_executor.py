@@ -1384,7 +1384,14 @@ def _scheduled_article(
 
                         product_scene_profile = resolve_product_scene_profile(
                             prepared_image.product.name,
-                            tags=prepared_image.product.tags,
+                            # ERP 的旧商品常只返回型号，但同一原图已归档时素材库
+                            # 保存过品类标签。两者合并后再决定场景，视觉识别额度
+                            # 耗尽也能稳定识别“屏风”等历史产品，避免对外显示
+                            # “未识别家具”。
+                            tags=[
+                                *(prepared_image.product.tags or []),
+                                *prepared_image.asset_taxonomy_tags,
+                            ],
                             categories=prepared_image.product.categories,
                         )
                         # 视觉模型仅用于细化纯编号 ERP 商品的展示名。分类和标签已经

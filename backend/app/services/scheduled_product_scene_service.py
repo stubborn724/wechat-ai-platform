@@ -169,6 +169,16 @@ _PRODUCT_SCENE_PROFILES: tuple[ProductSceneProfile, ...] = (
         forbidden_elements=("餐桌", "餐椅", "床", "床头柜", "厨房岛台"),
     ),
     ProductSceneProfile(
+        key="screen_partition",
+        label="屏风/空间隔断",
+        trigger_terms=("屏风隔断", "屏风", "隔断"),
+        # 屏风承担空间组织而非单一房间家具的职责，不能像床或餐桌一样强制归入
+        # 某个房间；保留多个真实使用空间，避免图生图把产品错误收窄成固定场景。
+        required_rooms=("客厅", "玄关", "餐厅"),
+        allowed_elements=("墙面", "地面", "自然光影", "少量功能配套家具"),
+        forbidden_elements=("厨房岛台", "卫浴设施", "不相关的大型家具"),
+    ),
+    ProductSceneProfile(
         key="generic_furniture",
         label="未识别家具",
         trigger_terms=(),

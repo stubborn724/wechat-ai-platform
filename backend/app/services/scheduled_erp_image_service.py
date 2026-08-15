@@ -6,6 +6,7 @@ import hashlib
 import logging
 import math
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -65,6 +66,9 @@ class PreparedErpImage:
     relay_object_key: str
     reference_image_bytes: bytes
     reference_content_type: str
+    # 同一 ERP 商品历史归档时可能保留了 ERP 本次响应缺失的品类标签。调用方只把
+    # 这些标签用于确定性场景匹配和展示名降级，不作为用户可见的原始素材元数据。
+    asset_taxonomy_tags: tuple[str, ...]
 
 
 def parse_scheduled_erp_image_config(raw_config: object) -> ScheduledErpImageConfig | None:
@@ -168,6 +172,11 @@ async def prepare_erp_images_for_scheduled_run(
                 relay_object_key=relay_object.object_key,
                 reference_image_bytes=normalized_image.data,
                 reference_content_type=normalized_image.content_type,
+                # 旧资产记录的 ``tags`` 允许为空。标签补全是增强能力，不能让
+                # 历史资产缺少该字段时阻断整条定时选图和草稿发布链路。
+                asset_taxonomy_tags=tuple(
+                    extract_asset_taxonomy_tags(getattr(asset, "tags", None))
+                ),
             ))
             db.add(ScheduledTaskErpImageUsage(
                 task_id=task_id,
@@ -188,6 +197,30 @@ async def prepare_erp_images_for_scheduled_run(
 
     db.flush()
     return prepared_images
+
+
+def extract_asset_taxonomy_tags(raw_tags: object) -> list[str]:
+    """从素材库历史标签中取回可用于产品分类的原子词。
+
+    早期归档把多个 ERP 标签保存为一条逗号分隔字符串，而新归档会保存 JSON 数组。
+    定时选图复用同一原图时，必须兼容两种格式，才能让“屏风”等历史品类在 ERP
+    临时只返回型号、视觉服务不可用时继续参与场景和标题决策。
+    """
+
+    if isinstance(raw_tags, str):
+        source_tags = [raw_tags]
+    elif isinstance(raw_tags, (list, tuple, set)):
+        source_tags = [str(item) for item in raw_tags if item is not None]
+    else:
+        source_tags = []
+
+    normalized_tags: list[str] = []
+    for source_tag in source_tags:
+        for tag in re.split(r"[,，、;；|｜]+", source_tag):
+            normalized = tag.strip()
+            if normalized and normalized not in normalized_tags:
+                normalized_tags.append(normalized)
+    return normalized_tags
 
 
 def _recent_erp_image_urls(

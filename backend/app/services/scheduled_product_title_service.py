@@ -13,6 +13,11 @@ from app.services.scheduled_product_scene_service import ProductSceneProfile
 
 
 _GENERIC_PRODUCT_TERMS = ("家具单品", "家居产品", "未识别家具", "未命名产品")
+_PUBLIC_FALLBACK_SUBJECT_BY_SCENE_KEY = {
+    # ``generic_furniture`` 是场景服务的内部兜底名，用来表达“不要猜测房间”，
+    # 不能透传到公众号标题，否则会把内部识别状态展示给读者。
+    "generic_furniture": "家居美学",
+}
 _TITLE_BODY_BY_SCENE_KEY = {
     "bed": "东方神韵与当代奢雅，在静谧卧室里安放一夜从容",
     "sofa": "东方神韵与当代奢雅，在从容客厅里修养日常",
@@ -60,6 +65,9 @@ def _resolve_title_subject(product_name: str, profile: ProductSceneProfile) -> s
     chinese_only = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
     if 1 <= len(chinese_only) <= 12:
         return chinese_only
+    public_fallback = _PUBLIC_FALLBACK_SUBJECT_BY_SCENE_KEY.get(profile.key)
+    if public_fallback:
+        return public_fallback
     return str(profile.label).split("/", 1)[0].strip() or "家居单品"
 
 

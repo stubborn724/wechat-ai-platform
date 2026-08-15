@@ -113,6 +113,46 @@ def test_bed_title_uses_product_scene_and_never_falls_back_to_living_room():
     assert "C2025111479" not in title
 
 
+def test_archived_erp_tags_restore_screen_partition_category_for_title():
+    """ERP 只返型号时，应复用历史素材标签中的品类而非对外显示未识别。"""
+
+    from app.services.scheduled_erp_image_service import extract_asset_taxonomy_tags
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+    from app.services.scheduled_product_title_service import normalize_scheduled_product_title
+
+    archived_tags = extract_asset_taxonomy_tags([
+        "ERP产品,剪纸系列,XHPF20201209,剪纸3.0,写怀系列,屏风",
+    ])
+    profile = resolve_product_scene_profile("XHPF20201209", tags=archived_tags)
+    title = normalize_scheduled_product_title(
+        "XHPF20201209 屏风",
+        profile=profile,
+        candidate_title="以线条与材质的留白，营造温润居住感",
+    )
+
+    assert "屏风" in archived_tags
+    assert profile.key == "screen_partition"
+    assert title.startswith("屏风|")
+    assert "未识别家具" not in title
+
+
+def test_generic_scene_profile_never_exposes_internal_label_as_public_title():
+    """没有任何可靠品类时，内部通用档案名称也不得出现在公众号标题。"""
+
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+    from app.services.scheduled_product_title_service import normalize_scheduled_product_title
+
+    profile = resolve_product_scene_profile("FSJJ-20241020116")
+    title = normalize_scheduled_product_title(
+        "FSJJ-20241020116 家具单品",
+        profile=profile,
+        candidate_title="以线条与材质的留白，营造温润居住感",
+    )
+
+    assert "未识别家具" not in title
+    assert title.startswith("家居美学|")
+
+
 def test_bed_html_slot_text_removes_living_room_conflict():
     """床类 HTML 文案槽位不得保留客厅或沙发等冲突场景词。"""
 
