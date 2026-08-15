@@ -6,12 +6,17 @@ ERP 接口经常只返回产品编号。本文服务在不修改原始编号的�
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from io import BytesIO
 
+import httpx
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+from PIL import Image
 
 from app.config import settings
 
@@ -21,6 +26,21 @@ _CHINESE_CHARACTER_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 _DESCRIPTION_CHARACTER_PATTERN = re.compile(r"[^\u4e00-\u9fff、，\s]")
 _DESCRIPTION_MAX_LENGTH = 16
 _FALLBACK_CATEGORY_DESCRIPTION = "家具单品"
+_UNRELIABLE_CATEGORY_DESCRIPTIONS = {
+    _FALLBACK_CATEGORY_DESCRIPTION,
+    "未识别家具",
+    "未命名产品",
+}
+_PRODUCT_VISION_MAX_SIDE = 2048
+_PRODUCT_VISION_JPEG_QUALITY = 82
+
+
+@dataclass(frozen=True)
+class NormalizedProductVisionImage:
+    """发送给轻量视觉模型的受控图片输入。"""
+
+    data: bytes
+    content_type: str
 
 
 async def enrich_erp_product_display_name(
@@ -41,6 +61,15 @@ async def enrich_erp_product_display_name(
     if _CHINESE_CHARACTER_PATTERN.search(normalized_product_name):
         return normalized_product_name
 
+    deterministic_category = _normalize_category_description(fallback_category or "")
+    if (
+        deterministic_category
+        and deterministic_category not in _UNRELIABLE_CATEGORY_DESCRIPTIONS
+    ):
+        # ERP 分类、标签或历史素材标签已经给出明确品类时，视觉模型不能再推翻
+        # 这份确定性事实。直接返回既省去一次图片下载和模型调用，也避免额外延时。
+        return f"{normalized_product_name} {deterministic_category}"
+
     analyzer = analyze_image or _analyze_product_category_with_visual_agent
     try:
         category_description = _normalize_category_description(await analyzer(image_url))
@@ -48,7 +77,6 @@ async def enrich_erp_product_display_name(
         logger.warning("ERP 产品中文说明识别失败 product=%s: %s", normalized_product_name, exc)
         category_description = ""
 
-    deterministic_category = _normalize_category_description(fallback_category or "")
     resolved_category = (
         category_description
         or deterministic_category
@@ -61,25 +89,32 @@ async def _analyze_product_category_with_visual_agent(image_url: str) -> str:
     """调用视觉 Agent，为产品主图生成严格受限的中文品类候选。
 
     通用视觉理解 Agent 的 ``subject`` 通常包含场景和材质长句，不适合作为产品名。
-    此处沿用项目已有的视觉模型与鉴权配置，但以专用命名提示词限制输出；每篇任务
-    只针对唯一 ERP 主图调用一次，不会对后续 4 到 5 张背景图重复分析。
+    此处使用项目现有 Kuai 网关中的 ``qwen3-vl-8b-instruct``：它比通用大模型更适合
+    单对象分类，且不会受 DashScope 免费额度影响。每篇任务只针对唯一 ERP 主图调用
+    一次；图片先压缩为数据 URI，避免视觉接口拒绝 ERP 高清原图。
     """
     prompt = (
         "你是家具产品图片分析员。请只根据图片中最主要的家具，输出一个准确、保守的中文品类名称。\n"
         "要求：只输出 4 到 10 个中文字符；不要句子、标点、材质、颜色、尺寸、品牌、系列、型号或营销词；"
         "看不清时输出“家具单品”。示例：双层圆形边几、异形子母茶几、软包休闲椅。"
     )
+    normalized_image = await _download_and_normalize_product_vision_image(image_url)
+    image_data_uri = (
+        f"data:{normalized_image.content_type};base64,"
+        f"{base64.b64encode(normalized_image.data).decode('ascii')}"
+    )
     llm = ChatOpenAI(
-        api_key=settings.dashscope_api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        model="qwen-vl-max",
+        api_key=settings.text_generation_api_key,
+        base_url=settings.text_generation_base_url,
+        model=settings.erp_product_vision_model,
         temperature=0,
-        max_tokens=32,
+        max_tokens=96,
+        timeout=settings.erp_product_vision_timeout_seconds,
     )
     response = await llm.ainvoke([
         HumanMessage(content=[
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "image_url", "image_url": {"url": image_data_uri}},
         ]),
     ])
     content = response.content
@@ -90,6 +125,55 @@ async def _analyze_product_category_with_visual_agent(image_url: str) -> str:
             if isinstance(block, dict)
         )
     return str(content or "").strip()
+
+
+async def _download_and_normalize_product_vision_image(
+    image_url: str,
+) -> NormalizedProductVisionImage:
+    """下载 ERP 中转图并压缩为轻量视觉模型稳定接受的 JPEG。"""
+
+    normalized_url = str(image_url or "").strip()
+    if not normalized_url:
+        raise ValueError("ERP 产品视觉识别缺少图片地址")
+    timeout = httpx.Timeout(settings.erp_product_vision_timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(normalized_url)
+        response.raise_for_status()
+    return normalize_product_vision_image(
+        response.content,
+        response.headers.get("content-type") or "image/jpeg",
+    )
+
+
+def normalize_product_vision_image(
+    data: bytes,
+    content_type: str,
+) -> NormalizedProductVisionImage:
+    """压缩商品图，兼顾视觉分类细节与低成本模型的输入体积限制。"""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+        raise ValueError("ERP 产品视觉识别图片不能为空")
+    try:
+        with Image.open(BytesIO(bytes(data))) as source:
+            source.load()
+            image = source.convert("RGB")
+            image.thumbnail(
+                (_PRODUCT_VISION_MAX_SIDE, _PRODUCT_VISION_MAX_SIDE),
+                Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            image.save(
+                output,
+                format="JPEG",
+                quality=_PRODUCT_VISION_JPEG_QUALITY,
+                optimize=True,
+            )
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise ValueError("ERP 产品视觉识别图片无法解码") from exc
+    return NormalizedProductVisionImage(
+        data=output.getvalue(),
+        content_type="image/jpeg",
+    )
 
 
 def _normalize_category_description(candidate: str) -> str:

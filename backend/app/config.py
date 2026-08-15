@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     # 正文提供商包含主备切换，本地验收允许单篇正文最多等待 15 分钟。
     text_generation_timeout_seconds: int = 900
 
+    # ERP 产品名只有型号时，需要从商品主图识别保守品类。该调用走现有 Kuai
+    # OpenAI 兼容网关，默认使用轻量视觉模型，避免依赖可能耗尽免费额度的百炼。
+    erp_product_vision_model: str = "qwen3-vl-8b-instruct"
+    erp_product_vision_timeout_seconds: int = 90
+
     # AI 图片生成使用独立于正文大模型的提供商配置。业务层只识别统一图片生成
     # 服务，主备提供商及模型由这里选择，避免每个 Agent 各自硬编码模型地址。
     # 默认值与示例配置保持一致：优先使用 OpenAI 兼容主站，避免新环境在未显式
