@@ -18,6 +18,7 @@ import httpx
 
 from app.config import settings as application_settings
 from app.services.image_generation_models import (
+    classify_http_error_category,
     GeneratedImage,
     ImageErrorCategory,
     ImageGenerationRequest,
@@ -37,9 +38,6 @@ _CONTENT_TYPE_EXTENSIONS = {
     "image/webp": "webp",
     "image/gif": "gif",
 }
-_TEMPORARY_STATUS_CODES = {408, 409, 425}
-
-
 class OpenAICompatibleImageProvider:
     """通过 OpenAI 图片协议调用中转站并返回统一图片结果。"""
 
@@ -188,18 +186,7 @@ class OpenAICompatibleImageProvider:
             pass
         message = " ".join(message.split())[:300]
 
-        if status_code in {401, 403}:
-            category = ImageErrorCategory.AUTHENTICATION
-        elif status_code == 429:
-            category = ImageErrorCategory.RATE_LIMIT
-        elif status_code in _TEMPORARY_STATUS_CODES or status_code >= 500:
-            category = (
-                ImageErrorCategory.UPSTREAM
-                if status_code >= 500
-                else ImageErrorCategory.TEMPORARY
-            )
-        else:
-            category = ImageErrorCategory.INVALID_REQUEST
+        category = classify_http_error_category(status_code, message)
         raise ImageProviderError(
             f"图片中转站返回 HTTP {status_code}：{message}",
             category=category,

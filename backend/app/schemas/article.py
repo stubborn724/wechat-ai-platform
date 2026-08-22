@@ -121,6 +121,9 @@ class ArticleState(BaseModel):
     max_generated_images: int = Field(default=5, ge=0, le=30)
     enabled_image_methods: Optional[List[str]] = None
     error: Optional[str] = None
+    # Agent 的字符串错误仍用于 API 和日志展示；该标记保留错误分类，避免调度器
+    # 把“模型偶发 JSON 格式异常”退化为普通 RuntimeError 后丢失重试资格。
+    error_retryable: bool = False
     # Knowledge base integration
     knowledge_base_ids: Optional[List[int]] = None
     kb_context: Optional[str] = None
@@ -168,3 +171,6 @@ class ArticleState(BaseModel):
     # ERP 产品对应的空间规则快照。由定时任务在选定产品后程序化生成，避免每个
     # 图片槽位再次调用模型判断“餐桌应该放餐厅还是客厅”，也让重试使用同一规则。
     product_scene_profile: Optional[dict] = None
+    # ERP 来源同时代表品牌标题调性。该值在选品时冻结，标题兜底与海报文案均通过
+    # 它选择品牌规则，避免绣蔓等现代家具任务误用东方品牌的审美措辞。
+    product_brand_key: Optional[str] = None

@@ -133,11 +133,12 @@ def apply_publish_delivery_outcome(article: Any, attempt: Any, outcome: PublishD
 
 def expire_unresolved_relay_publish(article: Any, attempts: Iterable[Any], *, now: datetime,
                                     timeout_seconds: int) -> bool:
-    """将没有状态查询能力的 relay 发布收敛为可观测失败。
+    """将长期未取得终态的 relay 发布收敛为可恢复的未知状态。
 
     中转站当前只返回“已提交”而没有最终状态查询协议。为避免文章无限停在
-    ``PUBLISHING``，仅对明确标记为 ``RELAY_PUBLISHING`` 的任务在超时后置失败；
-    直连微信任务仍由原有 freepublish 轮询处理。
+    ``PUBLISHING``，仅对明确标记为 ``RELAY_PUBLISHING`` 的任务在超时后标为未知；
+    直连微信任务仍由原有 freepublish 轮询处理。未知不是微信拒绝，因此后续中转站
+    状态接口可在不重复发布的前提下继续查询并覆盖该状态。
     """
 
     if getattr(article, "status", None) != "publishing":
@@ -149,19 +150,110 @@ def expire_unresolved_relay_publish(article: Any, attempts: Iterable[Any], *, no
     if recorded_at is not None and _elapsed_seconds(recorded_at, now) < max(int(timeout_seconds), 1):
         return False
 
-    error_code = "PUBLISH_STATUS_UNAVAILABLE"
-    error_message = "微信中转站已受理发布，但当前没有最终状态查询能力；请到公众号后台核验。"
-    article.status = "failed"
+    error_code = "PUBLISH_STATUS_UNKNOWN"
+    error_message = "微信中转站已受理发布，但暂未取得最终发布状态；系统将继续查询。"
+    article.status = "unknown"
     article.phase = error_code
     article.error_message = error_message
     for attempt in attempts:
         if getattr(attempt, "status", None) not in {"pending", "queued", "publishing", "retrying"}:
             continue
-        attempt.status = "failed"
+        attempt.status = "unknown"
         attempt.error_code = error_code
         attempt.error_message = error_message
-        attempt.finished_at = now
+        # UNKNOWN 不是投递终态，不能写 finished_at，否则后续成功查询无法区分补偿。
+        attempt.finished_at = None
     return True
+
+
+def apply_relay_publish_status(
+    article: Any,
+    attempts: Iterable[Any],
+    candidates: Iterable[Any],
+    relay_result: dict[str, Any],
+    *,
+    now: datetime,
+) -> str:
+    """把中转站最终状态查询结果收敛到文章、投递记录和发布候选。
+
+    该函数是发布提交后的唯一状态写入入口。它只消费 ``query_publish_status`` 的
+    已归一化结果，绝不调用发布接口；这样轮询、Gateway 查询和未来回调都可以复用
+    同一套迁移规则，避免某个入口把“已受理”误写为“已发布”。
+    """
+
+    status = _string_or_none(relay_result.get("relay_status")) or "UNKNOWN"
+    message = _string_or_none(relay_result.get("message"))
+    error_code = _string_or_none(relay_result.get("error_code"))
+    wechat_article_id = _string_or_none(relay_result.get("wechat_article_id"))
+    active_attempts = [
+        attempt for attempt in attempts
+        if getattr(attempt, "status", None) in {"pending", "queued", "publishing", "retrying", "unknown"}
+    ]
+    active_candidates = [
+        candidate for candidate in candidates
+        if getattr(candidate, "status", None) in {"RESERVED", "PUBLISHING", "UNKNOWN"}
+    ]
+
+    if status == "PUBLISHED":
+        article.status = "published"
+        article.phase = "PUBLISHED"
+        article.error_message = None
+        if wechat_article_id:
+            article.msg_data_id = wechat_article_id
+        for attempt in active_attempts:
+            attempt.status = "success"
+            attempt.error_code = None
+            attempt.error_message = None
+            if wechat_article_id:
+                attempt.platform_message_id = wechat_article_id
+            attempt.finished_at = now
+        for candidate in active_candidates:
+            candidate.status = "PUBLISHED"
+        return status
+
+    if status == "FAILED":
+        final_error_code = error_code or "PUBLISH_REJECTED"
+        final_message = message or "微信平台拒绝或未完成正式发布"
+        article.status = "failed"
+        article.phase = final_error_code
+        article.error_message = final_message
+        for attempt in active_attempts:
+            attempt.status = "failed"
+            attempt.error_code = final_error_code
+            attempt.error_message = final_message
+            attempt.finished_at = now
+        for candidate in active_candidates:
+            candidate.status = "FAILED"
+        return status
+
+    if status == "PUBLISHING":
+        article.status = "publishing"
+        article.phase = "RELAY_PUBLISHING"
+        article.error_message = None
+        for attempt in active_attempts:
+            attempt.status = "publishing"
+            attempt.error_code = None
+            attempt.error_message = None
+            attempt.finished_at = None
+        for candidate in active_candidates:
+            candidate.status = "PUBLISHING"
+        return status
+
+    # 任何不可识别或暂不可查的状态都按 UNKNOWN 处理。它不是微信拒绝，必须保留
+    # 发布 ID 和已消费候选，等待后续查询覆盖，绝不能重新调用正式发布。
+    final_error_code = error_code or "PUBLISH_STATUS_UNKNOWN"
+    final_message = message or "发布已受理，暂未取得微信最终状态；系统将继续查询。"
+    article.status = "unknown"
+    article.phase = final_error_code
+    article.error_message = final_message
+    for attempt in active_attempts:
+        attempt.status = "unknown"
+        attempt.error_code = final_error_code
+        attempt.error_message = final_message
+        attempt.finished_at = None
+    for candidate in active_candidates:
+        candidate.status = "UNKNOWN"
+    return "UNKNOWN"
 
 
 def _failure_outcome(error_code: str, error_message: str, media_id: str | None = None) -> PublishDeliveryOutcome:

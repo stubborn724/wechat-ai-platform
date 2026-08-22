@@ -56,7 +56,8 @@ def test_xiuman_visual_rule_keeps_contact_details_out_of_image_model() -> None:
         if profile.erp_source_key == "xiuman"
     )
 
-    assert "每篇图片由程序按不同机位轮换" in xiuman.visual_document_text
+    assert "仅在参考图已知视角内轮换" in xiuman.visual_document_text
+    assert "不得幻觉补造" in xiuman.visual_document_text
     assert "模型不得生成任何可读文字" in xiuman.visual_document_text
     assert "右下角添加艺术字水印" not in xiuman.visual_document_text
     assert "绣蔓家具TEL" not in xiuman.visual_document_text

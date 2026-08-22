@@ -22,6 +22,7 @@ from typing import Any
 
 
 PRODUCT_SCENE_GUARD_MARKER = "【产品-场景一致性硬约束】"
+PRODUCT_IDENTITY_GUARD_MARKER = "【同篇产品身份证硬约束】"
 
 
 @dataclass(frozen=True)
@@ -378,13 +379,52 @@ def append_product_scene_guard(
     return f"{normalized_prompt}\n\n{guard}" if normalized_prompt else guard
 
 
+def append_product_identity_guard(
+    prompt: str,
+    profile: ProductSceneProfile | None,
+    *,
+    product_name: str = "",
+) -> str:
+    """把同一 ERP 原图的产品身份固定到每一个图片槽位。
+
+    ``append_erp_image_viewpoint_instruction`` 约束的是不能凭空补造未见结构，
+    但它不能阻止模型在不同槽位把同一张参考图理解为同系列的另一款家具。本函数
+    因此独立固定“本篇唯一产品”的识别信息：产品名称、确定性类别、可见结构与
+    材质边界，以及不可改变的比例/颜色/结构。它只编译文本，不调用视觉模型，
+    从而不会增加每张图片的成本或让重试时产品解释发生漂移。
+
+    ``profile`` 为 ``None`` 时使用保守的未识别家具描述，以兼容历史的参考图
+    图生图入口；定时 ERP 任务会传入选品时已经冻结的场景快照。
+    """
+
+    normalized_prompt = str(prompt or "").strip()
+    if PRODUCT_IDENTITY_GUARD_MARKER in normalized_prompt:
+        return normalized_prompt
+
+    safe_profile = profile or resolve_product_scene_profile(product_name)
+    product_label = str(product_name or "").strip() or safe_profile.label
+    required_rooms = "、".join(safe_profile.required_rooms)
+    identity = (
+        f"{PRODUCT_IDENTITY_GUARD_MARKER}\n"
+        f"唯一产品：{product_label}\n"
+        f"产品类别：{safe_profile.label}\n"
+        f"功能空间类别：{required_rooms}\n"
+        "同一产品，不是同系列不同款：本篇所有图片都必须是参考图中的同一件实体产品，"
+        "不得替换成外观相近、尺寸不同或同系列的其他款。\n"
+        "产品识别边界：保留参考图可见的主体轮廓、比例、关键连接结构、材质纹理、"
+        "主色和饰面关系；不得改变主体比例，不得增减可识别结构，不得改材质或颜色，"
+        "不得用通用家具、相似家具或其他产品替代。"
+    )
+    return f"{normalized_prompt}\n\n{identity}" if normalized_prompt else identity
+
+
 def append_erp_image_viewpoint_instruction(
     prompt: str,
     position: int,
     *,
     total: int,
 ) -> str:
-    """为 ERP 同篇配图分配稳定且互不重复的镜头视角。
+    """为 ERP 同篇配图分配不补造产品结构的景别与裁切差异。
 
     该函数只负责把镜头差异和联系方式禁生约束编译到提示词，不调用模型，也不
     改变产品主体。将规则放在生图请求的最后一层，是为了覆盖上游知识库或 Agent
@@ -397,23 +437,24 @@ def append_erp_image_viewpoint_instruction(
     safe_position = max(1, int(position or 1))
     view_index = (safe_position - 1) % 5
     viewpoints = (
-        "正面三分之四主视角：展示产品完整轮廓、正面比例和主要使用关系。",
-        "反向三分之四视角：从产品另一侧观察，展示侧面厚度、背部结构和空间关系。",
-        "侧面视角：以低机位侧拍展示产品的纵深、边缘线条、支撑结构和落地关系。",
-        "材质细节视角：近距离聚焦产品材质、纹理、连接件或边角工艺，同时保留可识别主体。",
-        "生活空间广角：从更远的环境视角展示产品在正确功能空间中的完整陈设关系。",
+        "完整主场景：保持参考图原始朝向，完整展示产品比例与正确功能空间。",
+        "更远空间全景：保持参考图原始朝向，只缩小产品并拉开景别，展示完整功能空间。",
+        "已见上部细节：只裁切放大参考图已经可见的台面、坐面、材质或上部轮廓。",
+        "已见下部细节：只裁切放大参考图已经可见的支撑、连接、柜脚或下部轮廓。",
+        "另一正确背景：保持参考图原始朝向，更换同类功能空间和侧向光线。",
     )
     instruction = (
-        "【ERP 多角度硬约束】\n"
+        "【ERP 已知角度硬约束】\n"
         f"本篇共 {safe_total} 张产品图，本图为第 {safe_position} 张。\n"
         f"{viewpoints[view_index]}\n"
-        "同一篇图片必须保持同一产品、同一空间类型和一致色温，但每张必须改变镜头位置、"
-        "取景距离或构图；禁止复制、镜像、简单裁切或只放大上一张。\n"
+        "仅可使用参考图已经可见的产品面、轮廓、材质和结构。产品必须保持参考图原始朝向，"
+        "不要求真实换角度；每张只通过景别、裁切范围和背景变化来区分，不得补造背面、侧后、"
+        "底部、内部结构或被遮挡细节，不得镜像、透视重建或重新设计产品。\n"
         "【联系方式隔离硬约束】\n"
         "图像模型禁止生成任何可读文字、中文、英文、数字、电话号码、二维码、微信图标、"
         "抖音图标、品牌名称、Logo、水印、产品咨询卡或联系方式背景。联系方式只允许由"
         "程序在文章固定底部咨询卡中渲染；如任务配置了图片水印，也只能由程序后处理叠加。"
     )
-    if "【ERP 多角度硬约束】" in normalized_prompt:
+    if "【ERP 已知角度硬约束】" in normalized_prompt:
         return normalized_prompt
     return f"{normalized_prompt}\n\n{instruction}" if normalized_prompt else instruction

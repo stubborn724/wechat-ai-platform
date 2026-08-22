@@ -25,8 +25,8 @@ def test_temporary_provider_error_is_fallback_eligible():
     assert error.can_fallback is True
 
 
-def test_auth_provider_error_is_not_fallback_eligible():
-    """鉴权配置错误必须直接暴露，不能长期由万相掩盖。"""
+def test_auth_provider_error_remains_classified_as_authentication():
+    """领域错误仍保留鉴权分类，由统一路由开关决定是否继续降级。"""
     from app.services.image_generation_models import (
         ImageErrorCategory,
         ImageProviderError,

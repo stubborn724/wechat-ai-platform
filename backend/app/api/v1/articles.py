@@ -326,6 +326,44 @@ def select_delivery_image_url(source_url: str, archived_url: str) -> str:
         return normalized_archived_url
     return normalized_source_url or normalized_archived_url
 
+
+def select_fallback_cover_image_url(
+    cover_image_url: str | None,
+    generated_images: list | None,
+) -> str | None:
+    """在独立 AI 封面不可用时选择一张真实正文图片作为封面。
+
+    公众号文章的封面和正文配图在请求字段上是两条数据流，但两者最终都必须
+    由同一篇文章交付给微信。过去封面生成异常后只打印“将使用正文配图”，却
+    没有把任何正文图片写回封面字段，导致正文已经完成、发布阶段才因封面为空
+    失败。这里保留用户明确选择的封面优先级，再从已生成图片中选择第一个有
+    地址的真实工件；没有真实图片时返回 ``None``，绝不伪造或使用随机图片。
+    """
+    explicit_cover = str(cover_image_url or "").strip()
+    if explicit_cover:
+        return explicit_cover
+
+    for image in generated_images or []:
+        candidate = image.get("url") if isinstance(image, dict) else getattr(image, "url", None)
+        normalized_candidate = str(candidate or "").strip()
+        if normalized_candidate:
+            return normalized_candidate
+    return None
+
+
+def require_article_cover_image_url(cover_image_url: str | None) -> str:
+    """确认图文文章已经拿到真实封面，避免发布阶段才暴露空值。
+
+    微信文章发布协议不会接受没有封面的文章。生成阶段如果继续把空值保存为
+    “已完成”，用户只能在点击发布后才看到中转站错误，既无法定位问题，也会
+    让 Runtime 误以为正文链路已经成功。把校验放在文章落库前，异常会沿现有
+    生成失败处理写入文章状态和错误消息，同时保留正文调试信息供恢复使用。
+    """
+    normalized_cover = str(cover_image_url or "").strip()
+    if not normalized_cover:
+        raise ValueError("封面图生成失败，文章尚未具备可发布的封面")
+    return normalized_cover
+
 @router.post("/articles/create", status_code=status.HTTP_201_CREATED)
 async def create_article(
     req: CreateArticleRequest,
@@ -839,6 +877,18 @@ async def create_article(
                         state = await agent5_generate_images(state)
                         print(f"     已获取 {len(state.images)} 张配图")
 
+                    # 独立 AI 封面失败时，复用已经生成的第一张正文图片，兑现上方的
+                    # 回退约定。该步骤必须发生在素材归档前，后续 URL 映射才能同时
+                    # 更新正文图片和文章封面；没有图片时保持空值，交给外层异常处理
+                    # 明确标记任务失败，不能把空封面拖到正式发布阶段才暴露。
+                    if not cover_image_url:
+                        cover_image_url = select_fallback_cover_image_url(
+                            cover_image_url,
+                            state.images,
+                        )
+                        if cover_image_url:
+                            print(f"  ✅ 已使用正文首图作为封面: {cover_image_url[:60]}")
+
                     # Extract image keywords BEFORE merge (post-processing needs them)
                     image_keywords_auto = re.findall(r'keywords=([^,\]]+)', content)
 
@@ -895,6 +945,11 @@ async def create_article(
                     content_rich = _render_image_markers(content, article.task_id)
             else:
                 content_rich = _render_image_markers(content, article.task_id)
+
+            # 图文文章必须在正文保存前完成封面闭环。真实封面可能来自 AI、用户
+            # 选图或正文首图回退；三者都没有时直接进入现有失败状态，不能把空封面
+            # 继续写入文章后再让正式发布接口返回“缺少封面”。
+            cover_image_url = require_article_cover_image_url(cover_image_url)
 
             # Footer is already appended by merge_images_into_content() via state.footer_template
 

@@ -34,7 +34,64 @@ class ErpProductConfigurationError(ErpProductError):
 
 
 class ErpProductApiError(ErpProductError):
-    """ERP 授权或产品查询接口返回失败。"""
+    """ERP 授权或产品查询接口返回失败。
+
+    ERP 的业务接口可能用 HTTP 200 返回“系统异常”，也可能直接返回网络/HTTP
+    错误。将是否可重试的结论随领域异常保存，调度器就不必依赖脆弱的字符串猜测，
+    同时仍能把明确的凭证错误与临时服务异常区分开。
+    """
+
+    _PERMANENT_ERROR_MARKERS = (
+        "凭证无效",
+        "client credential",
+        "invalid credential",
+        "invalid client",
+        "invalid token",
+        "unauthorized",
+        "access denied",
+        "permission denied",
+        "参数错误",
+        "请求参数错误",
+    )
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        """创建 ERP 异常，并冻结本次任务是否值得再次请求。
+
+        未明确标记为永久错误的 ERP API 异常默认允许有限重试，因为上游常把
+        服务繁忙、内部异常和网关故障包装在 HTTP 200 的业务响应中。配置错误、
+        凭证错误和明显参数错误则默认立即失败，避免无意义地重复调用。
+        """
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = (
+            self._infer_retryability(message)
+            if retryable is None
+            else bool(retryable)
+        )
+
+    @classmethod
+    def _infer_retryability(cls, message: str) -> bool:
+        """根据 ERP 错误摘要识别确定性错误，未知错误按临时故障处理。"""
+        normalized = " ".join(str(message or "").lower().split())
+        return not any(marker in normalized for marker in cls._PERMANENT_ERROR_MARKERS)
+
+
+def is_retryable_erp_status(status_code: int | None) -> bool:
+    """判断 ERP HTTP 状态是否适合有限重试。
+
+    408/425/429 和 5xx 通常代表请求超时、限流或上游异常；401/403、400 和
+    404 更可能是凭证、权限、路径或参数问题，应直接暴露给管理员处理。
+    """
+    if status_code is None:
+        return True
+    normalized = int(status_code)
+    return normalized in {408, 425, 429} or normalized >= 500
 
 
 @dataclass(frozen=True)
@@ -164,7 +221,9 @@ class ErpProductClient:
         response = await self._post(source.product_api_path, headers=headers, json_body=dict(filters))
         payload = self._read_json(response, "产品查询")
         if not payload.get("success") or str(payload.get("code")) != "0":
-            raise ErpProductApiError(f"ERP 产品查询失败：{payload.get('message') or payload.get('msg') or '未知错误'}")
+            raise ErpProductApiError(
+                f"ERP 产品查询失败：{payload.get('message') or payload.get('msg') or '未知错误'}"
+            )
 
         data = payload.get("data") or {}
         if not isinstance(data, dict):
@@ -201,7 +260,9 @@ class ErpProductClient:
         data = payload.get("data") or {}
         access_token = str(data.get("access_token") or "").strip()
         if payload.get("code") not in (0, "0") or not access_token:
-            raise ErpProductApiError(f"ERP Token 获取失败：{payload.get('msg') or '未返回 access_token'}")
+            raise ErpProductApiError(
+                f"ERP Token 获取失败：{payload.get('msg') or '未返回 access_token'}"
+            )
 
         expires_in = max(self._as_int(data.get("expires_in"), 3600), self._TOKEN_SAFETY_WINDOW_SECONDS + 1)
         self._tokens[source.key] = _CachedToken(
@@ -224,6 +285,20 @@ class ErpProductClient:
                 response = await client.post(url, headers=dict(headers), json=json_body)
             response.raise_for_status()
             return response
+        except httpx.HTTPStatusError as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            logger.warning(
+                "ERP 请求失败：path=%s status=%s error=%s",
+                path,
+                status_code,
+                type(exc).__name__,
+            )
+            raise ErpProductApiError(
+                f"ERP 服务请求失败：HTTP {status_code}",
+                retryable=is_retryable_erp_status(status_code),
+                status_code=status_code,
+            ) from exc
         except httpx.HTTPError as exc:
             # 连接中断、DNS 失败等传输异常没有 ``response`` 属性；使用两层
             # getattr 才能把所有 httpx 异常稳定转换为可供定时任务重试的业务错误。
@@ -234,7 +309,11 @@ class ErpProductClient:
                 getattr(response, "status_code", None),
                 type(exc).__name__,
             )
-            raise ErpProductApiError(f"ERP 服务请求失败：{exc}") from exc
+            raise ErpProductApiError(
+                f"ERP 服务请求失败：{type(exc).__name__}",
+                retryable=True,
+                status_code=getattr(response, "status_code", None),
+            ) from exc
 
     @staticmethod
     def _read_json(response: httpx.Response, operation: str) -> Dict[str, Any]:

@@ -88,54 +88,82 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     dashscope_model: str = "qwen-plus"
 
-    # 文生文使用独立的 OpenAI 兼容主站，百炼作为第二层兜底。密钥仅由服务端
-    # 环境变量注入；所有文章 Agent 通过统一路由调用，避免模型配置散落。
-    text_generation_provider_chain: str = "kuai,dashscope"
+    # 文生文使用两个相互独立的 Kuai 模型。密钥仅由服务端环境变量注入；所有
+    # 使用统一文本路由的文章能力按链路降级，避免每个 Agent 各自处理模型故障。
+    text_generation_provider_chain: str = "kuai,kuai_secondary"
     text_generation_base_url: str = ""
     text_generation_api_key: str = ""
     text_generation_model: str = "gpt-5-mini"
+    text_generation_secondary_base_url: str = ""
+    text_generation_secondary_api_key: str = ""
+    text_generation_secondary_model: str = "qwen3.5-flash"
     # 正文提供商包含主备切换，本地验收允许单篇正文最多等待 15 分钟。
     text_generation_timeout_seconds: int = 900
 
-    # ERP 产品名只有型号时，需要从商品主图识别保守品类。该调用走现有 Kuai
-    # OpenAI 兼容网关，默认使用轻量视觉模型，避免依赖可能耗尽免费额度的百炼。
+    # ERP 产品名只有型号时，需要从商品主图识别保守品类。Kuai 为主服务；方舟
+    # Endpoint 仅作为独立备用，不能配置公共模型名，否则方舟会拒绝调用。
     erp_product_vision_model: str = "qwen3-vl-8b-instruct"
     erp_product_vision_timeout_seconds: int = 90
+    erp_product_vision_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    erp_product_vision_ark_api_key: str = ""
+    erp_product_vision_ark_model: str = ""
 
     # AI 图片生成使用独立于正文大模型的提供商配置。业务层只识别统一图片生成
     # 服务，主备提供商及模型由这里选择，避免每个 Agent 各自硬编码模型地址。
     # 默认值与示例配置保持一致：优先使用 OpenAI 兼容主站，避免新环境在未显式
     # 配置 provider chain 时意外回退到历史万相路径。
     image_generation_provider: str = "kuai_openai_compatible"
-    image_generation_provider_chain: str = ""
+    image_generation_provider_chain: str = (
+        "kuai_openai_compatible,kuai_seedream_40,jiuye_image_2,volcengine_ark"
+    )
     image_generation_base_url: str = ""
     image_generation_api_key: str = ""
-    image_generation_model: str = "gpt-image-2"
-    image_generation_edit_model: str = "gpt-image-2"
+    image_generation_model: str = "doubao-seedream-4-5-251128"
+    image_generation_edit_model: str = "doubao-seedream-4-5-251128"
+    # 第二层继续走 Kuai 的另一个 Seedream 版本。它与第一层共用协议和密钥，但
+    # 在路由层必须使用独立 provider 名称，避免健康熔断把两个模型一起跳过。
     image_generation_secondary_base_url: str = ""
     image_generation_secondary_api_key: str = ""
-    image_generation_secondary_model: str = "gpt-image-2"
-    image_generation_secondary_edit_model: str = "gpt-image-2"
-    # 火山方舟 Seedream 是万相的图生图替代兜底。它可以接收本地图片字节，
-    # 因而不要求 ERP 原图先暴露为公网 URL。
+    image_generation_secondary_model: str = "doubao-seedream-4-0-250828"
+    image_generation_secondary_edit_model: str = "doubao-seedream-4-0-250828"
+    # 以下字段仅为旧部署保留，不纳入新的正式三层链路。
+    image_generation_tertiary_base_url: str = ""
+    image_generation_tertiary_api_key: str = ""
+    image_generation_tertiary_model: str = "doubao-seedream-4-0-250828"
+    image_generation_tertiary_edit_model: str = "doubao-seedream-4-0-250828"
+    # 九野使用异步任务协议，不能复用 OpenAI 同步图片适配器。它作为第三层时
+    # 独立提交并轮询 image-2，完成后将临时结果归档到 MinIO。
+    image_generation_jiuye_base_url: str = "https://api.jiuyeyingxiang.com"
+    image_generation_jiuye_api_key: str = ""
+    image_generation_jiuye_submit_path: str = "/v1/xingba/image"
+    image_generation_jiuye_poll_path: str = "/v1/xingba/image/{task_id}"
+    image_generation_jiuye_model: str = "gpt-image-2"
+    image_generation_jiuye_timeout_seconds: int = 240
+    image_generation_jiuye_poll_interval_seconds: float = 3.0
+    # 火山方舟配置仅保留给历史环境手动切换；默认正式链路不再装配它。
     image_generation_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_generation_ark_api_key: str = ""
-    image_generation_ark_model: str = "doubao-seedream-4-0-250828"
+    image_generation_ark_model: str = "doubao-seedream-4-5-251128"
     # 历史全局超时仅作为兼容回退。生产链路必须优先采用下方按 Provider 划分的
     # 超时，避免单个异常中转站把整篇定时文章阻塞 30 分钟。
     image_generation_timeout_seconds: int = 1800
     image_generation_primary_timeout_seconds: int = 120
     image_generation_secondary_timeout_seconds: int = 150
+    image_generation_tertiary_timeout_seconds: int = 180
     image_generation_ark_timeout_seconds: int = 180
     # 同一 Provider 连续临时故障时，后续图片直接走备用链路，避免五张图重复等待。
     image_provider_circuit_failure_threshold: int = 3
     image_provider_circuit_cooldown_seconds: int = 600
+    # 图片生成链路按业务要求采用“上一层失败即进入下一层”策略。显式配置成开关，
+    # 便于不同部署在成本和容错之间选择；开启后鉴权、额度、参数和存储等提供商
+    # 错误也会继续尝试下一层，只有所有层都失败才让任务失败。
+    image_generation_fallback_on_any_error: bool = False
     # 定时文章按任务维度互斥，但不同品牌可以在有限槽位中并行，消除全局串行排队。
     scheduled_task_max_active_runs: int = 2
     # 同一篇草稿会向多个公众号发起独立 HTTP 请求；限制为两个并行账号，既缩短
     # 五账号场景的尾部时间，也避免中转站或微信接口因突发并发产生限流。
     scheduled_draft_delivery_max_workers: int = 2
-    # 旧万相适配器仅用于兼容历史部署；新部署默认以方舟 Seedream 作为最终兜底。
+    # 默认最终兜底为火山方舟 Seedream 4.5；万相不再进入正式图片链路。
     image_generation_fallback_provider: str = "volcengine_ark"
     image_generation_max_response_bytes: int = 20 * 1024 * 1024
 

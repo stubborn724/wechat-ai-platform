@@ -528,6 +528,17 @@ def derive_invocation_state(
             error_code=delivery_attempt.error_code or "DELIVERY_FAILED",
             error_message=delivery_attempt.error_message or "文章投递失败",
         )
+    if delivery_attempt and delivery_attempt.status == "unknown":
+        result = _article_result(article, delivery_mode) if article else None
+        return _state(
+            "UNKNOWN",
+            delivery_attempt.error_code or "PUBLISH_STATUS_UNKNOWN",
+            90,
+            result=result,
+            error_code=delivery_attempt.error_code or "PUBLISH_STATUS_UNKNOWN",
+            error_message=delivery_attempt.error_message or "发布已受理，正在等待平台最终状态",
+            retryable=True,
+        )
     if article:
         result = _article_result(article, delivery_mode)
         if article.status == "failed":
@@ -536,6 +547,16 @@ def derive_invocation_state(
             failure_code = _article_failure_code(article, delivery_mode)
             return _state("FAILED", failure_code, 100, result=result, error_code=failure_code,
                           error_message=article.error_message or "文章投递失败")
+        if delivery_mode == "PUBLISH" and article.status == "unknown":
+            return _state(
+                "UNKNOWN",
+                article.phase or "PUBLISH_STATUS_UNKNOWN",
+                90,
+                result=result,
+                error_code=article.phase or "PUBLISH_STATUS_UNKNOWN",
+                error_message=article.error_message or "发布已受理，正在等待平台最终状态",
+                retryable=True,
+            )
         if delivery_mode == "DRAFT" and article.status == "draft_saved":
             if delivery_attempt and delivery_attempt.status == "success":
                 return _state("DRAFT_SAVED", "DRAFT_SAVED", 100, result=result)
@@ -703,8 +724,8 @@ def _converge_expired_relay_publish(
     ):
         return False
 
-    # 投递事实已被统一状态服务写成失败；Invocation 也必须同步保存诊断投影，避免
-    # 后续查询仅靠瞬时计算而丢失 finishedAt、错误码或人工核验说明。
+    # 投递事实已被统一状态服务写成 UNKNOWN；Invocation 同步保存诊断投影，避免
+    # 后续查询仅靠瞬时计算而丢失可恢复状态。UNKNOWN 不是终态，不能填写 finishedAt。
     latest_attempt = attempts[0] if attempts else None
     state = derive_invocation_state(
         context[0],
@@ -719,9 +740,9 @@ def _converge_expired_relay_publish(
     invocation.error_code = state.get("error_code")
     invocation.error_message = state.get("error_message")
     invocation.retryable = state.get("retryable", False)
-    invocation.finished_at = now
+    invocation.finished_at = None if state["status"] == "UNKNOWN" else now
     logger.warning(
-        "TaGeAI relay publish timed out during query: invocation=%s article=%s",
+        "TaGeAI relay publish final status is unavailable during query: invocation=%s article=%s",
         invocation.invocation_id,
         article.id,
     )

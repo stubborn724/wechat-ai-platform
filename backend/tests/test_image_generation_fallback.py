@@ -141,8 +141,9 @@ async def test_temporary_primary_failure_uses_wanxiang():
 
 @pytest.mark.asyncio
 async def test_authentication_failure_does_not_call_wanxiang():
-    """密钥无效时必须直接失败，防止错误配置被备用模型长期掩盖。"""
+    """开启全量降级时，鉴权失败也必须继续尝试下一层。"""
     from app.services.image_generation_models import (
+        GeneratedImage,
         ImageErrorCategory,
         ImageGenerationRequest,
         ImageProviderError,
@@ -155,17 +156,55 @@ async def test_authentication_failure_does_not_call_wanxiang():
         provider="openai_compatible",
     )
     primary = FakeProvider("openai_compatible", error=auth_error)
-    fallback = FakeProvider("wanxiang")
+    fallback = FakeProvider(
+        "wanxiang",
+        result=GeneratedImage("https://cdn.example.com/fallback.png", "wanxiang", "wanx"),
+    )
     service = ImageGenerationService(
-        settings=build_settings(),
+        settings=SimpleNamespace(
+            **vars(build_settings()),
+            image_generation_fallback_on_any_error=True,
+        ),
         providers={primary.name: primary, fallback.name: fallback},
     )
 
-    with pytest.raises(ImageProviderError) as error_info:
-        await service.generate(ImageGenerationRequest(prompt="家具海报"))
+    result = await service.generate(ImageGenerationRequest(prompt="家具海报"))
 
-    assert error_info.value is auth_error
-    assert len(fallback.calls) == 0
+    assert result.provider == "wanxiang"
+    assert result.fallback_used is True
+    assert fallback.calls
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_exception_also_reaches_next_layer():
+    """提供商抛出未分类异常时，也不能阻断后续图片模型。"""
+    from app.services.image_generation_models import GeneratedImage, ImageGenerationRequest
+    from app.services.image_generation_service import ImageGenerationService
+
+    class UnexpectedFailureProvider(FakeProvider):
+        async def generate(self, request):
+            self.calls.append(request)
+            raise RuntimeError("连接池临时异常")
+
+    primary = UnexpectedFailureProvider("openai_compatible")
+    fallback = FakeProvider(
+        "wanxiang",
+        result=GeneratedImage("https://cdn.example.com/fallback.png", "wanxiang", "wanx"),
+    )
+    service = ImageGenerationService(
+        settings=SimpleNamespace(
+            **vars(build_settings()),
+            image_generation_fallback_on_any_error=True,
+        ),
+        providers={primary.name: primary, fallback.name: fallback},
+    )
+
+    result = await service.generate(ImageGenerationRequest(prompt="家具海报"))
+
+    assert result.provider == "wanxiang"
+    assert result.fallback_used is True
+    assert primary.calls
+    assert fallback.calls
 
 
 @pytest.mark.asyncio
@@ -389,3 +428,54 @@ async def test_ark_is_final_fallback_after_both_relays_fail():
     assert legacy_relay.calls == [request]
     assert ark.calls == [request]
     assert wanxiang.calls == []
+
+
+def test_default_provider_factory_keeps_two_openai_layers_jiuye_and_ark_fallback():
+    """默认图片链路必须含两层 OpenAI、九野异步层与方舟最终兜底。
+
+    两层 Kuai 使用不同 Provider 名称，确保模型级熔断互不影响；旧的第三个
+    Kuai Provider 不应继续被装配，避免配置表面上与实际生产链路不一致。
+    """
+    from app.services.image_generation_service import _build_default_providers
+
+    settings = SimpleNamespace(
+        image_generation_base_url="https://api.kuai.host/v1",
+        image_generation_api_key="test-key",
+        image_generation_model="doubao-seedream-4-5-251128",
+        image_generation_edit_model="doubao-seedream-4-5-251128",
+        image_generation_secondary_base_url="https://api.kuai.host/v1",
+        image_generation_secondary_api_key="test-key",
+        image_generation_secondary_model="doubao-seedream-4-0-250828",
+        image_generation_secondary_edit_model="doubao-seedream-4-0-250828",
+        image_generation_tertiary_base_url="https://api.kuai.host/v1",
+        image_generation_tertiary_api_key="test-key",
+        image_generation_tertiary_model="doubao-seedream-4-0-250828",
+        image_generation_tertiary_edit_model="doubao-seedream-4-0-250828",
+        image_generation_jiuye_base_url="https://api.jiuyeyingxiang.com",
+        image_generation_jiuye_api_key="jiuye-test-key",
+        image_generation_jiuye_model="gpt-image-2",
+        image_generation_jiuye_timeout_seconds=240,
+        image_generation_jiuye_poll_interval_seconds=3,
+        image_generation_timeout_seconds=1800,
+        image_generation_primary_timeout_seconds=120,
+        image_generation_secondary_timeout_seconds=150,
+        image_generation_tertiary_timeout_seconds=180,
+        image_generation_ark_base_url="https://ark.example.test/api/v3",
+        image_generation_ark_api_key="ark-test-key",
+        image_generation_ark_model="doubao-seedream-4-5-251128",
+        image_generation_ark_timeout_seconds=180,
+        image_generation_max_response_bytes=20 * 1024 * 1024,
+    )
+
+    providers = _build_default_providers(settings)
+
+    assert set(providers) == {
+        "kuai_openai_compatible",
+        "kuai_seedream_40",
+        "jiuye_image_2",
+        "volcengine_ark",
+    }
+    assert providers["kuai_openai_compatible"].edit_model == "doubao-seedream-4-5-251128"
+    assert providers["kuai_seedream_40"].edit_model == "doubao-seedream-4-0-250828"
+    assert providers["jiuye_image_2"].model == "gpt-image-2"
+    assert providers["volcengine_ark"].model == "doubao-seedream-4-5-251128"

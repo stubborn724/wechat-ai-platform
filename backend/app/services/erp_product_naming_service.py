@@ -43,6 +43,21 @@ class NormalizedProductVisionImage:
     content_type: str
 
 
+@dataclass(frozen=True)
+class ProductVisionProvider:
+    """ERP 商品品类识别的单个视觉提供商配置。
+
+    将调用地址、密钥和模型标识作为不可变对象传递，避免主备切换时混用 Kuai
+    公共模型名与方舟 Endpoint ID。方舟 OpenAI 兼容接口只能接收接入点 ID，
+    因此该边界能把容易误配的差异限制在配置解析层。
+    """
+
+    name: str
+    base_url: str
+    api_key: str
+    model: str
+
+
 async def enrich_erp_product_display_name(
     *,
     product_name: str,
@@ -89,9 +104,9 @@ async def _analyze_product_category_with_visual_agent(image_url: str) -> str:
     """调用视觉 Agent，为产品主图生成严格受限的中文品类候选。
 
     通用视觉理解 Agent 的 ``subject`` 通常包含场景和材质长句，不适合作为产品名。
-    此处使用项目现有 Kuai 网关中的 ``qwen3-vl-8b-instruct``：它比通用大模型更适合
-    单对象分类，且不会受 DashScope 免费额度影响。每篇任务只针对唯一 ERP 主图调用
-    一次；图片先压缩为数据 URI，避免视觉接口拒绝 ERP 高清原图。
+    此处优先使用项目现有 Kuai 网关中的 ``qwen3-vl-8b-instruct``。当中转站临时
+    不可用时，再尝试方舟视觉 Endpoint。每篇任务只下载并压缩一次 ERP 主图，主备
+    调用共享同一份 data URI，避免重复访问 ERP 造成额外网络失败。
     """
     prompt = (
         "你是家具产品图片分析员。请只根据图片中最主要的家具，输出一个准确、保守的中文品类名称。\n"
@@ -103,10 +118,66 @@ async def _analyze_product_category_with_visual_agent(image_url: str) -> str:
         f"data:{normalized_image.content_type};base64,"
         f"{base64.b64encode(normalized_image.data).decode('ascii')}"
     )
+    last_error: Exception | None = None
+    for provider in _build_product_vision_provider_chain():
+        try:
+            return await _invoke_product_vision_provider(
+                provider=provider,
+                prompt=prompt,
+                image_data_uri=image_data_uri,
+            )
+        except Exception as exc:
+            last_error = exc
+            # 这里不记录 URL 和密钥，既能保留供应商故障线索，也避免把 ERP 素材地址
+            # 或敏感配置泄露到任务日志。所有备用都失败时由上层回退确定性分类。
+            logger.warning(
+                "ERP 产品视觉识别 provider=%s 调用失败，继续尝试下一层: %s",
+                provider.name,
+                exc,
+            )
+    raise RuntimeError("ERP 产品视觉识别所有提供商均不可用") from last_error
+
+
+def _build_product_vision_provider_chain() -> tuple[ProductVisionProvider, ...]:
+    """构造稳定的 Kuai 主用、方舟备用视觉识别链路。
+
+    未完整配置方舟地址、密钥或 Endpoint ID 时不创建半成品备用层。这样新环境仍能
+    保持原来的 Kuai 行为，而不会因空配置浪费一次失败调用或覆盖主服务结果。
+    """
+    providers = [
+        ProductVisionProvider(
+            name="kuai",
+            base_url=settings.text_generation_base_url,
+            api_key=settings.text_generation_api_key,
+            model=settings.erp_product_vision_model,
+        )
+    ]
+    ark_base_url = settings.erp_product_vision_ark_base_url.strip()
+    ark_api_key = settings.erp_product_vision_ark_api_key.strip()
+    ark_model = settings.erp_product_vision_ark_model.strip()
+    if ark_base_url and ark_api_key and ark_model:
+        providers.append(
+            ProductVisionProvider(
+                name="volcengine_ark",
+                base_url=ark_base_url,
+                api_key=ark_api_key,
+                model=ark_model,
+            )
+        )
+    return tuple(providers)
+
+
+async def _invoke_product_vision_provider(
+    *,
+    provider: ProductVisionProvider,
+    prompt: str,
+    image_data_uri: str,
+) -> str:
+    """以统一 OpenAI 兼容协议调用一个视觉提供商并提取文本结果。"""
     llm = ChatOpenAI(
-        api_key=settings.text_generation_api_key,
-        base_url=settings.text_generation_base_url,
-        model=settings.erp_product_vision_model,
+        api_key=provider.api_key,
+        base_url=provider.base_url,
+        model=provider.model,
         temperature=0,
         max_tokens=96,
         timeout=settings.erp_product_vision_timeout_seconds,

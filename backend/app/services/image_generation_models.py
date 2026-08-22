@@ -34,6 +34,69 @@ _FALLBACK_ELIGIBLE_CATEGORIES = frozenset({
     ImageErrorCategory.TRUNCATED_RESPONSE,
 })
 
+_TEMPORARY_HTTP_STATUS_CODES = frozenset({408, 409, 425})
+_AUTHENTICATION_ERROR_MARKERS = (
+    "invalid key",
+    "invalid api key",
+    "invalid api_key",
+    "invalid token",
+    "api key not found",
+    "api_key not found",
+    "unauthorized",
+    "authentication failed",
+    "permission denied",
+    "insufficient permission",
+    "access denied",
+)
+_RATE_LIMIT_ERROR_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "quota exceeded",
+    "concurrency limit",
+)
+_TEMPORARY_ERROR_MARKERS = (
+    "temporarily unavailable",
+    "temporary unavailable",
+    "service unavailable",
+    "service busy",
+    "server busy",
+    "overloaded",
+    "try again",
+    "upstream unavailable",
+    "gateway timeout",
+)
+
+
+def classify_http_error_category(status_code: int, message: str) -> ImageErrorCategory:
+    """将图片 Provider 的 HTTP 错误归类为鉴权、限流或可用性故障。
+
+    设计原因：部分中转站会用 403 表示临时风控、容量不足或服务不可用，不能
+    仅凭状态码阻断备用链路；但明确的密钥和权限错误必须保留为不可降级错误，
+    否则会掩盖配置问题并让每张图片重复消耗备用模型额度。对未识别的 403
+    采取保守的鉴权分类，只有明确带有临时故障语义时才允许降级。
+    """
+    normalized_status = int(status_code)
+    normalized_message = " ".join(str(message or "").lower().split())
+
+    if normalized_status == 401:
+        return ImageErrorCategory.AUTHENTICATION
+    if normalized_status == 403:
+        if any(marker in normalized_message for marker in _AUTHENTICATION_ERROR_MARKERS):
+            return ImageErrorCategory.AUTHENTICATION
+        if any(marker in normalized_message for marker in _RATE_LIMIT_ERROR_MARKERS):
+            return ImageErrorCategory.RATE_LIMIT
+        if any(marker in normalized_message for marker in _TEMPORARY_ERROR_MARKERS):
+            return ImageErrorCategory.TEMPORARY
+        return ImageErrorCategory.AUTHENTICATION
+    if normalized_status == 429:
+        return ImageErrorCategory.RATE_LIMIT
+    if normalized_status in _TEMPORARY_HTTP_STATUS_CODES:
+        return ImageErrorCategory.TEMPORARY
+    if normalized_status >= 500:
+        return ImageErrorCategory.UPSTREAM
+    return ImageErrorCategory.INVALID_REQUEST
+
 
 class ImageProviderError(RuntimeError):
     """携带提供商和错误类别的可诊断异常。

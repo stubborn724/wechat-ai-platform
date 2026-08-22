@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 from pydantic import ValidationError
+from types import SimpleNamespace
 
 from app.api.v1.articles import (
     CreateArticleRequest,
@@ -39,6 +40,46 @@ def test_create_article_request_keeps_selected_cover_separate_from_body_images()
 
     assert request.selected_cover_image_url == "https://assets.example.com/cover.jpg"
     assert request.selected_image_urls is None
+
+
+def test_generated_body_image_can_be_used_as_cover_when_ai_cover_is_missing():
+    """独立 AI 封面失败时，已生成的正文图片必须成为真实的封面候选。
+
+    文章发布协议要求封面存在。生成阶段不能只记录一条“将使用正文配图”的日志，
+    却把空值继续带到发布阶段；这个测试固定封面回退策略，避免正文成功、发布才
+    发现封面为空的长链路失败。
+    """
+    from app.api.v1.articles import select_fallback_cover_image_url
+
+    images = [
+        SimpleNamespace(url="https://assets.example.com/body-1.png"),
+        SimpleNamespace(url="https://assets.example.com/body-2.png"),
+    ]
+
+    assert select_fallback_cover_image_url("", images) == images[0].url
+    assert select_fallback_cover_image_url(
+        "https://assets.example.com/explicit-cover.png", images
+    ) == "https://assets.example.com/explicit-cover.png"
+
+
+def test_generated_body_image_does_not_create_a_fake_cover_when_none_exists():
+    """没有任何真实图片时不得伪造封面地址，调用方应继续走明确失败分支。"""
+    from app.api.v1.articles import select_fallback_cover_image_url
+
+    assert select_fallback_cover_image_url("", []) is None
+    assert select_fallback_cover_image_url("", [SimpleNamespace(url="")]) is None
+
+
+def test_article_cover_requirement_explains_why_generation_cannot_be_published():
+    """正式文章没有封面时应暴露可行动错误，而不是继续伪装成生成成功。"""
+    from app.api.v1.articles import require_article_cover_image_url
+
+    with pytest.raises(ValueError, match="封面图生成失败"):
+        require_article_cover_image_url("")
+
+    assert require_article_cover_image_url("https://assets.example.com/cover.png") == (
+        "https://assets.example.com/cover.png"
+    )
 
 
 def test_create_article_request_rejects_removed_manual_mode():

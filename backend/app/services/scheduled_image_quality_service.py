@@ -47,6 +47,9 @@ class ImageQualityReport:
 
     is_usable: bool
     reason: str
+    # 低信息量、格式损坏等内容质量问题不应无限重试；只有对象下载、网络和上游
+    # 存储暂时不可达时设为 True，由调用方把整篇定时任务交给有限退避重试。
+    retryable: bool = False
 
 
 def assess_image_bytes(image_bytes: bytes) -> ImageQualityReport:
@@ -156,7 +159,11 @@ async def inspect_generated_image_url(image_url: str) -> ImageQualityReport:
                 content = response.content
     except Exception as exc:
         logger.warning("图片质量检查下载失败 url=%s error=%s", normalized_url[:180], exc)
-        return ImageQualityReport(False, "质量检查失败：无法下载生成图片")
+        return ImageQualityReport(
+            False,
+            "质量检查失败：无法下载生成图片",
+            retryable=True,
+        )
 
     # 文章图片通常远小于此限制。提前拒绝异常大响应可以防止质量检查被错误的
     # 上游响应拖垮 Worker；真正的归档服务仍会按自己的响应大小策略再次保护。

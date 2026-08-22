@@ -63,6 +63,7 @@ def test_stale_generating_job_without_heartbeat_converges_to_retryable_failure(m
     """旧 Worker 遗留的生成任务必须落成明确失败，而不是无限停在 GENERATING。"""
 
     from app.integrations.tageai import service as tageai_service
+    from app.config import settings
     from app.models.mysql_models import ContentJob, TageAiIntegrationInvocation
 
     stale_time = datetime.now(timezone.utc) - timedelta(minutes=20)
@@ -99,6 +100,8 @@ def test_stale_generating_job_without_heartbeat_converges_to_retryable_failure(m
         ContentJob: [job],
     }, callback_exists=True)
     monkeypatch.setattr(tageai_service, "MysqlSessionLocal", lambda: db)
+    # 用例验证的是超时收敛，不应依赖开发机的默认超时配置。
+    monkeypatch.setattr(settings, "tageai_generation_heartbeat_timeout_seconds", 60)
 
     state = tageai_service.get_invocation("invocation-stale-generation", 7)
 
@@ -266,8 +269,8 @@ def test_failed_draft_attempt_overrides_stale_draft_saved_article_status():
     assert state["error_code"] == "DRAFT_DELIVERY_FAILED"
 
 
-def test_failed_relay_article_without_attempt_keeps_timeout_diagnostic():
-    """投递记录缺失时也必须保留 relay 超时失败的真实诊断码。
+def test_unknown_relay_article_without_attempt_keeps_status_unavailable_diagnostic():
+    """投递记录缺失时也必须保留 relay 状态未知诊断，而不是误报发布失败。
 
     PublishAttempt 通常优先，但历史数据、人工清理或部分事务失败可能只留下文章记录；
     此时不能把 relay 状态查询超时错误映射成草稿保存失败。
@@ -276,8 +279,8 @@ def test_failed_relay_article_without_attempt_keeps_timeout_diagnostic():
     job = SimpleNamespace(status="approved", error_code=None, error_message=None)
     article = SimpleNamespace(
         id=42,
-        status="failed",
-        phase="PUBLISH_STATUS_UNAVAILABLE",
+        status="unknown",
+        phase="PUBLISH_STATUS_UNKNOWN",
         main_title="超时文章",
         publish_id="relay-publish-001",
         msg_data_id=None,
@@ -286,9 +289,9 @@ def test_failed_relay_article_without_attempt_keeps_timeout_diagnostic():
 
     state = derive_invocation_state(job, article, "PUBLISH")
 
-    assert state["status"] == "FAILED"
-    assert state["phase"] == "PUBLISH_STATUS_UNAVAILABLE"
-    assert state["error_code"] == "PUBLISH_STATUS_UNAVAILABLE"
+    assert state["status"] == "UNKNOWN"
+    assert state["phase"] == "PUBLISH_STATUS_UNKNOWN"
+    assert state["error_code"] == "PUBLISH_STATUS_UNKNOWN"
 
 
 class _InvocationStateQuery:
@@ -455,8 +458,8 @@ def _relay_publishing_query_context(submission_time, *, callback_exists=False):
     return db, invocation, article, attempt
 
 
-def test_query_stale_relay_publish_converges_to_persistent_failure(monkeypatch):
-    """超过状态查询时限的 relay 发布必须由 Integration 查询持久化为失败。
+def test_query_stale_relay_publish_converges_to_persistent_unknown(monkeypatch):
+    """超过状态查询时限的 relay 发布必须持久化为可恢复的未知状态。
 
     Celery 轮询用于主动补偿，但外部调用方不能因 Beat 延迟而无限读取 PUBLISHING；
     因此 GET 查询发现 relay 没有最终状态协议且已超时后，必须同时收敛文章、投递
@@ -473,14 +476,14 @@ def test_query_stale_relay_publish_converges_to_persistent_failure(monkeypatch):
 
     state = tageai_service.get_invocation("invocation-relay-timeout", 7)
 
-    assert state["status"] == "FAILED"
-    assert state["phase"] == "PUBLISH_STATUS_UNAVAILABLE"
-    assert state["error_code"] == "PUBLISH_STATUS_UNAVAILABLE"
-    assert state["finished_at"] is not None
-    assert article.status == "failed"
-    assert attempt.status == "failed"
-    assert invocation.status == "FAILED"
-    assert invocation.finished_at is not None
+    assert state["status"] == "UNKNOWN"
+    assert state["phase"] == "PUBLISH_STATUS_UNKNOWN"
+    assert state["error_code"] == "PUBLISH_STATUS_UNKNOWN"
+    assert state["finished_at"] is None
+    assert article.status == "unknown"
+    assert attempt.status == "unknown"
+    assert invocation.status == "UNKNOWN"
+    assert invocation.finished_at is None
     assert db.commit_count == 1
 
 

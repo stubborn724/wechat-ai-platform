@@ -1,0 +1,154 @@
+name: wechat-ai-platform
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: wechat-platform-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: wechat-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: wechat-platform-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:6381:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: wechat-platform-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9002:9000"
+      - "127.0.0.1:9003:9001"
+    volumes:
+      - minio-data:/data
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: wechat-platform-backend
+    restart: unless-stopped
+    env_file: ../.env
+    environment: &application-environment
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8002"
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    command: sh -c "python init_db.py && python -m app.main"
+    ports:
+      - "127.0.0.1:8002:8002"
+    depends_on:
+      mysql: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+
+  celery-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: wechat-platform-celery-worker
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *application-environment
+    command: celery -A app.celery_app worker --loglevel=info --pool=solo --queues=celery --hostname=default@%h
+    depends_on:
+      backend: { condition: service_started }
+
+  celery-scheduled-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: wechat-platform-celery-scheduled-worker
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *application-environment
+    command: celery -A app.celery_app worker --loglevel=info --pool=threads --concurrency=2 --queues=scheduled --hostname=scheduled@%h
+    depends_on:
+      backend: { condition: service_started }
+
+  celery-beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: wechat-platform-celery-beat
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *application-environment
+    command: celery -A app.celery_app beat --loglevel=info --schedule=/var/lib/celery/celerybeat-schedule
+    volumes:
+      - celery-beat-data:/var/lib/celery
+    depends_on:
+      backend: { condition: service_started }
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.runtime
+    container_name: wechat-platform-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      backend: { condition: service_started }
+
+volumes:
+  mysql-data:
+  postgres-data:
+  redis-data:
+  minio-data:
+  celery-beat-data:

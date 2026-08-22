@@ -1,8 +1,8 @@
 """图片生成主备路由与兼容入口。
 
-所有业务流程只依赖本服务。主提供商失败时，只有经过领域层标记为临时性或
-上游可用性故障的异常才允许调用备用提供商；鉴权、参数、配置和本地存储错误
-直接暴露，避免系统长期运行在意外降级状态。
+所有业务流程只依赖本服务。提供商失败后的处理由配置开关统一控制：生产环境当前
+采用逐层尝试策略，让中转站鉴权、额度、参数和临时故障都能继续进入下一层；所有
+提供商都失败后才统一抛出汇总异常，避免业务入口各自实现不一致的降级逻辑。
 """
 
 from __future__ import annotations
@@ -93,18 +93,23 @@ class ImageGenerationService:
         )
 
     async def generate(self, request: ImageGenerationRequest) -> GeneratedImage:
-        """逐级调用提供商；不可降级错误立即停止，避免掩盖错误配置。"""
+        """逐级调用提供商，当前层出现任意可处理故障就继续下一层。
+
+        设计上把提供商配置解析放进同一个异常边界，避免某一层漏配时直接跳出
+        整条链；对适配器未归类的普通异常也转换为不含敏感正文的上游错误，保证
+        中转站 SDK 或网络库的异常不会阻断后续模型。是否放宽领域错误由显式开关
+        决定，默认值仍保留旧行为以兼容未更新环境。
+        """
         errors: list[ImageProviderError] = []
+        fallback_on_any_error = bool(
+            getattr(self.settings, "image_generation_fallback_on_any_error", False)
+        )
         operation = (
             "edit"
             if request.reference_image_bytes or request.reference_image_url
             else "generation"
         )
         for provider_index, provider_name in enumerate(self.provider_names):
-            provider = self._require_provider(
-                provider_name,
-                role="主" if provider_index == 0 else f"第 {provider_index + 1} 层",
-            )
             if not self.health_service.allow_request(provider_name, operation):
                 skipped_error = ImageProviderError(
                     "图片提供商处于故障冷却期，已跳过本次请求",
@@ -119,27 +124,11 @@ class ImageGenerationService:
                 )
                 continue
             try:
-                result = await provider.generate(request)
-                self.health_service.record_success(provider_name, operation)
-                from app.services.model_usage_service import record_image_generation_usage
-
-                record_image_generation_usage(
-                    result.provider,
-                    result.model,
-                    request.size,
-                    has_reference_image=bool(
-                        request.reference_image_bytes or request.reference_image_url
-                    ),
+                provider = self._require_provider(
+                    provider_name,
+                    role="主" if provider_index == 0 else f"第 {provider_index + 1} 层",
                 )
-                if provider_index > 0:
-                    logger.warning(
-                        "图片降级成功 provider=%s model=%s level=%d",
-                        result.provider,
-                        result.model,
-                        provider_index + 1,
-                    )
-                    return result.mark_fallback_used()
-                return result
+                result = await provider.generate(request)
             except ImageProviderError as provider_error:
                 errors.append(provider_error)
                 self.health_service.record_failure(
@@ -147,7 +136,7 @@ class ImageGenerationService:
                     operation,
                     provider_error.category,
                 )
-                if not provider_error.can_fallback:
+                if not fallback_on_any_error and not provider_error.can_fallback:
                     logger.error(
                         "图片提供商失败且禁止降级 provider=%s category=%s",
                         provider_error.provider,
@@ -160,6 +149,57 @@ class ImageGenerationService:
                     provider_error.category.value,
                     provider_index + 1,
                 )
+            except Exception as unexpected_error:
+                # 适配器通常会把外部异常归类为 ImageProviderError，但保留这一层
+                # 防线可以覆盖 SDK、连接池和序列化库的新异常，且不把异常正文写入
+                # 日志或最终错误，避免意外泄露 URL、请求头或密钥片段。
+                provider_error = ImageProviderError(
+                    f"图片提供商调用异常：{type(unexpected_error).__name__}",
+                    category=ImageErrorCategory.UPSTREAM,
+                    provider=provider_name or "unknown",
+                )
+                errors.append(provider_error)
+                self.health_service.record_failure(
+                    provider_name,
+                    operation,
+                    provider_error.category,
+                )
+                logger.error(
+                    "图片提供商抛出未分类异常，准备下一层 provider=%s exception_type=%s level=%d",
+                    provider_name,
+                    type(unexpected_error).__name__,
+                    provider_index + 1,
+                )
+            else:
+                self.health_service.record_success(provider_name, operation)
+                from app.services.model_usage_service import record_image_generation_usage
+
+                try:
+                    record_image_generation_usage(
+                        result.provider,
+                        result.model,
+                        request.size,
+                        has_reference_image=bool(
+                            request.reference_image_bytes or request.reference_image_url
+                        ),
+                    )
+                except Exception as usage_error:
+                    # 图片已经由 Provider 成功生成；用量记录失败不能再次调用下一层，
+                    # 否则会把本地数据库故障放大成重复图片请求和额外计费。
+                    logger.warning(
+                        "图片生成成功但用量记录失败 provider=%s exception_type=%s",
+                        result.provider,
+                        type(usage_error).__name__,
+                    )
+                if provider_index > 0:
+                    logger.warning(
+                        "图片降级成功 provider=%s model=%s level=%d",
+                        result.provider,
+                        result.model,
+                        provider_index + 1,
+                    )
+                    return result.mark_fallback_used()
+                return result
         if errors:
             raise ImageGenerationFallbackError(*errors) from errors[-1]
         raise ImageProviderError(
@@ -207,8 +247,6 @@ class ImageGenerationService:
 def _build_default_providers(settings) -> dict[str, ImageGenerationProvider]:
     """集中组装生产提供商，避免业务模块自行实例化供应商客户端。"""
     from app.services.openai_compatible_image_provider import OpenAICompatibleImageProvider
-    from app.services.volcengine_ark_image_provider import VolcengineArkImageProvider
-    from app.services.wanxiang_image_provider import WanxiangImageProvider
 
     kuai_provider = OpenAICompatibleImageProvider(
         settings=settings,
@@ -219,9 +257,11 @@ def _build_default_providers(settings) -> dict[str, ImageGenerationProvider]:
             settings.image_generation_timeout_seconds,
         ),
     )
-    openai_provider = OpenAICompatibleImageProvider(
+    # 第二层继续走 Kuai 的 OpenAI 兼容图片协议，但使用独立 Provider 名称。
+    # 两层各自拥有熔断状态，主模型超时、限流或服务异常时不会阻塞第二个模型。
+    seedream_40_provider = OpenAICompatibleImageProvider(
         settings=settings,
-        name="openai_compatible",
+        name="kuai_seedream_40",
         base_url=getattr(settings, "image_generation_secondary_base_url", "") or (
             settings.image_generation_base_url
         ),
@@ -240,20 +280,20 @@ def _build_default_providers(settings) -> dict[str, ImageGenerationProvider]:
             settings.image_generation_timeout_seconds,
         ),
     )
-    wanxiang_provider = WanxiangImageProvider()
-    ark_provider = VolcengineArkImageProvider(
-        settings=settings,
-        timeout_seconds=getattr(
-            settings,
-            "image_generation_ark_timeout_seconds",
-            settings.image_generation_timeout_seconds,
-        ),
-    )
+    # 九野作为第三层异步 image-2 提供商，独立维护提交和轮询协议。
+    from app.services.jiuye_image_provider import JiuyeImageProvider
+
+    jiuye_provider = JiuyeImageProvider(settings=settings)
+    # 火山方舟作为第四层独立图片提供商。它直接接收 ERP 图片字节，避免再次
+    # 依赖公网参考图 URL，且与前三层的熔断状态完全隔离。
+    from app.services.volcengine_ark_image_provider import VolcengineArkImageProvider
+
+    ark_provider = VolcengineArkImageProvider(settings=settings)
     return {
         kuai_provider.name: kuai_provider,
-        openai_provider.name: openai_provider,
+        seedream_40_provider.name: seedream_40_provider,
+        jiuye_provider.name: jiuye_provider,
         ark_provider.name: ark_provider,
-        wanxiang_provider.name: wanxiang_provider,
     }
 
 

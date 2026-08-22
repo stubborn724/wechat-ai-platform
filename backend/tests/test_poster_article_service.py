@@ -116,6 +116,39 @@ async def test_poster_plan_keeps_product_and_style_body_separated_by_bar():
 
 
 @pytest.mark.asyncio
+async def test_xiuman_poster_title_rejects_oriental_style_terms():
+    """绣蔓海报路径也必须阻止东方奢雅标题进入公众号草稿。"""
+    from app.services.poster_article_service import generate_poster_plan
+    from app.services.publication_format_service import analyze_publication_format
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+
+    async def fake_complete(_request):
+        return json.dumps({
+            "article_title": "茶几|东方神韵与当代奢雅，在客厅光影里修养日常",
+            "posters": [{"copy": "材质与光线让客厅更适合自在停留。", "scene": "客厅"}],
+        }, ensure_ascii=False)
+
+    plan = await generate_poster_plan(
+        profile=profile,
+        product_name="现代茶几",
+        product_scene_profile=resolve_product_scene_profile("现代茶几"),
+        brand_key="xiuman",
+        complete_text=fake_complete,
+    )
+
+    assert plan.article_title.startswith("现代茶几|")
+    assert "东方" not in plan.article_title
+    assert "奢雅" not in plan.article_title
+    assert "现代" in plan.article_title
+    assert "东方" not in plan.posters[0].copy
+
+
+@pytest.mark.asyncio
 async def test_poster_plan_repairs_invalid_json_once_without_regenerating_copy():
     """海报文案偶发非 JSON 时应做一次结构修复，避免整条任务无效失败。"""
     from app.services.poster_article_service import generate_poster_plan
@@ -281,6 +314,7 @@ async def test_poster_images_forward_reference_bytes_and_exact_embedded_copy():
         plan=plan,
         product_name="维多利亚餐桌",
         tenant_id=107,
+        reference_image_url="https://xiumancloud.oss-cn-beijing.aliyuncs.com/reference/erp-image.jpg",
         reference_image_bytes=b"erp-image",
         reference_content_type="image/jpeg",
         generate_image=fake_generate,
@@ -288,6 +322,11 @@ async def test_poster_images_forward_reference_bytes_and_exact_embedded_copy():
 
     assert urls == ["https://cdn.example.com/1.png", "https://cdn.example.com/2.png"]
     assert all(request.reference_image_bytes == b"erp-image" for request in received)
+    assert all(
+        request.reference_image_url
+        == "https://xiumancloud.oss-cn-beijing.aliyuncs.com/reference/erp-image.jpg"
+        for request in received
+    )
     assert "东意西形" in received[0].prompt
     assert "让空间回到从容" in received[1].prompt
     assert all("禁止内嵌二维码" in request.prompt for request in received)
@@ -371,6 +410,8 @@ async def test_poster_images_keep_real_product_visible_and_match_product_room():
     assert "餐厅" in prompt
     assert "沙发" in prompt
     assert "产品-场景一致性硬约束" in prompt
+    assert "【同篇产品身份证硬约束】" in prompt
+    assert "同一产品，不是同系列不同款" in prompt
 
 
 @pytest.mark.asyncio
@@ -417,6 +458,72 @@ async def test_poster_images_retry_low_information_result_once():
     assert urls == ["https://cdn.example.com/poster.png"]
     assert len(prompts) == 2
     assert "低信息量结果修复" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_poster_images_promotes_retryable_quality_download_failure():
+    """海报质量检查的临时下载故障应升级为调度器可识别的可重试异常。"""
+    from app.services.poster_article_service import PosterPlan, PosterText, generate_poster_images
+    from app.services.publication_format_service import analyze_publication_format
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+    plan = PosterPlan(
+        article_title="一席成景",
+        posters=(PosterText(copy="一席成景", scene="标题空间"),),
+    )
+
+    async def fake_generate(_request):
+        return "https://cdn.example.com/poster.png"
+
+    async def fake_quality(_url):
+        return type(
+            "RetryableReport",
+            (),
+            {"is_usable": False, "reason": "质量检查下载失败", "retryable": True},
+        )()
+
+    with pytest.raises(RuntimeError) as error_info:
+        await generate_poster_images(
+            profile=profile,
+            plan=plan,
+            product_name="现代餐桌",
+            tenant_id=107,
+            reference_image_bytes=b"erp-image",
+            reference_content_type="image/jpeg",
+            generate_image=fake_generate,
+            quality_checker=fake_quality,
+        )
+
+    assert is_retryable_scheduled_error(error_info.value) is True
+
+
+@pytest.mark.asyncio
+async def test_poster_plan_marks_double_invalid_json_as_retryable():
+    """模型和结构修复模型都返回非法 JSON 时，应允许定时任务重试整篇。"""
+    from app.services.poster_article_service import generate_poster_plan
+    from app.services.publication_format_service import analyze_publication_format
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    profile = analyze_publication_format(
+        """【文章形式】纯海报拼接形式，无独立文字段落。
+【图片要求】竖版长海报比例，产品主体清晰。"""
+    )
+
+    async def fake_complete(_request):
+        return "这不是 JSON"
+
+    with pytest.raises(RuntimeError) as error_info:
+        await generate_poster_plan(
+            profile=profile,
+            product_name="现代餐桌",
+            complete_text=fake_complete,
+        )
+
+    assert is_retryable_scheduled_error(error_info.value) is True
 
 
 @pytest.mark.asyncio
@@ -493,10 +600,12 @@ async def test_programmatic_poster_images_generate_three_product_views_for_one_s
         "https://cdn.example.com/view-3.png",
     ]
     assert len(requests) == 3
-    assert "空间引入广角" in requests[0].prompt
+    assert "原视角空间广角" in requests[0].prompt
     assert "完整产品主视觉" in requests[1].prompt
-    assert "材质、结构、局部细节或侧后角度" in requests[2].prompt
+    assert "已见材质局部" in requests[2].prompt
+    assert all("仅可使用参考图已经可见" in request.prompt for request in requests)
     assert all("同一 ERP 产品、同一房间、同色温、同光向" in request.prompt for request in requests)
+    assert all("【同篇产品身份证硬约束】" in request.prompt for request in requests)
 
 
 @pytest.mark.asyncio

@@ -153,6 +153,26 @@ def test_generic_scene_profile_never_exposes_internal_label_as_public_title():
     assert title.startswith("家居美学|")
 
 
+def test_xiuman_title_rejects_oriental_fallback_and_uses_modern_home_language():
+    """绣蔓不是东方品牌，标题不能沿用其他品牌的东方奢雅话术。"""
+
+    from app.services.scheduled_product_scene_service import resolve_product_scene_profile
+    from app.services.scheduled_product_title_service import normalize_scheduled_product_title
+
+    profile = resolve_product_scene_profile("FSJJ-20241020116 茶几", tags=["茶几"])
+    title = normalize_scheduled_product_title(
+        "FSJJ-20241020116 茶几",
+        profile=profile,
+        candidate_title="茶几|东方神韵与当代奢雅，在客厅光影里修养日常",
+        brand_key="xiuman",
+    )
+
+    assert title.startswith("茶几|")
+    assert "东方" not in title
+    assert "奢雅" not in title
+    assert "现代" in title
+
+
 def test_bed_html_slot_text_removes_living_room_conflict():
     """床类 HTML 文案槽位不得保留客厅或沙发等冲突场景词。"""
 
@@ -246,6 +266,58 @@ def test_product_scene_guard_explicitly_blocks_wrong_room_furniture_for_sofa_and
     assert "餐桌专属约束" in table_prompt
     assert "床" in table_prompt
     assert "卧室" in table_prompt
+
+
+def test_erp_viewpoint_instruction_never_demands_unseen_back_or_side_structure():
+    """单张 ERP 参考图不能被要求补造背面、侧后或内部不可见结构。"""
+
+    from app.services.scheduled_product_scene_service import (
+        append_erp_image_viewpoint_instruction,
+    )
+
+    prompt = append_erp_image_viewpoint_instruction(
+        "主体：参考图中的茶几",
+        position=2,
+        total=5,
+    )
+
+    assert "反向三分之四" not in prompt
+    assert "背部结构" not in prompt
+    assert "侧后角度：" not in prompt
+    assert "仅可使用参考图已经可见" in prompt
+    assert "轻微斜视" not in prompt
+    assert "轻微俯视" not in prompt
+    assert "保持参考图原始朝向" in prompt
+    assert "景别、裁切范围和背景" in prompt
+
+
+def test_product_identity_guard_freezes_same_product_across_all_image_slots():
+    """同篇图生图必须锁定同一件 ERP 产品，不能退化成同系列的其他款。"""
+
+    from app.services.scheduled_product_scene_service import (
+        append_product_identity_guard,
+        resolve_product_scene_profile,
+    )
+
+    profile = resolve_product_scene_profile("云朵岩板茶几")
+    prompt = append_product_identity_guard(
+        "主体：参考图中的茶几，现代客厅",
+        profile,
+        product_name="云朵岩板茶几",
+    )
+    repeated = append_product_identity_guard(
+        prompt,
+        profile,
+        product_name="云朵岩板茶几",
+    )
+
+    assert "【同篇产品身份证硬约束】" in prompt
+    assert "唯一产品：云朵岩板茶几" in prompt
+    assert "产品类别：茶几/边几" in prompt
+    assert "同一产品，不是同系列不同款" in prompt
+    assert "不得改变主体比例" in prompt
+    assert "不得改材质或颜色" in prompt
+    assert repeated == prompt
 
 
 def test_html_slot_compiler_removes_conflicting_alt_text_for_erp_product():

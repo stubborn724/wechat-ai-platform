@@ -43,8 +43,10 @@ from app.services.scheduled_image_quality_service import (
     append_scene_quality_guard,
     inspect_generated_image_url,
 )
+from app.services.scheduled_retry_errors import RetryableImageQualityError
 from app.services.scheduled_product_scene_service import (
     append_erp_image_viewpoint_instruction,
+    append_product_identity_guard,
     append_product_scene_guard,
     product_scene_profile_from_payload,
     sanitize_product_scene_text,
@@ -310,6 +312,7 @@ async def agent1_generate_title_options(state: ArticleState) -> ArticleState:
             state.title_options = [TitleOption(main_title=fallback_title, sub_title="")]
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         state.error = f"Failed to parse title options: {exc}"
+        state.error_retryable = True
 
     return state
 
@@ -370,6 +373,7 @@ async def agent1_generate_imitation_title(
         state.title_options = valid_options
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         state.error = f"标题仿写失败：模型返回格式无效：{exc}"
+        state.error_retryable = True
         state.title_options = []
 
     return state
@@ -455,6 +459,7 @@ async def agent2_generate_outline(
         state.outline = OutlineResult(**data)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         state.error = f"Failed to parse outline: {exc}"
+        state.error_retryable = True
 
     return state
 
@@ -600,6 +605,7 @@ async def agent3_generate_html_imitation_content(state: ArticleState) -> Article
                 state.product_name or state.topic,
                 profile=scene_profile,
                 candidate_title=str(data.get("wechat_title") or ""),
+                brand_key=state.product_brand_key,
             )
         _apply_format_profile_titles(state, data)
         text_by_slot = _index_agent_slots(data.get("text_slots", []), "content")
@@ -637,6 +643,7 @@ async def agent3_generate_html_imitation_content(state: ArticleState) -> Article
         return state
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         state.error = f"HTML imitation content generation failed: {exc}"
+        state.error_retryable = True
         return state
 
 
@@ -723,6 +730,8 @@ def _build_html_imitation_prompt(
 
 图片背景知识库（仅用于 image_slots.prompt，必须将全部硬性视觉约束落实到每个图片槽位）：
 {image_background_context}
+
+{_build_content_constraints_section(state.content_constraints)}
 
 {title_output_contract}
 
@@ -1070,6 +1079,7 @@ async def _generate_structured_content(
 
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         state.error = f"Failed to parse structured content: {exc}"
+        state.error_retryable = True
         # Fallback: treat raw as content
         state.content = raw
 
@@ -1173,6 +1183,7 @@ async def agent4_analyze_image_requirements(state: ArticleState) -> ArticleState
         state.image_requirements = [ImageRequirement(**req) for req in requirements]
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         state.error = f"Failed to parse image requirements: {exc}"
+        state.error_retryable = True
 
     return state
 
@@ -1302,6 +1313,13 @@ async def agent5_generate_images(
                         scene_profile,
                         product_name=state.product_name or state.topic,
                     )
+            # 产品身份证不依赖模型视觉识别，且每个槽位都重复注入。这样即使槽位
+            # 各自生成，也会把同一张 ERP 原图约束为同一件产品，而不是同系列款式。
+            prompt = append_product_identity_guard(
+                prompt,
+                scene_profile,
+                product_name=state.product_name or state.topic,
+            )
 
             generated = None
             final_prompt = prompt
@@ -1359,7 +1377,12 @@ async def agent5_generate_images(
                 or not quality_report.is_usable
             ):
                 reason = quality_report.reason if quality_report else "未完成质量检查"
-                raise RuntimeError(
+                error_type = (
+                    RetryableImageQualityError
+                    if bool(getattr(quality_report, "retryable", False))
+                    else RuntimeError
+                )
+                raise error_type(
                     f"图生图失败：第 {req.position} 张图片连续两次质量检查未通过，{reason}"
                 )
 

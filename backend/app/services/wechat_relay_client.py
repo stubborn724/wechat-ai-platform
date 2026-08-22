@@ -14,10 +14,24 @@ import json
 import time
 import uuid
 from typing import Callable, Optional
+from urllib.parse import quote
 
 import requests
 
 from app.services.publish_domain_policy import map_relay_publish_mode
+from app.services.scheduled_retry_errors import RetryableScheduledTaskError
+
+
+class WechatRelayRetryableError(RetryableScheduledTaskError):
+    """中转站明确拒绝草稿且说明为临时故障时的可恢复异常。
+
+    该类型只用于 ``draft_only``：草稿尚未创建，不存在重复发布副作用。真实发布
+    即使收到临时 HTTP 或网络错误，也不能使用它，因为无法证明中转站没有受理。
+    """
+
+
+class WechatRelayPublishAmbiguousError(RuntimeError):
+    """真实发布请求的最终受理结果未知，必须人工核验而非自动重发。"""
 
 
 class WeChatRelayClient:
@@ -33,6 +47,7 @@ class WeChatRelayClient:
     """
 
     PUBLISH_PATH = "/api/wechat/articles/publish"
+    PUBLISH_STATUS_PATH = "/api/wechat/articles/publish/{publish_id}"
 
     def __init__(
         self,
@@ -118,8 +133,30 @@ class WeChatRelayClient:
             },
         }
         raw_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        result = self._post_json(self.PUBLISH_PATH, raw_body)
-        return self._normalize_publish_result(result)
+        is_draft_only = relay_publish_mode == "draft_only"
+        result = self._post_json(
+            self.PUBLISH_PATH,
+            raw_body,
+            retry_safe=is_draft_only,
+        )
+        return self._normalize_publish_result(result, retry_safe=is_draft_only)
+
+    def query_publish_status(self, publish_id: str) -> dict:
+        """读取已受理发布的微信最终状态，不产生任何新的发布副作用。
+
+        中转站负责保存发布时建立的受保护凭据引用，并在固定 IP 上调用微信
+        ``freepublish/get``。调用方只传中转站签发的 ``publish_id``，避免把公众号
+        AppSecret 再次带入查询请求，也保证重复查询不会变成重复发布。
+        """
+
+        normalized_publish_id = str(publish_id or "").strip()
+        if not normalized_publish_id:
+            raise ValueError("publish_id is required for relay publish-status query")
+        path = self.PUBLISH_STATUS_PATH.format(
+            publish_id=quote(normalized_publish_id, safe=""),
+        )
+        result = self._get_json(path)
+        return self._normalize_publish_status_result(result)
 
     def _map_publish_mode(
         self,
@@ -138,23 +175,56 @@ class WeChatRelayClient:
             confirm_publish,
         )
 
-    def _post_json(self, path_with_query: str, raw_body: bytes) -> dict:
+    def _post_json(self, path_with_query: str, raw_body: bytes, *, retry_safe: bool) -> dict:
         """发送已序列化 JSON。
 
         签名必须基于实际发送的 raw bytes，不能先签一个对象再让 HTTP 库重新
         序列化，否则字段空格或中文转义差异都会导致中转站验签失败。
         """
         headers = self._build_headers("POST", path_with_query, raw_body)
-        response = self.session.post(
+        try:
+            response = self.session.post(
+                f"{self.base_url}{path_with_query}",
+                data=raw_body,
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            # 草稿创建没有公众号发布副作用，网络失败可由调度器有限重试；真实
+            # 发布则可能已经被中转站或微信接受，不能因为响应丢失而再次提交。
+            if retry_safe:
+                raise WechatRelayRetryableError("微信中转站草稿请求暂时不可达") from exc
+            raise WechatRelayPublishAmbiguousError(
+                "微信中转站真实发布请求结果不明确，请先核验公众号后台"
+            ) from exc
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # 中转站 422 会包含字段路径。只记录响应摘要，绝不记录请求体中的密钥。
+            detail = self._read_error_detail(response)
+            message = f"WeChat relay HTTP {response.status_code}: {detail}"
+            if retry_safe and _is_retryable_relay_http_status(response.status_code):
+                raise WechatRelayRetryableError(message) from exc
+            if not retry_safe and int(response.status_code or 0) >= 500:
+                raise WechatRelayPublishAmbiguousError(
+                    "微信中转站真实发布请求返回服务端错误，请先核验公众号后台"
+                ) from exc
+            raise RuntimeError(message) from exc
+        return response.json()
+
+    def _get_json(self, path_with_query: str) -> dict:
+        """发送没有请求体的 HMAC GET，并沿用发布接口的错误诊断规范。"""
+
+        raw_body = b""
+        headers = self._build_headers("GET", path_with_query, raw_body)
+        response = self.session.get(
             f"{self.base_url}{path_with_query}",
-            data=raw_body,
             headers=headers,
             timeout=self.timeout,
         )
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
-            # 中转站 422 会包含字段路径。只记录响应摘要，绝不记录请求体中的密钥。
             raise RuntimeError(
                 f"WeChat relay HTTP {response.status_code}: "
                 f"{self._read_error_detail(response)}"
@@ -195,7 +265,7 @@ class WeChatRelayClient:
             "X-Relay-Signature": signature,
         }
 
-    def _normalize_publish_result(self, result: dict) -> dict:
+    def _normalize_publish_result(self, result: dict, *, retry_safe: bool) -> dict:
         """把中转站响应转换成当前系统已有发布结果结构。
 
         当前文章发布链路已经依赖 `media_id` 和 `publish_id` 字段。中转站统一
@@ -205,6 +275,10 @@ class WeChatRelayClient:
         if not result.get("success"):
             status = result.get("status", "FAILED")
             message = result.get("message", "微信中转站发布失败")
+            if retry_safe and _is_retryable_relay_business_failure(status, message):
+                raise WechatRelayRetryableError(
+                    f"WeChat relay publish temporarily failed ({status}): {message}"
+                )
             raise RuntimeError(f"WeChat relay publish failed ({status}): {message}")
 
         status = result.get("status", "")
@@ -224,3 +298,65 @@ class WeChatRelayClient:
         elif status == "FOLLOWER_PUSH_SENT":
             normalized["msg_id"] = wechat_article_id
         return normalized
+
+    @staticmethod
+    def _normalize_publish_status_result(result: dict) -> dict:
+        """把中转站最终状态响应约束为上层可安全消费的公开字段。
+
+        ``PUBLIC_PUBLISH_SUBMITTED`` 是提交回执而不是状态查询结果，因此不在
+        可接受集合内。未知或不符合契约的响应直接抛错，由上层保留 ``UNKNOWN``
+        并重试，不能把无法验证的响应误写成发布成功或明确失败。
+        """
+
+        if not result.get("success"):
+            status = result.get("status", "UNKNOWN")
+            message = result.get("message", "微信中转站状态查询失败")
+            raise RuntimeError(f"WeChat relay publish-status failed ({status}): {message}")
+
+        status = _string_or_empty(result.get("status"))
+        if status not in {"PUBLISHING", "PUBLISHED", "FAILED", "UNKNOWN"}:
+            raise RuntimeError(f"WeChat relay returned invalid publish-status: {status or 'empty'}")
+
+        return {
+            "relay_status": status,
+            "wechat_article_id": _string_or_empty(result.get("wechatArticleId")),
+            "wechat_url": _string_or_empty(result.get("wechatUrl")),
+            "message": _string_or_empty(result.get("message")),
+            "error_code": _string_or_empty(result.get("errorCode")) or None,
+            "raw": result,
+        }
+
+
+def _string_or_empty(value: object) -> str:
+    """将中转站可展示字段规范为空安全字符串，避免协议空值泄漏到上层状态判断。"""
+
+    return str(value or "").strip()
+
+
+def _is_retryable_relay_http_status(status_code: object) -> bool:
+    """判断草稿请求的 HTTP 状态是否属于可等待恢复的中转站故障。"""
+
+    try:
+        normalized_status = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    return normalized_status in {408, 425, 429} or normalized_status >= 500
+
+
+def _is_retryable_relay_business_failure(status: object, message: object) -> bool:
+    """只识别中转站明确给出的临时业务拒绝，避免按模糊文本重试配额类失败。"""
+
+    detail = f"{status or ''} {message or ''}".casefold()
+    # 微信 45028 是当天群发额度耗尽；无论服务端怎样描述，都不能被临时关键字覆盖。
+    if "45028" in detail or "masssend quota" in detail or "群发额度" in detail:
+        return False
+    return any(marker in detail for marker in (
+        "temporary",
+        "temporarily",
+        "服务暂不可用",
+        "service unavailable",
+        "rate limit",
+        "限流",
+        "稍后重试",
+        "gateway timeout",
+    ))

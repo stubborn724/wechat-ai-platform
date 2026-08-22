@@ -190,13 +190,14 @@ class _FakePollingQuery:
 class _FakePollingDb(_FakeDeliveryDb):
     """为 relay 状态收敛提供文章和发布尝试记录。"""
 
-    def __init__(self, article, attempt):
+    def __init__(self, article, attempt, candidate=None):
         super().__init__()
         self.article = article
         self.attempt = attempt
+        self.candidate = candidate
 
     def query(self, model_class):
-        from app.models.mysql_models import Article, ContentVersion, PublishAttempt
+        from app.models.mysql_models import Article, ContentVersion, PublishAttempt, TageAiPublishCandidate
 
         if model_class is Article:
             return _FakePollingQuery([self.article])
@@ -204,14 +205,56 @@ class _FakePollingDb(_FakeDeliveryDb):
             return _FakePollingQuery([SimpleNamespace(job_id=self.attempt.job_id)])
         if model_class is PublishAttempt:
             return _FakePollingQuery([self.attempt])
+        if model_class is TageAiPublishCandidate:
+            return _FakePollingQuery([self.candidate] if self.candidate else [])
         raise AssertionError(f"unexpected query model: {model_class}")
 
     def close(self):
         return None
 
 
-def test_relay_submission_without_status_endpoint_becomes_observable_failure(monkeypatch):
-    """relay 无状态查询能力时，超时发布必须退出 PUBLISHING 并保留诊断码。"""
+class _CandidateBoundPollingQuery(_FakePollingQuery):
+    """模拟正式发布任务与预览版本使用不同 Job 时的投递记录过滤。"""
+
+    def __init__(self, attempt):
+        super().__init__([])
+        self.attempt = attempt
+
+    def filter(self, *args, **kwargs):
+        """只有查询显式按发布候选幂等键关联时才返回正式发布尝试。"""
+
+        # 正式发布的 PublishAttempt 归属新建的 ``article_publish_existing`` Job，不能
+        # 仅依赖预览 ContentVersion 的旧 job_id。该替身使测试在旧实现下无法取到尝试。
+        if any("idempotency_key" in str(condition) for condition in args):
+            self.rows = [self.attempt]
+        else:
+            self.rows = []
+        return self
+
+
+class _CandidateBoundPollingDb(_FakePollingDb):
+    """验证轮询通过候选幂等键找到正式发布 Job 的投递记录。"""
+
+    def __init__(self, article, attempt, candidate, preview_job_id):
+        super().__init__(article, attempt, candidate)
+        self.preview_job_id = preview_job_id
+
+    def query(self, model_class):
+        from app.models.mysql_models import Article, ContentVersion, PublishAttempt, TageAiPublishCandidate
+
+        if model_class is Article:
+            return _FakePollingQuery([self.article])
+        if model_class is ContentVersion:
+            return _FakePollingQuery([SimpleNamespace(job_id=self.preview_job_id)])
+        if model_class is PublishAttempt:
+            return _CandidateBoundPollingQuery(self.attempt)
+        if model_class is TageAiPublishCandidate:
+            return _FakePollingQuery([self.candidate])
+        raise AssertionError(f"unexpected query model: {model_class}")
+
+
+def test_relay_submission_without_status_endpoint_becomes_observable_unknown(monkeypatch):
+    """relay 无状态查询能力时，超时发布必须进入可恢复的未知状态。"""
 
     from app.services import wechat_gateway_policy
     from app.tasks import job_tasks
@@ -240,11 +283,131 @@ def test_relay_submission_without_status_endpoint_becomes_observable_failure(mon
     db = _FakePollingDb(article, attempt)
     monkeypatch.setattr(job_tasks, "MysqlSessionLocal", lambda: db)
     monkeypatch.setattr(wechat_gateway_policy, "is_wechat_relay_enabled", lambda: True)
+    monkeypatch.setattr(
+        job_tasks,
+        "_create_wechat_relay_client",
+        lambda: SimpleNamespace(query_publish_status=lambda _publish_id: (_ for _ in ()).throw(RuntimeError("404"))),
+        raising=False,
+    )
 
     result = job_tasks.poll_publishing_articles.run()
 
-    assert result.get("failed_unresolved") == 1
-    assert article.status == "failed"
-    assert article.phase == "PUBLISH_STATUS_UNAVAILABLE"
-    assert attempt.status == "failed"
-    assert attempt.error_code == "PUBLISH_STATUS_UNAVAILABLE"
+    assert result.get("unknown_unresolved") == 1
+    assert article.status == "unknown"
+    assert article.phase == "PUBLISH_STATUS_UNKNOWN"
+    assert attempt.status == "unknown"
+    assert attempt.error_code == "PUBLISH_STATUS_UNKNOWN"
+
+
+def test_relay_publish_status_query_marks_article_attempt_and_candidate_published(monkeypatch):
+    """中转站确认已发布后，轮询必须收敛全部本地事实且不重新提交文章。"""
+
+    from app.services import wechat_gateway_policy
+    from app.tasks import job_tasks
+
+    submitted_at = datetime.now(timezone.utc)
+    article = SimpleNamespace(
+        id=1003,
+        tenant_id=7,
+        status="publishing",
+        phase="RELAY_PUBLISHING",
+        publish_id="relay-publish-002",
+        msg_data_id=None,
+        error_message=None,
+        updated_at=submitted_at,
+        wechat_publish_time=submitted_at,
+    )
+    attempt = SimpleNamespace(
+        id=2003,
+        tenant_id=7,
+        job_id=901,
+        account_id=103,
+        status="publishing",
+        error_code=None,
+        error_message=None,
+        platform_message_id=None,
+        finished_at=None,
+    )
+    candidate = SimpleNamespace(id=3003, article_id=1003, status="PUBLISHING")
+    db = _FakePollingDb(article, attempt, candidate)
+    queried_publish_ids = []
+    relay_client = SimpleNamespace(
+        query_publish_status=lambda publish_id: (
+            queried_publish_ids.append(publish_id)
+            or {
+                "relay_status": "PUBLISHED",
+                "wechat_article_id": "wechat-article-002",
+                "wechat_url": "https://mp.weixin.qq.com/s/published",
+                "message": "published",
+                "error_code": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(job_tasks, "MysqlSessionLocal", lambda: db)
+    monkeypatch.setattr(wechat_gateway_policy, "is_wechat_relay_enabled", lambda: True)
+    monkeypatch.setattr(job_tasks, "_create_wechat_relay_client", lambda: relay_client, raising=False)
+
+    result = job_tasks.poll_publishing_articles.run()
+
+    assert queried_publish_ids == ["relay-publish-002"]
+    assert result["published"] == 1
+    assert article.status == "published"
+    assert article.phase == "PUBLISHED"
+    assert article.msg_data_id == "wechat-article-002"
+    assert attempt.status == "success"
+    assert attempt.platform_message_id == "wechat-article-002"
+    assert attempt.finished_at is not None
+    assert candidate.status == "PUBLISHED"
+
+
+def test_relay_publish_status_updates_attempt_from_formal_publish_job(monkeypatch):
+    """预览版本与正式发布 Job 不同，仍须同步正式发布尝试的终态。"""
+
+    from app.services import wechat_gateway_policy
+    from app.tasks import job_tasks
+
+    submitted_at = datetime.now(timezone.utc)
+    article = SimpleNamespace(
+        id=1004,
+        tenant_id=7,
+        status="publishing",
+        phase="RELAY_PUBLISHING",
+        publish_id="relay-publish-003",
+        msg_data_id=None,
+        error_message=None,
+        updated_at=submitted_at,
+        wechat_publish_time=submitted_at,
+    )
+    # 预览 Job 为 901，正式发布任务单独创建了 902；这是实际 Phase B 流程的正常形态。
+    attempt = SimpleNamespace(
+        id=2004,
+        tenant_id=7,
+        job_id=902,
+        account_id=103,
+        status="publishing",
+        error_code=None,
+        error_message=None,
+        platform_message_id=None,
+        finished_at=None,
+    )
+    candidate = SimpleNamespace(id=3004, article_id=1004, status="PUBLISHING")
+    db = _CandidateBoundPollingDb(article, attempt, candidate, preview_job_id=901)
+    relay_client = SimpleNamespace(
+        query_publish_status=lambda _publish_id: {
+            "relay_status": "PUBLISHED",
+            "wechat_article_id": "wechat-article-003",
+            "message": "published",
+            "error_code": None,
+        },
+    )
+    monkeypatch.setattr(job_tasks, "MysqlSessionLocal", lambda: db)
+    monkeypatch.setattr(wechat_gateway_policy, "is_wechat_relay_enabled", lambda: True)
+    monkeypatch.setattr(job_tasks, "_create_wechat_relay_client", lambda: relay_client, raising=False)
+
+    result = job_tasks.poll_publishing_articles.run()
+
+    assert result["published"] == 1
+    assert article.status == "published"
+    assert attempt.status == "success"
+    assert attempt.platform_message_id == "wechat-article-003"
+    assert attempt.finished_at is not None

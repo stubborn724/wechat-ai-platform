@@ -104,3 +104,61 @@ def test_product_vision_input_is_compressed_for_cost_effective_vl_model() -> Non
     assert len(result.data) < 2 * 1024 * 1024
     with Image.open(BytesIO(result.data)) as normalized:
         assert max(normalized.size) <= 2048
+
+
+@pytest.mark.asyncio
+async def test_product_vision_uses_ark_endpoint_after_kuai_failure(monkeypatch) -> None:
+    """Kuai 视觉调用失败时，已配置的方舟 Endpoint 必须接管同一张压缩图片。"""
+
+    from app.services import erp_product_naming_service as service
+
+    class FakeResponse:
+        """模拟 OpenAI 兼容接口的最小回复对象。"""
+
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class FakeChatOpenAI:
+        """按调用配置分别模拟主服务失败和方舟备用成功。"""
+
+        calls: list[dict] = []
+
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.calls.append(kwargs)
+
+        async def ainvoke(self, _messages):
+            if self.kwargs["model"] == "qwen3-vl-8b-instruct":
+                raise RuntimeError("Kuai vision unavailable")
+            return FakeResponse("双层圆形边几")
+
+    async def fake_download(_image_url: str):
+        return service.NormalizedProductVisionImage(
+            data=b"image-bytes",
+            content_type="image/jpeg",
+        )
+
+    monkeypatch.setattr(service, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(
+        service,
+        "_download_and_normalize_product_vision_image",
+        fake_download,
+    )
+    monkeypatch.setattr(
+        service.settings,
+        "erp_product_vision_ark_base_url",
+        "https://ark.example.test/api/v3",
+    )
+    monkeypatch.setattr(service.settings, "erp_product_vision_ark_api_key", "test-key")
+    monkeypatch.setattr(service.settings, "erp_product_vision_ark_model", "ep-test-vision")
+
+    result = await service._analyze_product_category_with_visual_agent(
+        "https://erp.example.test/product.jpg"
+    )
+
+    assert result == "双层圆形边几"
+    assert [call["model"] for call in FakeChatOpenAI.calls] == [
+        "qwen3-vl-8b-instruct",
+        "ep-test-vision",
+    ]
+    assert FakeChatOpenAI.calls[1]["base_url"] == "https://ark.example.test/api/v3"

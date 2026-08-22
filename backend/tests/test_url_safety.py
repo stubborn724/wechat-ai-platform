@@ -20,6 +20,49 @@ def test_allows_configured_dashscope_image_host_with_benchmark_dns(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "dashscope-0484.oss-accelerate.aliyuncs.com",
+        "dashscope-9371.oss-cn-hangzhou.aliyuncs.com",
+    ],
+)
+def test_allows_official_dynamic_dashscope_image_hosts_with_benchmark_dns(
+    monkeypatch,
+    host,
+):
+    """DashScope 动态 bucket 变化时，受控的官方 HTTPS OSS 地址仍可归档。"""
+    from app.services import url_safety
+
+    monkeypatch.setattr(url_safety, "_resolve_dns", lambda resolved_host: ["198.18.2.188"])
+
+    url_safety.validate_url(f"https://{host}/generated/image.png")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://dashscope-0484.oss-accelerate.aliyuncs.com.evil.test/image.png",
+        "https://customer-bucket.oss-accelerate.aliyuncs.com/image.png",
+        "https://dashscope-demo.oss-accelerate.aliyuncs.com/image.png",
+        "https://dashscope-0484.cdn.aliyuncs.com/image.png",
+        "http://dashscope-0484.oss-accelerate.aliyuncs.com/image.png",
+        "https://dashscope-0484.oss-accelerate.aliyuncs.com:9443/image.png",
+    ],
+)
+def test_rejects_untrusted_dashscope_lookalike_urls_with_benchmark_dns(
+    monkeypatch,
+    url,
+):
+    """动态域名兼容不能放行仿冒主机、非官方 bucket 或不安全协议与端口。"""
+    from app.services import url_safety
+
+    monkeypatch.setattr(url_safety, "_resolve_dns", lambda resolved_host: ["198.18.2.188"])
+
+    with pytest.raises(ValueError, match="resolves to internal IP"):
+        url_safety.validate_url(url)
+
+
 def test_allows_configured_erp_oss_image_host_with_benchmark_dns(monkeypatch):
     """已审计的 ERP 产品图 OSS 域名在基准网段映射下仍应允许归档。"""
     from app.services import url_safety

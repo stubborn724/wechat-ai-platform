@@ -80,6 +80,29 @@ def build_settings():
     )
 
 
+def test_text_provider_builder_supports_two_independent_kuai_models():
+    """第二层 Kuai 必须可独立配置，不能复用第一层的模型字段。"""
+    from app.services.text_generation_service import _build_default_text_providers
+
+    settings = SimpleNamespace(
+        text_generation_timeout_seconds=90,
+        text_generation_base_url="https://api.kuai.example/v1",
+        text_generation_api_key="primary-key",
+        text_generation_model="gpt-5-mini",
+        text_generation_secondary_base_url="https://api.kuai.example/v1",
+        text_generation_secondary_api_key="secondary-key",
+        text_generation_secondary_model="qwen3.5-flash",
+        dashscope_api_key="dashscope-key",
+        dashscope_model="qwen-plus",
+    )
+
+    providers = _build_default_text_providers(settings)
+
+    assert providers["kuai"].model == "gpt-5-mini"
+    assert providers["kuai_secondary"].model == "qwen3.5-flash"
+    assert providers["kuai_secondary"].api_key == "secondary-key"
+
+
 @pytest.mark.asyncio
 async def test_text_primary_success_does_not_call_dashscope():
     """快站成功时不能继续调用百炼，避免重复计费。"""
@@ -155,6 +178,28 @@ async def test_text_all_providers_fail_without_leaking_keys():
     assert "kuai" in message
     assert "dashscope" in message
     assert "sk-" not in message
+
+
+@pytest.mark.asyncio
+async def test_text_chain_error_exposes_all_provider_failures_for_scheduler():
+    """总失败异常必须保留底层异常集合，供调度器区分临时故障与配置错误。"""
+    from app.services.text_generation_service import (
+        TextGenerationChainError,
+        TextGenerationRequest,
+        TextGenerationService,
+    )
+
+    kuai = FakeTextProvider("kuai", error=TimeoutError("暂时超时"))
+    dashscope = FakeTextProvider("dashscope", error=ValueError("参数错误"))
+    service = TextGenerationService(
+        settings=build_settings(),
+        providers={"kuai": kuai, "dashscope": dashscope},
+    )
+
+    with pytest.raises(TextGenerationChainError) as error_info:
+        await service.complete(TextGenerationRequest("system", "user"))
+
+    assert [name for name, _error in error_info.value.failures] == ["kuai", "dashscope"]
 
 
 @pytest.mark.asyncio

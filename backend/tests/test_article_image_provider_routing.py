@@ -61,6 +61,8 @@ async def test_erp_reference_generation_uses_shared_provider_request(monkeypatch
     assert request.reference_image_url == "https://cos.example.com/signed-reference"
     assert "品牌色调克制" in request.prompt
     assert "目标产品：云朵茶几" in request.prompt
+    assert "【同篇产品身份证硬约束】" in request.prompt
+    assert "同一产品，不是同系列不同款" in request.prompt
     assert result.images[0].method == "openai_compatible"
 
 

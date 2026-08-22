@@ -86,6 +86,30 @@ def _iter_exception_chain(error: BaseException):
         nested_errors = getattr(current, "errors", None)
         if nested_errors:
             pending.extend(error for error in nested_errors if isinstance(error, BaseException))
+        # 文生文链路的失败项带有提供商名称 ``(name, exception)``，不能直接把
+        # 元组加入异常链。这里仅提取其中真实的异常，保持其他业务包装结构兼容。
+        nested_failures = getattr(current, "failures", None)
+        if nested_failures:
+            for failure in nested_failures:
+                nested_error = failure[1] if isinstance(failure, tuple) and len(failure) > 1 else failure
+                if isinstance(nested_error, BaseException):
+                    pending.append(nested_error)
+
+
+def raise_scheduled_state_error(state) -> None:
+    """把 Agent 状态错误还原为调度器可消费的领域异常。
+
+    历史 Agent 通过 ``state.error`` 回传可展示文案。定时入口若直接包一层
+    ``RuntimeError``，模型 JSON 解析这种可恢复错误便失去类型信息；新增的标记
+    让 API 展示方式保持不变，同时由这里在真正进入调度边界时恢复异常语义。
+    """
+
+    message = str(getattr(state, "error", "") or "文章生成失败")
+    if bool(getattr(state, "error_retryable", False)):
+        from app.services.scheduled_retry_errors import RetryableModelOutputError
+
+        raise RetryableModelOutputError(message)
+    raise RuntimeError(message)
 
 
 def is_retryable_scheduled_error(error: BaseException) -> bool:
@@ -120,9 +144,21 @@ def is_retryable_scheduled_error(error: BaseException) -> bool:
     except ImportError:
         ImageGenerationFallbackError = None
     try:
+        from app.services.erp_product_service import ErpProductApiError
+    except ImportError:
+        ErpProductApiError = None
+    try:
         from app.services.wechat_publisher import WechatPublishAmbiguousError
     except ImportError:
         WechatPublishAmbiguousError = None
+    try:
+        from app.services.wechat_relay_client import WechatRelayPublishAmbiguousError
+    except ImportError:
+        WechatRelayPublishAmbiguousError = None
+    try:
+        from app.services.scheduled_retry_errors import RetryableScheduledTaskError
+    except ImportError:
+        RetryableScheduledTaskError = None
 
     retryable_image_categories = set()
     if ImageErrorCategory is not None:
@@ -145,9 +181,14 @@ def is_retryable_scheduled_error(error: BaseException) -> bool:
     exception_chain = list(_iter_exception_chain(error))
     # 发布请求已经发出但响应不明确时，微信可能已经产生了外部副作用。即使其
     # cause 是 requests.ConnectionError，也必须优先停止自动重试，交给人工核验。
-    if (
-        isinstance(WechatPublishAmbiguousError, type)
-        and any(isinstance(current, WechatPublishAmbiguousError) for current in exception_chain)
+    ambiguous_publish_error_types = tuple(
+        error_type
+        for error_type in (WechatPublishAmbiguousError, WechatRelayPublishAmbiguousError)
+        if isinstance(error_type, type)
+    )
+    if ambiguous_publish_error_types and any(
+        isinstance(current, ambiguous_publish_error_types)
+        for current in exception_chain
     ):
         return False
 
@@ -156,7 +197,11 @@ def is_retryable_scheduled_error(error: BaseException) -> bool:
         # 错误才值得再次请求。包装层（例如 ERP 的 ErpProductApiError）会通过
         # __cause__ 继续遍历到这里，因此不能按业务异常基类整体判定为可重试。
         response = getattr(current, "response", None)
+        # MinIO/COS 等 SDK 有时把 HTTP 状态直接放在异常上，而不是 requests/httpx
+        # 的 response 对象中。兼容两种形态后，临时 5xx 与限流可复用同一退避策略。
         status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            status_code = getattr(current, "status_code", None)
         if status_code in {408, 425, 429} or (
             isinstance(status_code, int) and status_code >= 500
         ):
@@ -172,6 +217,24 @@ def is_retryable_scheduled_error(error: BaseException) -> bool:
             return True
         if isinstance(current, tuple(retryable_types)):
             return True
+        storage_error_code = str(getattr(current, "code", "") or "").casefold()
+        if storage_error_code in {
+            "slowdown",
+            "internalerror",
+            "serviceunavailable",
+            "requesttimeout",
+            "operationtimedout",
+        }:
+            return True
+        if (
+            isinstance(RetryableScheduledTaskError, type)
+            and isinstance(current, RetryableScheduledTaskError)
+        ):
+            return True
+        if isinstance(ErpProductApiError, type) and isinstance(current, ErpProductApiError):
+            # ERP 可能在 HTTP 200 中返回业务层“系统异常”。该属性由 ERP 领域层
+            # 根据状态码和错误摘要冻结，调度器只负责执行统一的有限重试策略。
+            return bool(getattr(current, "retryable", False))
         if isinstance(ImageProviderError, type) and isinstance(current, ImageProviderError):
             return getattr(current, "category", None) in retryable_image_categories
         if (
@@ -1200,6 +1263,62 @@ def _scheduled_article(
     for slot_idx in range(task.articles_per_day or 1):
         print(f"\n  >>> 槽位 {slot_idx+1} (图文) <<<")
 
+        # 她格是知识库驱动的原创企业服务文章。任务通常不设置固定主题，若任由
+        # 模型从同一资料自由发挥，极易连续生成“AI 入企/协同/复盘”的泛化文章。
+        # 在创建文章前冻结一个具体经营痛点，重试继续依据同一运行时段计算，既能
+        # 保证正文深度，也不会让一次失败重试换掉已经开始生成的选题。
+        effective_topic = topic or ""
+        shege_constraints: list[str] = []
+        from app.services.shege_pain_point_planning_service import (
+            is_shege_enterprise_ai_style,
+            load_recent_shege_topics,
+            plan_shege_pain_point,
+        )
+
+        if is_shege_enterprise_ai_style(task.style):
+            scheduled_at = datetime.now()
+            if run is not None:
+                try:
+                    scheduled_at = datetime.combine(
+                        run.scheduled_date,
+                        datetime.strptime(run.scheduled_time, "%H:%M").time(),
+                    )
+                except (TypeError, ValueError):
+                    # 历史运行记录可能没有规范时间字符串；此时退回当前时间只会
+                    # 影响选题轮换，不会影响任务原有的发布时段或交付行为。
+                    scheduled_at = datetime.now()
+            recent_topics = load_recent_shege_topics(
+                db,
+                tenant_id=task.tenant_id,
+                now=scheduled_at,
+            )
+            frozen_topic = ""
+            if run is not None and getattr(run, "article_id", None):
+                from app.models.mysql_models import Article
+
+                previous_article = db.query(Article).filter(
+                    Article.id == run.article_id,
+                    Article.tenant_id == task.tenant_id,
+                ).first()
+                frozen_topic = str(
+                    getattr(previous_article, "topic", "") or ""
+                ).strip()
+            pain_point_plan = plan_shege_pain_point(
+                recent_topics=recent_topics,
+                now=scheduled_at,
+                frozen_topic=frozen_topic,
+            )
+            effective_topic = effective_topic or pain_point_plan.topic
+            shege_constraints = list(pain_point_plan.constraints)
+            if topic:
+                # 用户主动填写主题时不应被自动选题覆盖，但仍必须遵守一题深挖和
+                # 历史避重规则。第一条只替换焦点描述，其余规则保持统一。
+                shege_constraints[0] = (
+                    f"全文只能围绕“{effective_topic}”这一个具体经营痛点展开，"
+                    "禁止扩写成泛泛的 AI 入企介绍或罗列多个问题。"
+                )
+            print(f"  🎯 她格痛点选题: {effective_topic}")
+
         # 1. 创建 Article 记录
         actor_id = execution_actor_id
         if actor_id is None:
@@ -1209,7 +1328,7 @@ def _scheduled_article(
 
         article = create_article_record(
             db=db, user_id=actor_id, tenant_id=task.tenant_id,
-            topic=topic or "", style=task.style or "default",
+            topic=effective_topic, style=task.style or "default",
             image_source=task.image_source or "dashscope",
             footer_template=task.footer_template,
         )
@@ -1223,10 +1342,11 @@ def _scheduled_article(
             task_id=article.task_id,
             user_id=actor_id,
             tenant_id=task.tenant_id,
-            topic=topic or "",
+            topic=effective_topic,
             style=task.style or "default",
             enabled_image_methods=task.enabled_image_methods or ["DASHSCOPE"],
             footer_template=task.footer_template,
+            content_constraints=shege_constraints,
             # 旧任务或迁移前对象没有该字段时回退到五张，避免改变既有成本策略。
             max_generated_images=max(1, min(getattr(task, "html_image_count", 5) or 5, 30)),
         )
@@ -1405,6 +1525,7 @@ def _scheduled_article(
                             fallback_category=str(product_scene_profile.label).split("/", 1)[0],
                         )
                         s.product_scene_profile = product_scene_profile.to_payload()
+                        s.product_brand_key = erp_image_config.source_key
                         print(
                             f"  🖼️ ERP 配图: {erp_image_config.commodity_category or '全部分类'}，"
                             f"已选择产品“{product_name}”作为图生图参考，"
@@ -1565,6 +1686,7 @@ def _scheduled_article(
                             profile=publication_profile,
                             product_name=s.product_name,
                             title_subject=poster_scene_profile.label,
+                            brand_key=erp_image_config.source_key if erp_image_config else None,
                             # 公共写作模板同时约束公众号标题；未设置时保持既有海报
                             # 标题链路，确保正式运行中的绣蔓任务不受影响。
                             style=task.style,
@@ -1577,6 +1699,9 @@ def _scheduled_article(
                             plan=poster_plan,
                             product_name=s.product_name,
                             tenant_id=s.tenant_id,
+                            # 海报链路同时传入 ERP 原图字节和临时 HTTPS 地址：支持
+                            # multipart 的提供商使用字节，URL 型备用模型使用 HTTPS 地址。
+                            reference_image_url=s.reference_image_url,
                             reference_image_bytes=s.reference_image_bytes,
                             reference_content_type=s.reference_content_type,
                             product_scene_profile=poster_scene_profile,
@@ -1619,7 +1744,7 @@ def _scheduled_article(
                     # Agent 1: 标题 — 返回 ArticleState
                     s = await agent1_generate_title_options(s)
                     if s.error:
-                        raise RuntimeError(s.error)
+                        raise_scheduled_state_error(s)
                     selected_title = (
                         s.title_options[0]
                         if s.title_options
@@ -1640,12 +1765,12 @@ def _scheduled_article(
                 if not s.reference_html and not s.format_profile_payload:
                     s = await agent2_generate_outline(s)
                     if s.error:
-                        raise RuntimeError(s.error)
+                        raise_scheduled_state_error(s)
 
                 # Agent 3: 正文或 HTML 槽位内容
                 s = await agent3_generate_content(s)
                 if s.error:
-                    raise RuntimeError(s.error)
+                    raise_scheduled_state_error(s)
 
                 # 配图: 有参考图片时走理解+AI生成，否则走 AI 生图
                 # 注意: 有 layout_template 时，agent 3 已按模板生成 [IMAGE:] 占位符
@@ -2289,6 +2414,7 @@ def _publish_to_wechat(
         raise ValueError("定时任务未配置公众号，无法完成发布")
 
     from app.services.wechat_publisher import WechatPublishAmbiguousError, publish_article
+    from app.services.wechat_relay_client import WechatRelayPublishAmbiguousError
 
     publish_domain = resolve_scheduled_publish_domain(task, run)
     delivery_results = dict(getattr(run, "delivery_results", None) or {}) if run else {}
@@ -2431,10 +2557,17 @@ def _publish_to_wechat(
                 aid,
             )
         except Exception as e:
-            if (
-                run is not None
-                and isinstance(WechatPublishAmbiguousError, type)
-                and any(isinstance(item, WechatPublishAmbiguousError) for item in _iter_exception_chain(e))
+            ambiguous_publish_error_types = tuple(
+                error_type
+                for error_type in (
+                    WechatPublishAmbiguousError,
+                    WechatRelayPublishAmbiguousError,
+                )
+                if isinstance(error_type, type)
+            )
+            if run is not None and any(
+                isinstance(item, ambiguous_publish_error_types)
+                for item in _iter_exception_chain(e)
             ):
                 delivery_results[delivery_key] = {
                     "status": "ambiguous",

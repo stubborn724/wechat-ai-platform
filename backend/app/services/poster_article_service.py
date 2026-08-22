@@ -16,10 +16,16 @@ from app.services.image_generation_models import ImageGenerationRequest
 from app.services.publication_format_service import PublicationFormatProfile
 from app.services.scheduled_product_scene_service import (
     ProductSceneProfile,
+    append_erp_image_viewpoint_instruction,
+    append_product_identity_guard,
     append_product_scene_guard,
 )
 from app.services.scheduled_image_quality_service import (
     append_low_information_retry_instruction,
+)
+from app.services.scheduled_retry_errors import (
+    RetryableImageQualityError,
+    RetryableModelOutputError,
 )
 from app.services.text_generation_service import TextGenerationRequest, text_generation_service
 from app.services.writing_style_template_service import (
@@ -49,6 +55,8 @@ async def generate_poster_plan(
     profile: PublicationFormatProfile,
     product_name: str,
     title_subject: str | None = None,
+    product_scene_profile: ProductSceneProfile | None = None,
+    brand_key: str | None = None,
     style: str | None = None,
     body_copy_only: bool = False,
     complete_text: Callable[[TextGenerationRequest], Awaitable[str]] = text_generation_service.complete,
@@ -123,7 +131,9 @@ async def generate_poster_plan(
         try:
             data = _parse_json(repaired_raw)
         except ValueError as repair_error:
-            raise ValueError("海报文案 Agent 返回的 JSON 无效") from repair_error
+            # 两次调用都收到非 JSON 时，模型服务本身仍可用，只是本轮结构化输出
+            # 偶发失效。此时尚未生成或发布任何内容，允许调度器重跑整篇任务。
+            raise RetryableModelOutputError("海报文案 Agent 返回的 JSON 无效") from repair_error
     # 模型偶尔会先输出“型号·占位品类|长句”。此处不能过早按最终标题长度截断，
     # 否则在清掉型号后正文已变成半句话；最终长度只在语义主体确定后统一收敛。
     title = _clean_copy(data.get("article_title", ""), 120)
@@ -177,6 +187,28 @@ async def generate_poster_plan(
         title_subject=title_subject,
         max_chars=title_max_chars,
     )
+    # 绣蔓的素材与空间规则是现代家具语境。海报文案 Agent 若沿用了其它品牌的
+    # 东方审美标题，在发布前按同一产品场景档案纠正，避免纯海报与 HTML 图文
+    # 两条链路出现不同品牌标题规则。
+    if str(brand_key or "").strip().lower() == "xiuman" and product_scene_profile is not None:
+        from app.services.scheduled_product_title_service import (
+            normalize_scheduled_product_title,
+        )
+
+        safe_title = normalize_scheduled_product_title(
+            product_name,
+            profile=product_scene_profile,
+            candidate_title=safe_title,
+            brand_key="xiuman",
+        )
+        if posters and not body_copy_only:
+            # 首张历史海报会直接把模型 ``article_title`` 当作画面短标题。仅修正
+            # 公众号标题会导致同一篇文章出现两套品牌话术，因此这里同步替换首图
+            # 文案；长度仍遵守知识库对画面标题的限制。
+            posters[0] = PosterText(
+                copy=_clean_copy(safe_title, profile.title_max_chars),
+                scene=posters[0].scene,
+            )
     return PosterPlan(
         article_title=safe_title,
         posters=tuple(posters[:required_count]),
@@ -191,6 +223,7 @@ async def generate_poster_images(
     tenant_id: int,
     reference_image_bytes: bytes | None,
     reference_content_type: str | None,
+    reference_image_url: str | None = None,
     product_scene_profile: ProductSceneProfile | None = None,
     generate_image: Callable[[ImageGenerationRequest], Awaitable[object]],
     # 新三品牌模板由程序叠加中文文案；旧任务默认仍让模型按历史提示词绘制，
@@ -200,18 +233,16 @@ async def generate_poster_images(
 ) -> list[str]:
     """逐张图生图，确保产品主体、功能空间和品牌视觉规则同时生效。
 
-    纯海报以前已经复用了 ERP 原图，但产品场景快照只进入普通 HTML 图文链路，
-    使海报模型仍可能把餐桌放入客厅。这里把同一份确定性场景规则传入每张海报，
-    并保留参考图字节作为唯一真实主体来源，解决“只生成朦胧背景”的退化结果。
+    每张海报都以同一份 ERP 原图作为参考，保留产品的真实材质、比例和结构；场景
+    规则、格式模板、正文叠字与固定页脚仍由各自既有流程处理，不在此处变更。
     """
 
     if not reference_image_bytes:
         raise ValueError("纯海报任务缺少 ERP 产品参考图")
     visual_anchor = _build_shared_visual_anchor(profile.visual_directives)
 
-    # 程序叠字模式也必须生成三张独立机位。早期的单主视觉切片虽然省一次调用，
-    # 但会把同一个产品角度裁成三段，无法形成真实的产品叙事。共同视觉锚点和
-    # 归档合成器负责保持连续感，三张图则负责提供空间、主视觉、细节三种视角。
+    # 程序叠字模式也必须生成三张独立构图。共同视觉锚点和归档合成器负责保持
+    # 连续感，三张图则通过空间、主视觉、细节三种关注点形成产品叙事。
     if not embed_copy_in_model:
         return await _generate_programmatic_three_view_images(
             profile=profile,
@@ -220,6 +251,7 @@ async def generate_poster_images(
             tenant_id=tenant_id,
             reference_image_bytes=reference_image_bytes,
             reference_content_type=reference_content_type,
+            reference_image_url=reference_image_url,
             visual_anchor=visual_anchor,
             product_scene_profile=product_scene_profile,
             generate_image=generate_image,
@@ -237,6 +269,18 @@ async def generate_poster_images(
             product_scene_profile=product_scene_profile,
             embed_copy_in_model=embed_copy_in_model,
         )
+        # 海报与普通图文共享同一张 ERP 原图，提示词仍限制模型只使用可见结构，
+        # 避免为了图片差异补造背面或侧后细节。
+        prompt = append_erp_image_viewpoint_instruction(
+            prompt,
+            index,
+            total=len(plan.posters),
+        )
+        prompt = append_product_identity_guard(
+            prompt,
+            product_scene_profile,
+            product_name=product_name,
+        )
         final_prompt = prompt
         generated = None
         quality_report = None
@@ -247,10 +291,9 @@ async def generate_poster_images(
                 prompt=final_prompt,
                 size="1024*1536",
                 tenant_id=tenant_id,
+                reference_image_url=reference_image_url,
                 reference_image_bytes=reference_image_bytes,
                 reference_content_type=reference_content_type or "image/jpeg",
-                # 文案是否由程序叠加不改变产品参考图的传递；该字段也让支持它
-                # 的供应商明确不要自行绘制文字。
                 no_text=not embed_copy_in_model,
             ))
             url = str(getattr(generated, "url", generated) or "").strip()
@@ -274,9 +317,12 @@ async def generate_poster_images(
             )
         ):
             reason = getattr(quality_report, "reason", "未完成质量检查")
-            raise RuntimeError(
-                f"第 {index} 张海报连续两次质量检查未通过，{reason}"
+            error_type = (
+                RetryableImageQualityError
+                if bool(getattr(quality_report, "retryable", False))
+                else RuntimeError
             )
+            raise error_type(f"第 {index} 张海报连续两次质量检查未通过，{reason}")
         url = str(getattr(generated, "url", generated) or "").strip()
         urls.append(url)
     return urls
@@ -290,6 +336,7 @@ async def _generate_programmatic_three_view_images(
     tenant_id: int,
     reference_image_bytes: bytes,
     reference_content_type: str | None,
+    reference_image_url: str | None,
     visual_anchor: str,
     product_scene_profile: ProductSceneProfile | None,
     generate_image: Callable[[ImageGenerationRequest], Awaitable[object]],
@@ -313,6 +360,16 @@ async def _generate_programmatic_three_view_images(
             embed_copy_in_model=False,
         )
         prompt += f"\n{_build_programmatic_view_instruction(index)}"
+        prompt = append_erp_image_viewpoint_instruction(
+            prompt,
+            index,
+            total=len(plan.posters),
+        )
+        prompt = append_product_identity_guard(
+            prompt,
+            product_scene_profile,
+            product_name=product_name,
+        )
         generated = None
         quality_report = None
         final_prompt = prompt
@@ -321,6 +378,7 @@ async def _generate_programmatic_three_view_images(
                 prompt=final_prompt,
                 size="1024*1536",
                 tenant_id=tenant_id,
+                reference_image_url=reference_image_url,
                 reference_image_bytes=reference_image_bytes,
                 reference_content_type=reference_content_type or "image/jpeg",
                 no_text=True,
@@ -341,7 +399,12 @@ async def _generate_programmatic_three_view_images(
             or not bool(getattr(quality_report, "is_usable", False))
         ):
             reason = getattr(quality_report, "reason", "未完成质量检查")
-            raise RuntimeError(f"第 {index} 张三视角海报质量检查未通过，{reason}")
+            error_type = (
+                RetryableImageQualityError
+                if bool(getattr(quality_report, "retryable", False))
+                else RuntimeError
+            )
+            raise error_type(f"第 {index} 张三视角海报质量检查未通过，{reason}")
         urls.append(str(getattr(generated, "url", generated) or "").strip())
     return urls
 
@@ -405,17 +468,17 @@ def _build_poster_prompt(
 
 
 def _build_programmatic_view_instruction(position: int) -> str:
-    """定义三图海报的镜头分工，确保同产品而非同一张图片的重复裁切。"""
+    """定义三图海报的景别和已见区域分工，不以补造隐藏结构换取画面差异。"""
 
     view_instructions = {
-        1: "【本图机位】空间引入广角：从产品所在功能空间的自然视角进入，产品清晰可见但不占满画面，保留上半部文字留白。",
-        2: "【本图机位】完整产品主视觉：使用三分之四角度或正面视角，完整呈现产品轮廓、比例和主要材质，作为整组的视觉中心。",
-        3: "【本图机位】材质、结构、局部细节或侧后角度：展示桌边、支撑、纹理、五金或产品与使用场景的细节，必须与前两张构图明显不同。",
+        1: "【本图构图】原视角空间广角：保持参考图已见的产品朝向，只拉开取景距离呈现功能空间，产品清晰可见并保留上半部文字留白。",
+        2: "【本图构图】完整产品主视觉：保持参考图原始朝向，完整呈现可见轮廓、比例和主要材质，作为整组视觉中心。",
+        3: "【本图构图】已见材质局部：只聚焦参考图中已经可见的桌边、支撑、纹理、五金或使用细节；不得要求背面、侧后、底部或内部结构。",
     }
-    instruction = view_instructions.get(position, "【本图机位】使用与前图不同的产品细节或生活视角。")
+    instruction = view_instructions.get(position, "【本图构图】使用与前图不同的已见细节、景别或生活背景。")
     return (
-        "【三视角连续叙事】本篇三张图必须是同一 ERP 产品、同一房间、同色温、同光向和同一朦胧层次，"
-        "但每张的镜头角度、焦距和构图必须不同；不能复制、镜像、裁切或仅放大前一张。\n"
+        "【连续构图叙事】本篇三张图必须是同一 ERP 产品、同一房间、同色温、同光向和同一朦胧层次；"
+        "每张只通过原始朝向下的景别、裁切范围和背景变化区分，不能复制、镜像、透视重建或补造隐藏结构。\n"
         f"{instruction}"
     )
 
@@ -433,7 +496,7 @@ def _build_shared_visual_anchor(visual_directives: str) -> str:
     return f"""【本篇统一背景视觉锚点】
 以下规则适用于本篇所有海报，必须保持为同一套视觉系统：品牌空间类型、背景氛围、
 主色与辅助色、光线方向和色温、材质表现、镜头语言、景深关系以及文字安全区均保持一致。
-每张图只允许改变当前场景的关注点、产品展示角度和对应文案，不得另起一套背景风格，
+每张图只允许改变当前场景的关注点、产品景别与构图和对应文案，不得另起一套背景风格，
 不得把不同品牌或不同色系的家居空间混入同一篇文章。
 
 知识库背景规则（必须逐条遵守）：

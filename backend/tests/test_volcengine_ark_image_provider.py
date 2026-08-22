@@ -55,6 +55,16 @@ class FakeStorage:
         return f"http://minio.test/wechat-assets/{object_key}"
 
 
+def test_ark_size_meets_seedream_minimum_pixel_requirement():
+    """方舟 Seedream 4.5 拒绝低于 3686400 像素的请求，兜底规格必须预先抬升。"""
+    from app.services.volcengine_ark_image_provider import _normalize_ark_size
+
+    for requested_size in ("1024*1024", "1024*1365", "1365*1024"):
+        normalized = _normalize_ark_size(requested_size)
+        width, height = (int(part) for part in normalized.split("x", maxsplit=1))
+        assert width * height >= 3_686_400
+
+
 @pytest.mark.asyncio
 async def test_ark_provider_sends_local_reference_as_data_uri_and_archives_b64_result():
     """豆包兜底必须直接传本地图片字节，不能要求万相式公网参考图。"""

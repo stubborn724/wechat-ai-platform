@@ -247,14 +247,26 @@ class TextGenerationService:
 
 
 def _build_default_text_providers(settings) -> dict[str, TextGenerationProvider]:
-    """集中组装快站与百炼客户端配置。"""
+    """集中组装双 Kuai 文本链路，并保留百炼兼容提供商。"""
     timeout_seconds = int(getattr(settings, "text_generation_timeout_seconds", 180))
+    primary_base_url = getattr(settings, "text_generation_base_url", "")
+    primary_api_key = getattr(settings, "text_generation_api_key", "")
     return {
         "kuai": OpenAICompatibleTextProvider(
             name="kuai",
-            base_url=getattr(settings, "text_generation_base_url", ""),
-            api_key=getattr(settings, "text_generation_api_key", ""),
+            base_url=primary_base_url,
+            api_key=primary_api_key,
             model=getattr(settings, "text_generation_model", "gpt-4.1-mini"),
+            timeout_seconds=timeout_seconds,
+        ),
+        "kuai_secondary": OpenAICompatibleTextProvider(
+            name="kuai_secondary",
+            base_url=getattr(settings, "text_generation_secondary_base_url", "")
+            or primary_base_url,
+            api_key=getattr(settings, "text_generation_secondary_api_key", "")
+            or primary_api_key,
+            model=getattr(settings, "text_generation_secondary_model", "")
+            or getattr(settings, "text_generation_model", "gpt-4.1-mini"),
             timeout_seconds=timeout_seconds,
         ),
         "dashscope": OpenAICompatibleTextProvider(

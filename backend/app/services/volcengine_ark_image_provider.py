@@ -15,6 +15,7 @@ import httpx
 
 from app.config import settings as application_settings
 from app.services.image_generation_models import (
+    classify_http_error_category,
     GeneratedImage,
     ImageErrorCategory,
     ImageGenerationRequest,
@@ -28,9 +29,6 @@ _CONTENT_TYPE_EXTENSIONS = {
     "image/png": "png",
     "image/webp": "webp",
 }
-_TEMPORARY_STATUS_CODES = {408, 409, 425}
-
-
 class VolcengineArkImageProvider:
     """将统一图片请求转换为火山方舟 Seedream 请求。
 
@@ -173,16 +171,7 @@ class VolcengineArkImageProvider:
         except Exception:
             pass
         message = " ".join(message.split())[:300]
-        if status_code in {401, 403}:
-            category = ImageErrorCategory.AUTHENTICATION
-        elif status_code == 429:
-            category = ImageErrorCategory.RATE_LIMIT
-        elif status_code in _TEMPORARY_STATUS_CODES:
-            category = ImageErrorCategory.TEMPORARY
-        elif status_code >= 500:
-            category = ImageErrorCategory.UPSTREAM
-        else:
-            category = ImageErrorCategory.INVALID_REQUEST
+        category = classify_http_error_category(status_code, message)
         raise ImageProviderError(
             f"火山方舟返回 HTTP {status_code}：{message}",
             category=category,
@@ -238,15 +227,11 @@ class VolcengineArkImageProvider:
 
 
 def _normalize_ark_size(size: str) -> str:
-    """把旧业务的星号分隔规格转换为方舟认可的 ``宽x高`` 格式。"""
-    normalized = str(size or "1024*1024").lower().replace("*", "x")
-    try:
-        width_text, height_text = normalized.split("x", maxsplit=1)
-        width, height = int(width_text), int(height_text)
-    except (TypeError, ValueError):
-        return "1024x1024"
-    if height > width * 1.1:
-        return "1024x1536"
-    if width > height * 1.1:
-        return "1536x1024"
-    return "1024x1024"
+    """把业务规格映射为方舟 Seedream 4.5 可接受的像素尺寸。
+
+    方舟当前接口明确拒绝小于 3686400 像素的请求，而历史文章默认规格仅约
+    100 万像素。为保证最后一层永远可接管，统一使用 2048x2048 的安全规格；
+    业务提示词仍会约束画面构图，避免因上游尺寸不一致导致兜底再次失败。
+    """
+    _ = size
+    return "2048x2048"

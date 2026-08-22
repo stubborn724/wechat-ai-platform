@@ -6,6 +6,7 @@
 
 import ipaddress
 import logging
+import re
 import socket
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -51,6 +52,14 @@ _TRUSTED_EXTERNAL_IMAGE_HOSTS = {
     # 放行该主机，不能扩大到整个 198.18.0.0/15 网段。
     "videos.tpkcur.xyz",
 }
+
+# DashScope 生成图片使用动态 OSS bucket，数字编号会随任务或交付集群变化，
+# 因此不能继续维护单个完整主机名。这里严格约束 bucket 前缀、数字编号、
+# OSS 加速/官方地域端点和 aliyuncs.com 根域，避免把任意 OSS bucket 或
+# 形似官方域名的后缀主机纳入 SSRF 例外。
+_DASHSCOPE_OSS_HOST_PATTERN = re.compile(
+    r"^dashscope-\d+\.oss-(?:accelerate|(?:cn|ap|eu|us|me)-[a-z0-9-]+)\.aliyuncs\.com$"
+)
 
 # 公众号文章抓取域名白名单。
 # 微信文章在当前网络环境中可能被解析到 RFC 2544 基准测试网段，
@@ -118,16 +127,30 @@ def _check_cloud_metadata(host: str) -> None:
             raise ValueError(f"URL points to cloud metadata service: {host}")
 
 
+def _is_official_dashscope_oss_host(host: str) -> bool:
+    """识别受控范围内的 DashScope 官方动态 OSS 主机。
+
+    DashScope 返回地址中的 bucket 数字会变化，但主机结构稳定。单独封装
+    结构识别可避免在静态白名单中持续追加临时域名，也便于通过测试明确
+    约束允许范围；任何非数字 bucket、非 OSS 端点或附加域名后缀都拒绝。
+    """
+    return _DASHSCOPE_OSS_HOST_PATTERN.fullmatch(host.lower()) is not None
+
+
 def _is_trusted_external_image_url(parsed) -> bool:
     """判断 URL 是否为经过审计的外部图片交付地址。
 
     这条例外只适用于 HTTPS 默认端口和静态域名集合，用于兼容可信图片
     CDN 的特殊 DNS 映射；调用方仍不能借此请求任意内网地址或自定义端口。
     """
+    host = (parsed.hostname or "").lower()
     return (
         parsed.scheme == "https"
         and parsed.port in (None, 443)
-        and (parsed.hostname or "").lower() in _TRUSTED_EXTERNAL_IMAGE_HOSTS
+        and (
+            host in _TRUSTED_EXTERNAL_IMAGE_HOSTS
+            or _is_official_dashscope_oss_host(host)
+        )
     )
 
 

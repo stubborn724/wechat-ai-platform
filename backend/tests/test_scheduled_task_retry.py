@@ -63,6 +63,51 @@ def test_only_transient_scheduled_errors_are_retryable():
     assert is_retryable_scheduled_error(OSError("本地磁盘写入失败")) is False
 
 
+def test_text_generation_chain_inspects_nested_provider_failures():
+    """文生文主备都失败时，只要底层包含临时故障就应进入定时任务重试。"""
+    from app.services.text_generation_service import TextGenerationChainError
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    transient_chain_error = TextGenerationChainError([
+        ("kuai", TimeoutError("主模型超时")),
+        ("dashscope", RuntimeError("备用模型暂时不可用")),
+    ])
+    permanent_chain_error = TextGenerationChainError([
+        ("kuai", ValueError("请求参数错误")),
+        ("dashscope", RuntimeError("模型配置错误")),
+    ])
+
+    assert is_retryable_scheduled_error(transient_chain_error) is True
+    assert is_retryable_scheduled_error(permanent_chain_error) is False
+
+
+def test_retryable_state_error_is_preserved_when_scheduler_promotes_agent_failure():
+    """Agent 的模型格式错误升级到调度器时不能退化成普通 RuntimeError。"""
+    from app.services.scheduled_retry_errors import RetryableScheduledTaskError
+    from app.tasks.scheduled_task_executor import raise_scheduled_state_error
+
+    class FailedState:
+        error = "HTML 仿写内容解析失败"
+        error_retryable = True
+
+    with pytest.raises(RetryableScheduledTaskError):
+        raise_scheduled_state_error(FailedState())
+
+
+def test_erp_system_error_is_retryable_but_invalid_credential_is_not():
+    """ERP 产品接口的临时业务异常要重试，明确凭证错误不能反复请求。"""
+
+    from app.services.erp_product_service import ErpProductApiError
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    assert is_retryable_scheduled_error(
+        ErpProductApiError("ERP 产品查询失败：系统异常，请联系管理员")
+    ) is True
+    assert is_retryable_scheduled_error(
+        ErpProductApiError("ERP Token 获取失败：凭证无效")
+    ) is False
+
+
 def test_ambiguous_wechat_publish_result_is_not_automatically_retried():
     """外部发布请求的响应不明确时必须停止自动重投，防止微信收到重复文章。"""
     from app.services.wechat_publisher import WechatPublishAmbiguousError

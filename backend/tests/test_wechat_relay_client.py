@@ -32,8 +32,21 @@ class _FakeSession:
 
     def post(self, url, data=None, headers=None, timeout=None):
         self.calls.append({
+            "method": "POST",
             "url": url,
             "data": data,
+            "headers": headers or {},
+            "timeout": timeout,
+        })
+        return _FakeResponse(self.payload)
+
+    def get(self, url, headers=None, timeout=None):
+        """模拟状态查询请求，并保留方法和空请求体以验证不会再次发布。"""
+
+        self.calls.append({
+            "method": "GET",
+            "url": url,
+            "data": b"",
             "headers": headers or {},
             "timeout": timeout,
         })
@@ -185,6 +198,58 @@ def test_relay_client_maps_direct_publish_to_public_publish_with_confirm_gate():
     assert result["relay_status"] == "PUBLIC_PUBLISH_SUBMITTED"
 
 
+def test_relay_client_queries_publish_status_with_hmac_get_without_republishing():
+    """发布状态读取只查询中转站，不能把同一篇文章再次提交到微信。"""
+
+    from app.services.wechat_relay_client import WeChatRelayClient
+
+    session = _FakeSession({
+        "success": True,
+        "status": "PUBLISHED",
+        "wechatArticleId": "wechat-article-001",
+        "wechatUrl": "https://mp.weixin.qq.com/s/example",
+        "message": "published",
+    })
+    client = WeChatRelayClient(
+        base_url="http://relay.example.com",
+        relay_app_id="relay_client",
+        relay_secret="relay_secret",
+        session=session,
+        nonce_factory=lambda: "nonce-status-001",
+        timestamp_factory=lambda: "1760000003",
+    )
+
+    result = client.query_publish_status("publish-id-001")
+
+    assert result == {
+        "relay_status": "PUBLISHED",
+        "wechat_article_id": "wechat-article-001",
+        "wechat_url": "https://mp.weixin.qq.com/s/example",
+        "message": "published",
+        "error_code": None,
+        "raw": session.payload,
+    }
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://relay.example.com/api/wechat/articles/publish/publish-id-001"
+    assert call["data"] == b""
+    assert call["headers"]["X-Relay-App-Id"] == "relay_client"
+
+    expected_signature = hmac.new(
+        b"relay_secret",
+        "\n".join([
+            "GET",
+            "/api/wechat/articles/publish/publish-id-001",
+            "1760000003",
+            "nonce-status-001",
+            hashlib.sha256(b"").hexdigest(),
+        ]).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert call["headers"]["X-Relay-Signature"] == expected_signature
+
+
 def test_relay_client_maps_private_direct_publish_to_follower_push():
     """私域直接发布必须调用中转站的粉丝群发模式并返回 msg_id。"""
     from app.services.wechat_relay_client import WeChatRelayClient
@@ -308,3 +373,111 @@ def test_relay_client_reports_validation_response_body_without_request_secrets()
             html="<p>正文</p>",
             cover_image_url="https://assets.example.com/cover.png",
         )
+
+
+def test_relay_client_marks_temporary_draft_rejection_retryable():
+    """草稿尚未创建时收到明确的临时拒绝，可安全交给定时任务重试。"""
+    from app.services.wechat_relay_client import (
+        WeChatRelayClient,
+        WechatRelayRetryableError,
+    )
+
+    client = WeChatRelayClient(
+        base_url="http://relay.example.com",
+        relay_app_id="relay_client",
+        relay_secret="relay_secret",
+        session=_FakeSession({
+            "success": False,
+            "status": "TEMPORARY_UNAVAILABLE",
+            "message": "服务暂不可用，请稍后重试",
+        }),
+    )
+
+    with pytest.raises(WechatRelayRetryableError):
+        client.publish_article(
+            app_id="wx_app",
+            app_secret="wx_secret",
+            request_id="draft-retryable-error",
+            tenant_id="tenant-1",
+            publish_mode="draft",
+            confirm_publish=False,
+            title="文章标题",
+            digest="摘要",
+            html="<p>正文</p>",
+            cover_image_url="https://assets.example.com/cover.png",
+        )
+
+
+def test_relay_client_never_marks_masssend_quota_exhaustion_retryable():
+    """微信 45028 是当天群发额度耗尽，等待几分钟不会恢复，不能自动重试。"""
+    from app.services.wechat_relay_client import WeChatRelayClient
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    client = WeChatRelayClient(
+        base_url="http://relay.example.com",
+        relay_app_id="relay_client",
+        relay_secret="relay_secret",
+        session=_FakeSession({
+            "success": False,
+            "status": "FAILED",
+            "message": "45028 has no masssend quota",
+        }),
+    )
+
+    with pytest.raises(RuntimeError) as error_info:
+        client.publish_article(
+            app_id="wx_app",
+            app_secret="wx_secret",
+            request_id="private-quota-error",
+            tenant_id="tenant-1",
+            publish_mode="direct",
+            publish_domain="private",
+            confirm_publish=True,
+            title="文章标题",
+            digest="摘要",
+            html="<p>正文</p>",
+            cover_image_url="https://assets.example.com/cover.png",
+        )
+
+    assert is_retryable_scheduled_error(error_info.value) is False
+
+
+def test_relay_client_marks_direct_publish_transport_failure_ambiguous():
+    """直接发布遇到连接中断时不能自动重发，否则微信可能已经收到原请求。"""
+    from app.services.wechat_relay_client import (
+        WeChatRelayClient,
+        WechatRelayPublishAmbiguousError,
+    )
+    from app.tasks.scheduled_task_executor import is_retryable_scheduled_error
+
+    class FailingSession:
+        """模拟请求已发出后连接被中断，无法判断中转站是否已受理。"""
+
+        trust_env = False
+        proxies = {}
+
+        def post(self, *_args, **_kwargs):
+            raise requests.ConnectionError("connection reset")
+
+    client = WeChatRelayClient(
+        base_url="http://relay.example.com",
+        relay_app_id="relay_client",
+        relay_secret="relay_secret",
+        session=FailingSession(),
+    )
+
+    with pytest.raises(WechatRelayPublishAmbiguousError) as error_info:
+        client.publish_article(
+            app_id="wx_app",
+            app_secret="wx_secret",
+            request_id="direct-ambiguous-error",
+            tenant_id="tenant-1",
+            publish_mode="direct",
+            confirm_publish=True,
+            title="文章标题",
+            digest="摘要",
+            html="<p>正文</p>",
+            cover_image_url="https://assets.example.com/cover.png",
+        )
+
+    assert is_retryable_scheduled_error(error_info.value) is False

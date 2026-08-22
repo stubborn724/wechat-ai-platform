@@ -95,3 +95,24 @@ async def test_inspect_generated_image_url_reads_local_minio_through_internal_st
 
     assert report.is_usable is True
     assert storage.object_keys == ["generated-images/107/result.png"]
+
+
+@pytest.mark.asyncio
+async def test_inspect_generated_image_url_marks_download_failure_retryable(monkeypatch):
+    """临时下载失败应交给定时任务整体重试，而不是只按低质量图片结束。"""
+    from app.services import scheduled_image_quality_service as quality_service
+
+    class FailingStorage:
+        """模拟 MinIO 短暂断连；这里不访问真实存储，避免测试产生外部副作用。"""
+
+        def download_bytes(self, _object_key):
+            raise ConnectionError("MinIO 暂时不可达")
+
+    monkeypatch.setattr(quality_service, "storage_service", FailingStorage())
+
+    report = await quality_service.inspect_generated_image_url(
+        "http://localhost:9002/wechat-assets/generated-images/107/result.png"
+    )
+
+    assert report.is_usable is False
+    assert report.retryable is True

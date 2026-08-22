@@ -1,0 +1,14 @@
+.git
+.idea
+.pytest_cache
+.superpowers
+.workbuddy
+logs
+tmp
+backend/venv
+backend/.pytest_cache
+backend/logs
+backend/celerybeat-schedule.*
+frontend/node_modules
+frontend/dist
+frontend/vite-*.log

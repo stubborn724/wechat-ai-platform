@@ -5,6 +5,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
+
 from app.celery_app import celery_app
 from app.database import MysqlSessionLocal
 from app.models.mysql_models import Article, ContentJob, ContentVersion, PublishAttempt, TageAiPublishCandidate
@@ -20,6 +22,24 @@ from app.services.job_queue_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _create_wechat_relay_client():
+    """创建专用于最终状态读取的中转站客户端。
+
+    公众号 AppSecret 只在初次发布时交给中转站；后续状态查询仅携带 HMAC 和
+    ``publish_id``。单独保留工厂函数使 Celery 单测可以注入替身，避免测试访问真实
+    固定 IP 服务，也避免把连接配置散落在轮询循环中。
+    """
+
+    from app.config import settings
+    from app.services.wechat_relay_client import WeChatRelayClient
+
+    return WeChatRelayClient(
+        base_url=settings.wechat_relay_base_url,
+        relay_app_id=settings.wechat_relay_app_id,
+        relay_secret=settings.wechat_relay_secret,
+    )
 
 
 class ContentGenerationFailed(RuntimeError):
@@ -545,18 +565,18 @@ def poll_publishing_articles(self):
     try:
         from app.services.wechat_gateway_policy import is_wechat_relay_enabled
         if is_wechat_relay_enabled():
-            from app.config import settings
-            from app.services.publish_delivery_state_service import expire_unresolved_relay_publish
+            from app.services.publish_delivery_state_service import apply_relay_publish_status
 
             relay_articles = (
                 db.query(Article)
                 .filter(
-                    Article.status == "publishing",
-                    Article.phase == "RELAY_PUBLISHING",
+                    Article.status.in_(["publishing", "unknown"]),
+                    Article.phase.in_(["RELAY_PUBLISHING", "PUBLISH_STATUS_UNKNOWN"]),
                 )
                 .all()
             )
-            failed_unresolved = 0
+            relay_client = _create_wechat_relay_client()
+            status_counts = {"PUBLISHING": 0, "PUBLISHED": 0, "FAILED": 0, "UNKNOWN": 0}
             now = datetime.now(timezone.utc)
             for article in relay_articles:
                 # Article 不直接保存 ContentJob 外键，必须经 ContentVersion 反查任务。
@@ -570,33 +590,73 @@ def poll_publishing_articles(self):
                     .order_by(ContentVersion.id.desc())
                     .first()
                 )
-                attempts = []
+                candidates = (
+                    db.query(TageAiPublishCandidate)
+                    .filter(
+                        TageAiPublishCandidate.tenant_id == article.tenant_id,
+                        TageAiPublishCandidate.article_id == article.id,
+                    )
+                    .all()
+                )
+                # 预览和正式发布分别创建 ContentJob：ContentVersion 只能反查到预览 Job，
+                # 而真正的 PublishAttempt 归属 ``article_publish_existing`` Job。正式发布时
+                # 写入的候选幂等键是两者唯一、稳定的关联事实；同时保留旧 Job 条件，兼容
+                # 历史记录和非候选发布流程，避免轮询遗漏已受理的投递尝试。
+                attempt_lookup_conditions = []
                 if version:
+                    attempt_lookup_conditions.append(PublishAttempt.job_id == version.job_id)
+                candidate_attempt_keys = [
+                    f"tageai-candidate-{candidate.id}"
+                    for candidate in candidates
+                    if getattr(candidate, "id", None) is not None
+                ]
+                if candidate_attempt_keys:
+                    attempt_lookup_conditions.append(
+                        PublishAttempt.idempotency_key.in_(candidate_attempt_keys)
+                    )
+                attempts = []
+                if attempt_lookup_conditions:
                     attempts = (
                         db.query(PublishAttempt)
                         .filter(
                             PublishAttempt.tenant_id == article.tenant_id,
-                            PublishAttempt.job_id == version.job_id,
+                            or_(*attempt_lookup_conditions),
                         )
                         .all()
                     )
-                if expire_unresolved_relay_publish(
+                try:
+                    relay_result = relay_client.query_publish_status(article.publish_id)
+                except Exception as exc:
+                    # 网络、部署滞后或微信暂不可达不能冒充明确失败；保留 UNKNOWN 并在
+                    # 下一轮重新查询。异常摘要受长度限制，避免把响应或凭据写入日志。
+                    relay_result = {
+                        "relay_status": "UNKNOWN",
+                        "message": f"中转站最终状态暂不可查：{str(exc)[:300]}",
+                        "error_code": "PUBLISH_STATUS_UNKNOWN",
+                    }
+                final_status = apply_relay_publish_status(
                     article,
                     attempts,
+                    candidates,
+                    relay_result,
                     now=now,
-                    timeout_seconds=settings.wechat_relay_publish_status_timeout_seconds,
-                ):
-                    failed_unresolved += 1
-            if failed_unresolved:
+                )
+                status_counts[final_status] = status_counts.get(final_status, 0) + 1
+            if relay_articles:
                 db.commit()
-                logger.warning(
-                    "Relay publish status unavailable for %d article(s); marked as failed for manual verification",
-                    failed_unresolved,
+                logger.info(
+                    "Relay publish status polling finished: publishing=%d published=%d failed=%d unknown=%d",
+                    status_counts["PUBLISHING"],
+                    status_counts["PUBLISHED"],
+                    status_counts["FAILED"],
+                    status_counts["UNKNOWN"],
                 )
             return {
                 "polled": len(relay_articles),
-                "failed_unresolved": failed_unresolved,
-                "reason": "relay mode has no final publish-status endpoint",
+                "publishing": status_counts["PUBLISHING"],
+                "published": status_counts["PUBLISHED"],
+                "failed": status_counts["FAILED"],
+                "unknown_unresolved": status_counts["UNKNOWN"],
             }
 
         # Article 已在模块级导入；这里仅补充直连轮询专属的账号与凭据模型，避免

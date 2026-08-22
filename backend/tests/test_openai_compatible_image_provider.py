@@ -145,7 +145,7 @@ async def test_data_uri_result_is_decoded_and_archived_to_minio():
 
 @pytest.mark.asyncio
 async def test_authentication_error_is_classified_as_non_fallback_error():
-    """中转站 401/403 属于配置问题，统一路由不得静默切换万相。"""
+    """明确的 invalid token 仍属于配置问题，统一路由不得静默切换万相。"""
     from app.services.image_generation_models import (
         ImageErrorCategory,
         ImageGenerationRequest,
@@ -168,3 +168,30 @@ async def test_authentication_error_is_classified_as_non_fallback_error():
 
     assert error_info.value.category == ImageErrorCategory.AUTHENTICATION
     assert error_info.value.can_fallback is False
+
+
+@pytest.mark.asyncio
+async def test_temporary_forbidden_error_is_fallback_eligible():
+    """403 的临时不可用响应必须允许继续尝试下一层图片提供商。"""
+    from app.services.image_generation_models import (
+        ImageErrorCategory,
+        ImageGenerationRequest,
+        ImageProviderError,
+    )
+    from app.services.openai_compatible_image_provider import OpenAICompatibleImageProvider
+
+    client = FakeHttpClient(FakeResponse(
+        {"error": {"message": "Service temporarily unavailable"}},
+        status_code=403,
+    ))
+    provider = OpenAICompatibleImageProvider(
+        settings=build_settings(),
+        storage=FakeStorage(),
+        client_factory=lambda **_: client,
+    )
+
+    with pytest.raises(ImageProviderError) as error_info:
+        await provider.generate(ImageGenerationRequest(prompt="生成家具海报"))
+
+    assert error_info.value.category == ImageErrorCategory.TEMPORARY
+    assert error_info.value.can_fallback is True
